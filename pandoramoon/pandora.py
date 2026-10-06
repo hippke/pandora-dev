@@ -830,7 +830,8 @@ def _window_fluxes_z(
     # limb checks; ~90 % of the draws of a fit have no mutual eclipse)
     if not unphysical and eclipse_possible(xp, yp, xm, ym, r_planet, r_moon):
         flux_moon = eclipse(
-            xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, eclipse_pixelmap
+            xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, eclipse_pixelmap,
+            u1, u2
         )
     return flux_planet, flux_moon
 

@@ -799,9 +799,17 @@ polynomials, ~2 ppm near z = 1 - k for k ~ 0.001).
   (atmospheres, rings, reflected or thermal emission), which Pandora does
   not model.
 - The mutual-eclipse correction scales the moon's limb-darkened deficit by
-  the *geometric* fraction of its on-star area covered by the planet. Limb
-  darkening is not weighted across the overlap. Whether this matters at the
-  ppm level is still open (TASKS_TESTING T4).
+  the *geometric* fraction of its on-star area covered by the planet, plus
+  (since T4, "Eclipses: first-order limb-darkening gradient across the
+  overlap") a first-order term `lens_gradient_term()`: the intensity
+  gradient at the moon centre times the offset of the overlap's centroid,
+  tapered to zero across the limb band. It is not an exact LD-weighted
+  overlap. Measured against an independent radial integration of the union
+  of both disks (gefera-style exact result), Jupiter-sized planet: max error
+  Earth-sized moon (k = 0.0092) 1.36 -> 0.20 ppm (moon fully on the star),
+  1.37 -> 0.58 ppm (limb band); k = 0.035: 34 -> 5.9 / 36 -> 16 ppm;
+  rms 4-30x smaller; for all LD laws tested. `eclipse_method="pixelmap"`
+  keeps the old treatment.
 - Overlap *area* on the stellar limb: since the analytic method became the
   default (`eclipse_method="analytic"`, `pandoramoon/overlap_analytic.py`),
   it is exact to < 1e-6 of the moon area against an independent

@@ -119,7 +119,59 @@ def eclipse_possible(xp, yp, xm, ym, r_planet, r_moon):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, use_pixelmap=False):
+def lens_gradient_term(xp, yp, xm, ym, d, r_planet, r_moon, u1, u2):
+    """T4: first-order limb-darkening correction of the light under a
+    partial planet-moon overlap (in units of the unocculted stellar flux).
+
+    The constant-intensity treatment gives the overlap the moon disk's mean
+    intensity I_bar (exact, from the moon's Mandel-Agol deficit). To first
+    order the overlap's mean intensity is I_bar + grad I(m) . (c - m), with
+    m the moon centre and c the overlap (lens) centroid. Returned:
+    w * A * dI/dr(z_m) * ((c - m) . r_hat_m) / F0, with A the lens area,
+    I(r) = 1 - u1 (1 - mu) - u2 (1 - mu)^2, mu = sqrt(1 - r^2),
+    F0 = pi (1 - u1/3 - u2/6), and w = min(1, (1 - z_m) / r_moon) >= 0
+    a taper that switches the term off continuously across the limb band
+    (dI/dr diverges at the limb; on the limb the overlap area is the
+    three-circle area, its centroid is not computed).
+    Lens: the segments of the planet beyond the radical line (distance a
+    from the planet centre) and of the moon; their first moments about the
+    planet centre add up to A_moon_segment * d, so the centroid lies at
+    s = d A_m / A from the planet centre towards the moon.
+    Accuracy vs an exact LD-weighted union of both disks (radial
+    integration; Gordon & Agol 2022 for the exact method): Earth-sized moon
+    next to Jupiter, LD (0.4, 0.26): max error 1.36 -> 0.20 ppm (moon fully
+    on the star), 1.37 -> 0.58 ppm (limb band); see BUGS.md, known
+    limitations."""
+    zm = sqrt(xm * xm + ym * ym)
+    if not (zm < 1):
+        return 0.0
+    w = min(1.0, (1 - zm) / r_moon)
+    if d <= r_planet - r_moon:         # moon fully behind the planet: exact (er = 1)
+        return 0.0
+    if d <= r_moon - r_planet:         # planet fully inside the moon disk
+        A = pi * r_planet * r_planet
+        s = 0.0
+    else:
+        a = (d * d + r_planet * r_planet - r_moon * r_moon) / (2 * d)
+        h = sqrt(max(r_planet * r_planet - a * a, 0.0))
+        b = d - a
+        A_p = r_planet * r_planet * arccos(max(min(a / r_planet, 1.0), -1.0)) - a * h
+        A_m = r_moon * r_moon * arccos(max(min(b / r_moon, 1.0), -1.0)) - b * h
+        A = A_p + A_m
+        if not (A > 0):
+            return 0.0
+        s = d * A_m / A
+    # (c - m) . r_hat_m * dI/dr; c - m = (s - d) e_pm with e_pm the unit
+    # vector planet -> moon; z_m cancels: dI/dr = -(u1 + 2 u2 (1 - mu)) z_m / mu
+    mu = sqrt(1 - zm * zm)
+    e_dot_m = ((xm - xp) * xm + (ym - yp) * ym) / d
+    grad = -(u1 + 2 * u2 * (1 - mu)) / mu * (s - d) * e_dot_m
+    return w * A * grad / (pi * (1 - u1 / 3 - u2 / 6))
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, use_pixelmap=False,
+            u1=None, u2=None):
     """Checks if planet-moon occultation present. If yes, returns adjusted moon flux.
     Parameters
     ----------
@@ -135,7 +187,13 @@ def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, use_pix
     use_pixelmap : bool
         False (default): limb eclipses use the exact analytic three-circle
         overlap (overlap_analytic.er_fast). True: the legacy pixel raster
-        pixelart(), bit-identical to Pandora before the analytic method.
+        pixelart(), bit-identical to Pandora before the analytic method
+        (then u1, u2 are ignored).
+    u1, u2 : float or None
+        Quadratic limb darkening. If given (Pandora passes them; T4), partial
+        overlaps get the first-order limb-darkening correction
+        lens_gradient_term() instead of the moon disk's mean intensity alone.
+        None: the constant-intensity treatment of Pandora before T4.
 
     Returns
     -------
@@ -204,7 +262,15 @@ def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, use_pix
 
         # For Cases 2+3: Calculate reduced moon flux
         if er > 0:
-            flux_moon[idx] = -(1 - flux_moon[idx]) * 10 ** 6
-            flux_moon[idx] = flux_moon[idx] * (1 - er)
-            flux_moon[idx] = 1 - (-flux_moon[idx] * 10 ** -6)
+            f = -(1 - flux_moon[idx]) * 10 ** 6
+            f = f * (1 - er)
+            f = 1 - (-f * 10 ** -6)
+            # T4: limb-darkening gradient across the overlap (partial overlaps)
+            if u1 is not None and u2 is not None and not use_pixelmap and er < 1:
+                f = f + lens_gradient_term(
+                    xp[idx], yp[idx], xm[idx], ym[idx], distance_p_m, r_planet, r_moon, u1, u2
+                )
+                if f > 1:
+                    f = 1.0
+            flux_moon[idx] = f
     return flux_moon
