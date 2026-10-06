@@ -660,9 +660,39 @@ code reproduces the old regression reference bit-for-bit, so the time grid
 is the only change. The reference was regenerated deliberately for the new
 grid.
 
-Not changed here: `int(cpd * dur)` truncates float round-off. For example
-`int(100 * 0.29)` gives 28, not 29, so one cadence may be missing when
-`cpd * dur` is meant to be an integer.
+Not changed here: `int(cpd * dur)` truncates float round-off (bug #27).
+
+## 27. `timegrid()` loses a cadence when `cadences_per_day * epoch_duration` rounds down - FIXED
+
+Severity: low (one cadence missing per epoch for common settings)
+Location: `pandoramoon/grids.py:29` (`timegrid`)
+Fixed in: "Tolerate float round-off in timegrid() cadence count (bug #27)"
+
+```python
+cadences = int(cadences_per_day * epoch_duration) * int(supersampling_factor)
+```
+
+`int()` truncates. When the product is meant to be an integer but the
+float result lands just below it, one cadence per epoch is lost. The grid
+then fills only `(n - 1) / n` of the requested window, though it stays
+centred. Verified:
+- `int(100 * 0.29)` = 28 instead of 29;
+- `int(720 * 0.35)` = 251 instead of 252 (TESS 2 min over 0.35 d);
+- 34 of the 3588 pairs of common cadences (24 ... 4320 per day, Kepler LC)
+  and durations of 0.01 ... 2.99 d in steps of 0.01 d are affected.
+
+None of the regression cases are affected: their products have fractional
+parts of 0.33-0.99. Because of bug #22, `n_super` is a multiple of
+`supersampling_factor`, so the missing cadence never splits a supersample
+group.
+
+Fix: `int(x + 1e-9 * max(1, x))` with `x = cadences_per_day * epoch_duration`.
+Double-precision round-off in `x` is ~1e-16 relative, far below this
+tolerance. A product that truly falls short of the next integer by less than
+1e-9 cadences (relative) now gets that cadence. The exposures then overrun
+the window by < 1e-9 cadence, which is negligible. Verified by
+`test_timegrid_cadence_count_roundoff` in `../test_cases/unit_tests.py`
+(fails on the old code). The light-curve regression reference is unchanged.
 
 ## Known limitations (documented, not bugs)
 
