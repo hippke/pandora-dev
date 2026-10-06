@@ -26,7 +26,7 @@ params.per_moon = 0.3 # [days]
 params.tau_moon = 0.07  # [0..1]
 params.Omega_moon = 0  # [0..180]
 params.i_moon = 80  # [0..180]
-params.e_moon = 0.9  # [0..1]
+params.ecc_moon = 0.1  # [0..1]
 params.w_moon = 20  # [deg]
 params.M_moon = 0.05395 * params.M_planet   # [0..1]
 
