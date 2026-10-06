@@ -608,6 +608,15 @@ with the intensity at its annulus mid-radius.
   anomaly factor `sqrt((1+e)/(1-e))` divides by zero (ZeroDivisionError in
   numba), and e > 1 is a hyperbolic orbit outside the model's scope. The
   starter/corrector has also only been validated for e < ~0.99.
+- `video()` returns an unsaved `FuncAnimation` whose callback updates a
+  `tqdm` progress bar. If the animation is never saved (or the figure
+  closed) before the interpreter exits, Python segfaults at shutdown
+  (exit 139). Reproduced without any Pandora code (plain matplotlib
+  `FuncAnimation` + `tqdm` in the callback), so this is a third-party
+  teardown interaction, not a model bug; saving the video (as all examples
+  do) or calling `plt.close('all')` avoids it. Cosmetic: the progress bar
+  also overcounts (e.g. 453/450) because matplotlib draws an extra init
+  frame.
 
 ## Verification
 
@@ -636,3 +645,14 @@ commit - by design: it is now the correctly computed Keplerian orbit. The
 planet light curve is unchanged to numerical precision. Everything else
 (including the standard example planet light curve) is
 unchanged to numerical precision.
+
+Second pass (#20-#24): after the fixes, `occult` and `occult_hybrid` agree
+with the independent radial-integration reference to <= 0.5 ppm (largely
+reference-limited) over k = 0.01-0.7, for random z plus the boundary points
+z in {1 - k, |1 - k|, k, 1 + k}, with no NaN; the cache stays within ~3 ppm.
+The 18-check regression suite and the bug #2 orbit tests still pass, and
+`examples/example.py` (light curve + 450-frame video) runs and exits
+cleanly. Bug #22 changes the time grid only for `supersampling_factor > 1`;
+bug #23 only rejects orbits whose periapsis/apoapsis violate the existing
+limits; bugs #20/#21 change flux only at the former NaN points and within
+1e-4 of z = 1 - k.
