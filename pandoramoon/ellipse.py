@@ -2,6 +2,8 @@ import numpy as np
 from numpy import sqrt, pi, sin, cos, abs, tan, arctan
 from numba import jit
 
+from pandoramoon.trig import sincos_turns
+
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def ellipse(
@@ -70,8 +72,11 @@ def ellipse_ecc(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary):
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def ellipse_z(a, per, tau, Omega, i, time, x_bary, mass_ratio, b_bary):
     """ellipse() fused into one loop that also returns the distances from the
-    stellar centre: (xm, ym, xp, yp, zm, zp). Same formulas per sample, no
-    full-length temporaries (used by the culled likelihood path)."""
+    stellar centre: (xm, ym, xp, yp, zm, zp). No full-length temporaries
+    (used by the culled likelihood path). The phase is reduced in turns and
+    sin/cos come from trig.sincos_turns() (P7), so the loop vectorises; it
+    agrees with ellipse() to the ulp of ellipse()'s phase argument 2 pi
+    (t - tau per) / per (and is more accurate than it for large t)."""
     O = Omega / 180 * pi
     inc = i / 180 * pi
     cos_O = cos(O)
@@ -86,10 +91,10 @@ def ellipse_z(a, per, tau, Omega, i, time, x_bary, mass_ratio, b_bary):
     yp = np.empty(n)
     zm = np.empty(n)
     zp = np.empty(n)
+    t_ref = tau * per
     for j in range(n):
-        k = pi * (time[j] - tau * per) / per
-        cos_Q = cos(2 * k)
-        sin_Q = sin(2 * k)
+        # moon phase in turns; vectorisable sincos (P7) instead of libm
+        sin_Q, cos_Q = sincos_turns((time[j] - t_ref) / per)
         vector_x = cos_O * cos_Q - sin_O * sin_Q * cos_i
         vector_y = sin_O * cos_Q + cos_O * sin_Q * cos_i
         xmj = vector_x * a_moon + x_bary[j]
