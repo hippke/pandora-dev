@@ -7,7 +7,7 @@ from matplotlib.animation import FuncAnimation
 from os import path
 
 # Pandora
-from pandoramoon.eclipse import eclipse
+from pandoramoon.eclipse import eclipse, eclipse_possible
 from pandoramoon.ellipse import ellipse, ellipse_ecc, ellipse_z, ellipse_ecc_z
 from pandoramoon.occult import occult, occult_small, occult_hybrid, create_occult_cache, read_occult_cache
 from pandoramoon.helpers import resample
@@ -823,8 +823,10 @@ def _window_fluxes_z(
     else:
         flux_moon = occult_hybrid(zs=z_moon, k=r_moon, u1=u1, u2=u2)
 
-    # Mutual planet-moon occultations
-    if not unphysical:# and eclipses_occur:
+    # Mutual planet-moon occultations; skipped when no sample can overlap
+    # (P5: one vectorised min-distance pass instead of eclipse()'s per-sample
+    # limb checks; ~90 % of the draws of a fit have no mutual eclipse)
+    if not unphysical and eclipse_possible(xp, yp, xm, ym, r_planet, r_moon):
         flux_moon = eclipse(
             xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, eclipse_pixelmap
         )

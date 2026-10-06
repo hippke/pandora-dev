@@ -99,6 +99,26 @@ def pixelart(xp, yp, xm, ym, r_planet, r_moon, numerical_grid):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def eclipse_possible(xp, yp, xm, ym, r_planet, r_moon):
+    """False if no sample can have a planet-moon overlap, i.e. eclipse()
+    would return flux_moon unchanged (P5). eclipse() modifies a sample only
+    if sqrt(dx^2 + dy^2) < r_planet + r_moon; here the samples with
+    dx^2 + dy^2 < (r_planet + r_moon)^2 (1 + 1e-9) are counted (branch-free,
+    vectorised; a float min reduction is not vectorised by numba/LLVM). The
+    relative margin 1e-9 makes rounding differences (sqrt vs square, FMA
+    contraction) cause at most an unnecessary eclipse() call, never a
+    skipped overlap. NaN positions are never modified by eclipse() either."""
+    r = r_planet + r_moon
+    r2 = r * r * (1 + 1e-9)
+    n_close = 0
+    for i in range(len(xp)):
+        dx = xm[i] - xp[i]
+        dy = ym[i] - yp[i]
+        n_close += (dx * dx + dy * dy) < r2
+    return n_close > 0
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, use_pixelmap=False):
     """Checks if planet-moon occultation present. If yes, returns adjusted moon flux.
     Parameters
