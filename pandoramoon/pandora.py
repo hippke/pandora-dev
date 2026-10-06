@@ -11,7 +11,7 @@ from pandoramoon.eclipse import eclipse
 from pandoramoon.ellipse import ellipse, ellipse_ecc
 from pandoramoon.occult import occult, occult_small, occult_hybrid, create_occult_cache, read_occult_cache
 from pandoramoon.helpers import resample
-from pandoramoon.grids import timegrid, x_bary_grid
+from pandoramoon.grids import timegrid, x_bary_grid, x_bary_window
 
 
 class model_params(object):
@@ -378,10 +378,19 @@ def pandora(
     i_moon = float(i_moon)
     M_moon = float(M_moon)
 
-    a_moon, x_bary, unphysical = _setup(
+    a_moon, unphysical = _moon_setup(
         R_star, per_bary, a_bary, M_planet, M_moon, per_moon, ecc_moon,
-        r_planet, r_moon, t0_bary, t0_bary_offset, epoch_distance, ecc_bary,
-        w_bary, hill_sphere_threshold, time
+        r_planet, r_moon, hill_sphere_threshold
+    )
+    x_bary = x_bary_grid(
+        time, 
+        a_bary, 
+        per_bary, 
+        t0_bary, 
+        t0_bary_offset, 
+        epoch_distance, 
+        ecc_bary, 
+        w_bary
     )
     xm, ym, xp, yp = _orbit(
         time, x_bary, unphysical, a_moon, per_moon, tau_moon, Omega_moon,
@@ -410,17 +419,91 @@ def pandora(
     return flux_planet, flux_moon, flux_total, xp, yp, xm, ym
 
 
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def pandora_flux(
+    u1,
+    u2,
+    R_star,
+    # Planet parameters
+    per_bary,
+    a_bary,
+    r_planet,
+    b_bary,
+    w_bary,
+    ecc_bary,
+    t0_bary,
+    t0_bary_offset,
+    M_planet,
+    # Moon parameters
+    r_moon,
+    per_moon,
+    tau_moon,
+    Omega_moon,
+    i_moon,
+    ecc_moon,
+    w_moon,
+    M_moon,
+    # Other model parameters
+    epoch_distance,
+    supersampling_factor,
+    occult_small_threshold,
+    hill_sphere_threshold,
+    numerical_grid,
+    time,
+    cache=None,
+    eclipse_pixelmap=False
+):
+    """Same arguments and fluxes as pandora(), but returns only
+    (flux_planet, flux_moon, flux_total) and computes the orbit only for
+    samples that can be in transit. Use it in likelihood functions."""
+    R_star = float(R_star)
+    per_bary = float(per_bary)
+    a_bary = float(a_bary)
+    r_planet = float(r_planet)
+    b_bary = float(b_bary)
+    t0_bary = float(t0_bary)
+    t0_bary_offset = float(t0_bary_offset)
+    M_planet = float(M_planet)
+    r_moon = float(r_moon)
+    per_moon = float(per_moon)
+    tau_moon = float(tau_moon)
+    Omega_moon = float(Omega_moon)
+    i_moon = float(i_moon)
+    M_moon = float(M_moon)
+
+    a_moon, unphysical = _moon_setup(
+        R_star, per_bary, a_bary, M_planet, M_moon, per_moon, ecc_moon,
+        r_planet, r_moon, hill_sphere_threshold
+    )
+    # Barycentre positions only for samples that can be in transit
+    idx, x_bary = x_bary_window(
+        time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
+        ecc_bary, w_bary,
+        _cull_reach(a_moon, ecc_moon, r_planet, r_moon, unphysical, cache)
+    )
+    xm, ym, xp, yp = _orbit(
+        time[idx], x_bary, unphysical, a_moon, per_moon, tau_moon,
+        Omega_moon, w_moon, i_moon, ecc_moon, M_moon / M_planet, b_bary
+    )
+    flux_planet_w, flux_moon_w = _window_fluxes(
+        xp, yp, xm, ym, unphysical, r_planet, r_moon, u1, u2,
+        occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+    )
+    return _assemble_window(
+        len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
+    )
+
+
 # ----------------------------------------------------------------------------
 # Building blocks of pandora()
 # ----------------------------------------------------------------------------
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _setup(
+def _moon_setup(
     R_star, per_bary, a_bary, M_planet, M_moon, per_moon, ecc_moon, r_planet,
-    r_moon, t0_bary, t0_bary_offset, epoch_distance, ecc_bary, w_bary,
-    hill_sphere_threshold, time
+    r_moon, hill_sphere_threshold
 ):
-    """Planet-moon semi-major axis [R_star], barycentre x positions, and the
-    plausibility flag (unphysical moon orbits are moved out of transit)"""
+    """Planet-moon semi-major axis [R_star] and the plausibility flag
+    (unphysical moon orbits are moved out of transit)"""
     # Calculate moon period around planet
     G = 6.67408e-11
     day = 60 * 60 * 24
@@ -428,17 +511,6 @@ def _setup(
         G * (M_planet + M_moon) / (2 * pi / (per_moon * day)) ** 2
     ) ** (1 / 3)
     a_moon /= R_star
-
-    x_bary = x_bary_grid(
-        time, 
-        a_bary, 
-        per_bary, 
-        t0_bary, 
-        t0_bary_offset, 
-        epoch_distance, 
-        ecc_bary, 
-        w_bary
-    )
 
     # Check physical plausibility of a_moon
     # Should be inside [Roche lobe, Hill sphere] plus/minus some user-set margin
@@ -454,7 +526,7 @@ def _setup(
     # Instead of taking density guesses, we just demand a_moon > (R_planet + R_moon)
     if a_moon * (1 - ecc_moon) < (r_planet + r_moon):
         unphysical = True
-    return a_moon, x_bary, unphysical
+    return a_moon, unphysical
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
@@ -605,4 +677,51 @@ def _total_and_resample(flux_planet, flux_moon, supersampling_factor):
         flux_planet = resample(flux_planet, supersampling_factor)
         flux_moon = resample(flux_moon, supersampling_factor)
         flux_total = resample(flux_total, supersampling_factor)
+    return flux_planet, flux_moon, flux_total
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _assemble_window(n, idx, flux_planet_w, flux_moon_w, supersampling_factor):
+    """Output fluxes (planet, moon, total) of n samples from the fluxes at the
+    (ascending) window indices; flux is 1 elsewhere. Equivalent to _scatter()
+    followed by _total_and_resample(), but without full-length temporaries:
+    with supersampling, only output cadences that contain window samples are
+    averaged (the mean of exact 1s is exactly 1)."""
+    m = len(idx)
+    if supersampling_factor <= 1:
+        flux_planet = np.ones(n)
+        flux_moon = np.ones(n)
+        flux_total = np.ones(n)
+        for j in range(m):
+            flux_planet[idx[j]] = flux_planet_w[j]
+            flux_moon[idx[j]] = flux_moon_w[j]
+            flux_total[idx[j]] = flux_moon_w[j] + flux_planet_w[j] - 1
+        return flux_planet, flux_moon, flux_total
+
+    factor = supersampling_factor
+    out_samples = int(np.ceil(n / factor))
+    flux_planet = np.ones(out_samples)
+    flux_moon = np.ones(out_samples)
+    flux_total = np.ones(out_samples)
+    block_planet = np.empty(factor)
+    block_moon = np.empty(factor)
+    j = 0
+    while j < m:
+        out = idx[j] // factor
+        start = out * factor
+        end = start + factor
+        if end > n:
+            end = n
+        length = end - start
+        block_planet[:] = 1.0
+        block_moon[:] = 1.0
+        while j < m and idx[j] < end:
+            block_planet[idx[j] - start] = flux_planet_w[j]
+            block_moon[idx[j] - start] = flux_moon_w[j]
+            j += 1
+        bp = block_planet[:length]
+        bm = block_moon[:length]
+        flux_planet[out] = np.mean(bp)
+        flux_moon[out] = np.mean(bm)
+        flux_total[out] = np.mean(bm + bp - 1)
     return flux_planet, flux_moon, flux_total

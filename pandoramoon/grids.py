@@ -65,3 +65,34 @@ def x_bary_grid(
             - (((per_bary - epoch_distance) * epoch) / (tdur / 2))
         )
     return x_bary
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def x_bary_window(
+    time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance, ecc_bary,
+    w_bary, reach
+):
+    """Like x_bary_grid(), but returns only the samples with |x_bary| < reach:
+    (indices into time, x_bary at those indices). NaN is kept. No full-length
+    array is written, which matters for long time series (memory traffic).
+    Keep the formulas identical to x_bary_grid()."""
+    tdur = per_bary / pi * arcsin(1 / a_bary)
+    if ecc_bary > 0:
+        tdur /= 1 / sqrt(1 - ecc_bary ** 2) * (1 + ecc_bary * cos((w_bary - 90) / 180 * pi))
+    t0_shift_planet = t0_bary_offset / (tdur / 2)
+    n = len(time)
+    idx = np.empty(n, dtype=np.int64)
+    x_win = np.empty(n)
+    m = 0
+    for i in range(n):
+        epoch = int(np.floor((time[i] - t0_bary) / per_bary + 0.5))
+        x = (
+            (2 * (time[i] - (t0_bary + epoch_distance * epoch))) / tdur
+            - t0_shift_planet
+            - (((per_bary - epoch_distance) * epoch) / (tdur / 2))
+        )
+        if not (abs(x) >= reach):
+            idx[m] = i
+            x_win[m] = x
+            m += 1
+    return idx[:m].copy(), x_win[:m].copy()
