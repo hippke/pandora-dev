@@ -222,7 +222,7 @@ def occult(zs, k, u1, u2):
     for i in range(lzs):
         z = zs[i]
         if abs(z - k) < 1e-6:
-            z += 1e-6
+            z = k + 1e-6
 
         # The source is unocculted
         if z > 1 + k or z < 0:
@@ -385,7 +385,7 @@ def occult_hybrid(zs, k, u1, u2):
             z = zs[i]
 
         if abs(z - k) < 1e-6:
-            z += 1e-6
+            z = k + 1e-6
 
         # Source is unocculted
         if z > 1 + k or z < 0:
