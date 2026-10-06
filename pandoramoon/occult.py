@@ -460,12 +460,13 @@ def occult_hybrid(zs, k, u1, u2):
             or (i >= 0 and k <= 0.01 and z <= 0.98)
         ):
             # Perform linear interpolation correction
-            testv = occult_small_single_value(z, k, u1, u2)
             flux[i] = (
                 occult_small_single_value(z, k, u1, u2)
                 + interpol_flux_1
                 + interpol_flux_2 * z
             )
+            if flux[i] > 1:
+                flux[i] = 1
             continue
 
         # Occulting body transits the source: Table 3, Case IV:
