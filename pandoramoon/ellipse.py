@@ -53,7 +53,7 @@ def ellipse_ecc(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary):
     k = n - f0 / (f1 + 0.5 * h * f2 + h ** 2 * (1 - f1) / 6 + h ** 3 * (-f2) / 24)
     if flip:
         k = 2 * pi - k
-    r = -(1 - e * cos(k))
+    r = (1 - e * cos(k))
 
     wf = (w / 180 * pi) + (arctan(sqrt((1 + e) / (1 - e)) * tan(k / 2)) * 2)
     v = sin(wf) * cos((i / 180 * pi))
