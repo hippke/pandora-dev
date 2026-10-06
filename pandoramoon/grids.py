@@ -54,7 +54,7 @@ def x_bary_grid(
     t0_shift_planet = t0_bary_offset / (tdur / 2)
     x_bary = np.empty(len(time))
     for idx in range(len(time)):
-        epoch = int((time[idx] - t0_bary) / per_bary + 0.5)
+        epoch = int(np.floor((time[idx] - t0_bary) / per_bary + 0.5))
         x_bary[idx] = (
             (2 * (time[idx] - (t0_bary + epoch_distance * epoch))) / tdur
             - t0_shift_planet
