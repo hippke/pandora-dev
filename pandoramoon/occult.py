@@ -395,6 +395,12 @@ def occult_hybrid(zs, k, u1, u2):
                 flux[i] = 1
             continue
 
+        # The source is completely occulted
+        elif k >= 1 and z <= k - 1:
+            if i >= 0:
+                flux[i] = 0
+            continue
+
         z2 = z**2
         x1 = (k - z) ** 2
         x2 = (k + z) ** 2
