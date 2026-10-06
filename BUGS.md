@@ -32,10 +32,11 @@ The fix averages `[start, start + factor)` and additionally includes a
 partial trailing group when `len(arr) % factor != 0` (previously the tail was
 dropped - see also #17) so no data is silently lost.
 
-## 2. `ellipse_ecc()`: `if M.any() > pi:` never True - eccentric moon positions wrong for half of every orbit - OPEN (not fixed yet)
+## 2. `ellipse_ecc()`: `if M.any() > pi:` never True - eccentric moon positions wrong near the periastron recurrence - FIXED
 
 Severity: critical for eccentric moon orbits (`e_moon > 0`)
-Location: `pandoramoon/ellipse.py:36-41` and `54-55`
+Location: `pandoramoon/ellipse.py:36-41` and `54-55` (at base commit)
+Fixed in: "Fix element-wise M>pi reflection in ellipse_ecc (bug #2)"
 
 The code:
 
@@ -124,35 +125,32 @@ element: for each time stamp either solve for `M` and use `E`, or solve for
   unaffected.
 - Interplay with bug #8 (fixed): the former `r = -(1 - e*cos(k))` negation
   mirrored the whole orbit through the barycenter, equivalent to redefining
-  `w_moon -> w_moon + 180 deg`. With #8 fixed, the `M in [0, pi)` half now
-  follows the standard convention; the `M >= pi` half remains incorrect until
-  this bug is fixed.
+  `w_moon -> w_moon + 180 deg`. With #8 fixed, the `M in [0, pi)` half
+  followed the standard convention while the `M >= pi` half remained
+  incorrect until this bug was fixed.
 
-**Why not fixed yet (project decision).** The correct fix requires an
-element-wise restructure of the solver (loop over time stamps or vectorized
-mask logic), which changes the numerical output for every eccentric-moon
-model and invalidates comparison with previously generated injection data.
-It should be accompanied by (a) a regression test against an independent
-reference solver (e.g. `scipy.optimize.brentq`/Newton to 1e-12) over a dense
-`(M, e)` grid, and (b) a check that example notebooks still recover injected
-parameters.
-
-**Planned fix sketch.**
+**Fix.** The reflection is now applied element-wise and vectorized:
 
 ```python
-for idx in range(len(time)):
-    m = (2 * pi / per) * (time[idx] - tau * per)
-    m = m - (np.floor(m / (2 * pi)) * 2 * pi)
-    flip = m > pi          # per element, not M.any() > pi
-    if flip:
-        m = 2 * pi - m
-    ... starter + corrector for m -> k ...
-    if flip:
-        k = 2 * pi - k
+M = M - (np.floor(M / (2 * pi)) * 2 * pi)
+flip = M > pi                                   # per element
+M = np.where(flip, 2 * pi - M, M)               # solve in [0, pi] only
+... starter + g/h/k corrector -> k ...
+k = np.where(flip, 2 * pi - k, k)               # un-reflect
 ```
 
-(or fully vectorized with `np.where`). Runtime cost is expected to be small
-relative to the rest of the model.
+The `arctan(tan(k/2))*2` true-anomaly branch already returns values in
+(-pi, pi] for k in (pi, 2*pi), which is equivalent modulo 2*pi, so no
+further branch handling is needed. Verified against a machine-precision
+bisection reference over dense (M, e) grids: positions now agree to
+~4e-16 over the *full* orbit for e in [0.1, 0.9] (previously up to
+~1.9e-1 rad anomaly error); the e -> 0 limit matches the circular
+`ellipse()`; periastron direction, M = pi, and M -> 2*pi edges are
+correct. Runtime cost of the two `np.where` passes: ~25 ns per time
+stamp (~10 ms per 100k stamps), negligible relative to the full model.
+The injection-retrieval notebook (circular injection) is unaffected by
+construction; eccentric injection-retrieval should be spot-checked
+against an independent ephemeris when next exercised.
 
 ## 3. `read_occult_cache()`: index wraparound for k <= 0.001 erases transits - FIXED
 
@@ -454,13 +452,14 @@ returns 0, which flows into the limb-darkening terms as a silently wrong
 value. In practice convergence takes < 10 iterations, but the failure mode
 should be loud. The fix raises `ValueError`.
 
-## 19. Examples set `params.e_moon`, but the model reads `params.ecc_moon` - OPEN (fix together with #2)
+## 19. Examples set `params.e_moon`, but the model reads `params.ecc_moon` - FIXED
 
-Severity: medium (examples silently ignore the moon eccentricity)
+Severity: medium (examples silently ignored the moon eccentricity)
 Location: `examples/example.py:29`, `examples/example_figure.py:29`,
 `examples/example_video.py:29`, `examples/example.ipynb`,
 `examples/injection_retrieval_simple_ultranest.ipynb`; attribute defined as
 `ecc_moon` in `pandoramoon/pandora.py:42` and read in `moon_model.__init__`.
+Fixed in: "Fix e_moon/ecc_moon attribute name in examples; use physical e=0.1 (bug #19)"
 
 Discovered during final verification of this patch series: the standard
 example output was bit-identical before and after fixing bug #8, although it
@@ -472,12 +471,15 @@ The misspelled attribute is silently ignored, so the examples actually model a
 (The injection-retrieval notebook uses `e_moon = 0`, which coincides with the
 effective default, so its injection is unaffected.)
 
-Not fixed in this series on purpose: renaming the attribute would make the
-examples exercise `ellipse_ecc()` with e = 0.9, i.e. the still-open bug #2
-(broken M > pi reflection), and the tutorial video would show a
-non-Keplerian moon for half of each orbit. Fix `examples/*.py` and both
-notebooks (`e_moon` -> `ecc_moon`) together with bug #2, then verify that
-injection-retrieval recovers the injected parameters.
+Fixed together with bug #2 as planned: the attribute is renamed to
+`ecc_moon` in all three example scripts and both notebooks. The tutorial
+examples' value was changed from 0.9 to 0.1: the 0.9 was never actually
+exercised (this bug) and is physically invalid for this configuration - at
+e = 0.9 the moon's periastron (a*(1-e) ~ 0.019 R_star) lies deep inside the
+planet (r_planet = 0.1 R_star), so the moon would pass through the planet
+once per orbit. At e = 0.1 the periastron (0.170 R_star) stays comfortably
+outside r_planet + r_moon = 0.135 R_star. The injection-retrieval notebook
+keeps its (circular) e = 0 under the corrected name.
 
 ## Known limitations (documented, not bugs)
 
@@ -494,6 +496,10 @@ injection-retrieval recovers the injected parameters.
   worst case 3.7 ppm over k in [0.002, 0.099]).
 - `pandora()` has no guard against `r_planet >= 1` / `r_moon >= 1`
   (now handled inside `occult_hybrid` via bug #16's fix) or negative radii.
+- `ellipse_ecc()` has no guard against `e_moon >= 1`: at e = 1 the true
+  anomaly factor `sqrt((1+e)/(1-e))` divides by zero (ZeroDivisionError in
+  numba), and e > 1 is a hyperbolic orbit outside the model's scope. The
+  starter/corrector has also only been validated for e < ~0.99.
 
 ## Verification
 
@@ -505,14 +511,20 @@ followed by a full `examples/example.py` run (light curve + 450-frame video).
 The model output changes relative to the base commit only for:
 - supersampled light curves (bug #1 - previously wrong),
 - bodies with k < 0.001 used through the cache (bug #3 - previously erased),
-- eccentric moon positions (bug #8 - previously mirrored by 180 deg),
+- eccentric moon orbits (bug #2 - previously wrong near the periastron
+  recurrence; bug #8 - previously mirrored by 180 deg),
 - the exact boundary/crash points (bugs #4-#7, #16 - previously garbage or
   exceptions).
 
-The standard `examples/example.py` run is bit-identical to the base commit
-(its planet uses `occult_hybrid`, its moon uses `occult_small` with the
-default circular orbit - see bug #19 - and none of its (z, k) values hit the
-fixed boundary points), confirming the fixes are non-regressive on the
-normal path. Its 450-frame video renders in ~26 s.
-Everything else (including the standard example planet light curve) is
+Through the first fix round the standard `examples/example.py` run was
+bit-identical to the base commit (its planet uses `occult_hybrid`, its moon
+ran the default circular orbit because of bug #19, and none of its (z, k)
+values hit the fixed boundary points), confirming those fixes were
+non-regressive on the normal path.
+
+After fixing bugs #2 and #19, the example exercises the eccentric solver
+for real (e_moon = 0.1), so its moon light curve now differs from the base
+commit - by design: it is now the correctly computed Keplerian orbit. The
+planet light curve is unchanged to numerical precision. Everything else
+(including the standard example planet light curve) is
 unchanged to numerical precision.
