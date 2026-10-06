@@ -24,6 +24,10 @@ def read_occult_cache(zs_target, k, cache):
     fs, ks, zs = cache
     flux = np.ones(len(zs_target))
     idx_k = int(np.ceil((k - ks[0]) / (ks[1] - ks[0])))
+    if idx_k < 1:
+        idx_k = 1
+    if idx_k > len(ks) - 1:
+        idx_k = len(ks) - 1
     ratio_k = (ks[idx_k] - k) / (ks[idx_k] - ks[idx_k - 1])
     curve = fs[idx_k - 1] * ratio_k + fs[idx_k] * (1 - ratio_k)
     for idx in range(len(zs_target)):

@@ -436,11 +436,15 @@ def pandora(
 
     # Cached Mandel-Agol occultation model for planet < 0.1, else hybrid
     if cache is not None and r_planet < 0.1:
-        flux_planet = read_occult_cache(
-            zs_target=z_planet, 
-            k=r_planet, 
-            cache=cache
-        )
+        if r_planet < cache[1][0]:
+            # k below the cache grid: use exact small-body approximation
+            flux_planet = occult_small(zs=z_planet, k=r_planet, u1=u1, u2=u2)
+        else:
+            flux_planet = read_occult_cache(
+                zs_target=z_planet, 
+                k=r_planet, 
+                cache=cache
+            )
     else:
         flux_planet = occult_hybrid(zs=z_planet, u1=u1, u2=u2, k=r_planet)
         #flux_planet = occult(zs=z_planet, u1=u1, u2=u2, k=r_planet)
@@ -449,7 +453,11 @@ def pandora(
     if r_moon < occult_small_threshold:
         flux_moon = occult_small(zs=z_moon, k=r_moon, u1=u1, u2=u2)
     elif cache is not None and r_moon < 0.1:
-        flux_moon = read_occult_cache(zs_target=z_moon, k=r_moon, cache=cache)
+        if r_moon < cache[1][0]:
+            # k below the cache grid: use exact small-body approximation
+            flux_moon = occult_small(zs=z_moon, k=r_moon, u1=u1, u2=u2)
+        else:
+            flux_moon = read_occult_cache(zs_target=z_moon, k=r_moon, cache=cache)
     else:
         flux_moon = occult_hybrid(zs=z_moon, k=r_moon, u1=u1, u2=u2)
 
