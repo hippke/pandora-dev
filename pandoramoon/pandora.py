@@ -379,7 +379,7 @@ def pandora(
     # Should be inside [Roche lobe, Hill sphere] plus/minus some user-set margin
     M_star = ((4 * pi ** 2 / G) * ((a_bary * R_star) ** 3)) / (per_bary * day) ** 2
     r_hill = a_bary * (M_planet / (3 * M_star)) ** (1 / 3)
-    r_hill_fraction = a_moon / r_hill
+    r_hill_fraction = a_moon * (1 + ecc_moon) / r_hill
     if r_hill_fraction > hill_sphere_threshold:
         unphysical = True
     else:
@@ -387,7 +387,7 @@ def pandora(
 
     # Roche lobe: Not used here, because we don't know densities of planet and moon
     # Instead of taking density guesses, we just demand a_moon > (R_planet + R_moon)
-    if a_moon < (r_planet + r_moon):
+    if a_moon * (1 - ecc_moon) < (r_planet + r_moon):
         unphysical = True
 
     # Unphysical moon orbit: Keep planet, but put moon at far out of transit position
