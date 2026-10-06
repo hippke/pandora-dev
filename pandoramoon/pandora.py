@@ -378,6 +378,49 @@ def pandora(
     i_moon = float(i_moon)
     M_moon = float(M_moon)
 
+    a_moon, x_bary, unphysical = _setup(
+        R_star, per_bary, a_bary, M_planet, M_moon, per_moon, ecc_moon,
+        r_planet, r_moon, t0_bary, t0_bary_offset, epoch_distance, ecc_bary,
+        w_bary, hill_sphere_threshold, time
+    )
+    xm, ym, xp, yp = _orbit(
+        time, x_bary, unphysical, a_moon, per_moon, tau_moon, Omega_moon,
+        w_moon, i_moon, ecc_moon, M_moon / M_planet, b_bary
+    )
+
+    # Occultations and mutual eclipses only for samples that can be in
+    # transit; all others have flux exactly 1 (see _cull_window)
+    idx = _cull_window(
+        x_bary, _cull_reach(a_moon, ecc_moon, r_planet, r_moon, unphysical, cache)
+    )
+    if len(idx) == len(time):
+        flux_planet, flux_moon = _window_fluxes(
+            xp, yp, xm, ym, unphysical, r_planet, r_moon, u1, u2,
+            occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+        )
+    else:
+        flux_planet_w, flux_moon_w = _window_fluxes(
+            xp[idx], yp[idx], xm[idx], ym[idx], unphysical, r_planet, r_moon,
+            u1, u2, occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+        )
+        flux_planet, flux_moon = _scatter(len(time), idx, flux_planet_w, flux_moon_w)
+    flux_planet, flux_moon, flux_total = _total_and_resample(
+        flux_planet, flux_moon, supersampling_factor
+    )
+    return flux_planet, flux_moon, flux_total, xp, yp, xm, ym
+
+
+# ----------------------------------------------------------------------------
+# Building blocks of pandora()
+# ----------------------------------------------------------------------------
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _setup(
+    R_star, per_bary, a_bary, M_planet, M_moon, per_moon, ecc_moon, r_planet,
+    r_moon, t0_bary, t0_bary_offset, epoch_distance, ecc_bary, w_bary,
+    hill_sphere_threshold, time
+):
+    """Planet-moon semi-major axis [R_star], barycentre x positions, and the
+    plausibility flag (unphysical moon orbits are moved out of transit)"""
     # Calculate moon period around planet
     G = 6.67408e-11
     day = 60 * 60 * 24
@@ -411,7 +454,15 @@ def pandora(
     # Instead of taking density guesses, we just demand a_moon > (R_planet + R_moon)
     if a_moon * (1 - ecc_moon) < (r_planet + r_moon):
         unphysical = True
+    return a_moon, x_bary, unphysical
 
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _orbit(
+    time, x_bary, unphysical, a_moon, per_moon, tau_moon, Omega_moon, w_moon,
+    i_moon, ecc_moon, mass_ratio, b_bary
+):
+    """Sky-plane coordinates xm, ym, xp, yp [R_star] of moon and planet"""
     # Unphysical moon orbit: Keep planet, but put moon at far out of transit position
     if unphysical:
         bignum = 1e8
@@ -429,7 +480,7 @@ def pandora(
                 i=i_moon,
                 time=time,
                 x_bary=x_bary,
-                mass_ratio=M_moon / M_planet,
+                mass_ratio=mass_ratio,
                 b_bary=b_bary,
             )
         else:
@@ -442,11 +493,54 @@ def pandora(
                 w=w_moon,
                 i=i_moon,
                 time=time,
-                mass_ratio=M_moon / M_planet,
+                mass_ratio=mass_ratio,
                 x_bary=x_bary,
                 b_bary=b_bary,
             )
+    return xm, ym, xp, yp
 
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _cull_reach(a_moon, ecc_moon, r_planet, r_moon, unphysical, cache):
+    """Conservative bound on |x_bary| [R_star] beyond which neither body can
+    touch the star, so that all fluxes are exactly 1.
+
+    Both bodies are offset from the barycentre by at most a_moon * (1 + e)
+    on the sky (|projected unit vector| <= 1, orbital radius <= a (1 + e);
+    the planet's share is a q/(1+q), the moon's a/(1+q)). A body has
+    flux exactly 1 for z >= 1 + r (occult_small/occult_hybrid) or, with the
+    occultation cache, for z >= 1.1 (bilinear interpolation reaches past
+    1 + r up to the grid end). Mutual eclipses only modify a moon flux < 1.
+    The margin 1e-6 covers float round-off."""
+    r_limit = 1 + r_planet
+    if not unphysical:  # moon at 1e8 otherwise
+        r_limit = 1 + max(r_planet, r_moon)
+    if cache is not None:
+        r_limit = max(r_limit, 1.1)
+    if unphysical:  # planet sits at the barycentre
+        return r_limit + 1e-6
+    return r_limit + a_moon * (1 + abs(ecc_moon)) + 1e-6
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _cull_window(x_bary, reach):
+    """Indices of samples with |x_bary| < reach (NaN is kept: not culled)"""
+    n = len(x_bary)
+    idx = np.empty(n, dtype=np.int64)
+    m = 0
+    for i in range(n):
+        if not (abs(x_bary[i]) >= reach):
+            idx[m] = i
+            m += 1
+    return idx[:m]
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _window_fluxes(
+    xp, yp, xm, ym, unphysical, r_planet, r_moon, u1, u2,
+    occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+):
+    """Planet and moon flux (incl. mutual eclipses) for the given samples"""
     # Distances of planet and moon from (0,0) = center of star
     # Not sufficient to only calculate z in ellipse func: 
     # We also need full coordinates to determine mutual eclipses below
@@ -488,6 +582,22 @@ def pandora(
         flux_moon = eclipse(
             xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, eclipse_pixelmap
         )
+    return flux_planet, flux_moon
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _scatter(n, idx, flux_planet_w, flux_moon_w):
+    """Full-length flux arrays: 1 everywhere except at the window indices"""
+    flux_planet = np.ones(n)
+    flux_moon = np.ones(n)
+    for j in range(len(idx)):
+        flux_planet[idx[j]] = flux_planet_w[j]
+        flux_moon[idx[j]] = flux_moon_w[j]
+    return flux_planet, flux_moon
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _total_and_resample(flux_planet, flux_moon, supersampling_factor):
     flux_total = flux_moon + flux_planet - 1
 
     # Supersampling downconversion
@@ -495,5 +605,4 @@ def pandora(
         flux_planet = resample(flux_planet, supersampling_factor)
         flux_moon = resample(flux_moon, supersampling_factor)
         flux_total = resample(flux_total, supersampling_factor)
-
-    return flux_planet, flux_moon, flux_total, xp, yp, xm, ym
+    return flux_planet, flux_moon, flux_total
