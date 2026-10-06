@@ -472,6 +472,8 @@ def occult_hybrid(zs, k, u1, u2):
         # Occulting body transits the source: Table 3, Case IV:
         if z < (1 - k):
             q = sqrt((x2 - x1) / (1 - x1))
+            if q >= 1:
+                q = 1 - 1e-8  # float rounding guard; ldx is overwritten by the special case below
             ldx = (
                 2
                 / 9
