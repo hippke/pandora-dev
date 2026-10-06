@@ -481,6 +481,114 @@ once per orbit. At e = 0.1 the periastron (0.170 R_star) stays comfortably
 outside r_planet + r_moon = 0.135 R_star. The injection-retrieval notebook
 keeps its (circular) e = 0 under the corrected name.
 
+---
+
+Bugs #20-#24 were found in a second audit pass (2026-10-06). Unlike the
+first pass, which cross-checked `occult` against `occult_hybrid` (both share
+the same Mandel-Agol formulas and can be wrong in the same way), this pass
+compared against an independent reference: direct radial integration of the
+quadratic limb-darkened disk (400k-point midpoint rule, ~0.01 ppm accurate).
+
+## 20. `occult_hybrid` returns NaN at z = |1 - k| (unclamped arccos argument) - FIXED
+
+Severity: high (silent NaN in the light curve)
+Location: `pandoramoon/occult.py:411-412` (also `250-251` in `occult`)
+Fixed in: "Clamp arccos arguments in occult/occult_hybrid partial case (bug #20)"
+
+```python
+kap0 = arccos(min((k2 + z2 - 1) / (2 * k * z), 1))
+```
+
+`min()` clamps the argument only from above. At z = 1 - k the argument is
+mathematically exactly -1; float rounding gives e.g. `-1.000000000000002`,
+so `arccos` returns NaN and the flux point is NaN. Verified: NaN for 69 of
+199 k values in (0, 1) at z = 1 - k, and 1 NaN in a 2001-point ingress grid
+at k = 0.01. `kap1` has the same issue at z = k - 1 for k > 1. `occult`
+survives only because its `+ epsilon` in the denominator shrinks the
+argument just inside [-1, 1].
+
+Impact: the injection-retrieval notebook calls `pandora.pandora()` without a
+cache, so every planet goes through `occult_hybrid`, and its likelihood uses
+`np.nansum`, which silently drops NaN points and biases the fit. The
+previous boundary sweep checked only for exceptions, not NaN.
+
+The fix clamps both arccos arguments to [-1, 1] in both functions.
+
+## 21. Case-IV special-case band too wide: up to 21 ppm error and a flux discontinuity - FIXED
+
+Severity: medium-high (systematic model error; discontinuous likelihood)
+Location: `pandoramoon/occult.py:336` (`occult`), `490` (`occult_hybrid`)
+Fixed in: "Narrow case-IV k+z=1 special-case band to 1e-8 (bug #21)"
+
+```python
+if abs(k + z - 1) < 1e-4:
+    ld = <value exactly at k + z = 1>
+```
+
+Within 1e-4 of z = 1 - k the limb-darkening term is replaced by its
+boundary value, so the flux is constant across the band and jumps at its
+edge. Measured against the independent reference just inside the band
+edge (jump at the edge is the same size):
+
+| k    | error / jump |
+|------|--------------|
+| 0.05 | 1.0 ppm      |
+| 0.1  | 2.8 ppm      |
+| 0.2  | 7.5 ppm      |
+| 0.3  | 13 ppm       |
+| 0.45 | 21 ppm       |
+
+The general case-IV formula stays accurate to < 0.03 ppm down to 1e-8 from
+the boundary (degrading only at ~1e-10). The fix narrows the tolerance to
+1e-8 in both functions, where the special value's own error is ~1e-3 ppm.
+
+## 22. Supersampling groups straddle epoch boundaries - FIXED
+
+Severity: medium (wrong supersampled light curves for common settings)
+Location: `pandoramoon/grids.py:29` with `pandoramoon/helpers.py:resample`
+Fixed in: "Make supersamples per epoch a multiple of supersampling_factor (bug #22)"
+
+```python
+cadences = int(supersampled_cadences_per_day * epoch_duration)
+```
+
+The number of supersamples per epoch is generally not a multiple of
+`supersampling_factor`, but `resample()` groups the flattened array in
+blocks of `factor` straight across epochs. Verified: cpd = 48,
+dur = 0.6 d, ssf = 5 gives 144 supersamples per epoch, and group 28
+averages a sample at t = 11.29 d with samples at t = 375.96 d; every later
+group is misaligned too. The fix uses
+`cadences = int(cadences_per_day * epoch_duration) * int(supersampling_factor)`,
+so each epoch holds exactly `int(cpd * dur)` complete groups.
+
+## 23. Physical-plausibility check ignores moon eccentricity - FIXED
+
+Severity: medium (unphysical orbits accepted)
+Location: `pandoramoon/pandora.py:382, 390`
+Fixed in: "Use periapsis/apoapsis in moon plausibility checks (bug #23)"
+
+The Hill-sphere check (`a_moon / r_hill`) and the planet-contact check
+(`a_moon < r_planet + r_moon`) both use the semi-major axis. For an
+eccentric moon the relevant distances are the periapsis a(1 - e) (contact)
+and apoapsis a(1 + e) (Hill sphere). Verified: e_moon = 0.9 (the original
+example value) is accepted as physical, yet the minimum planet-moon
+separation is 0.019 R_star vs r_planet + r_moon = 0.135 R_star - the moon
+passes through the planet every orbit. The fix uses a(1 + e) / r_hill and
+a(1 - e) < r_planet + r_moon (identical to before for e = 0).
+
+## 24. `video()` draws the stellar disk too small - FIXED
+
+Severity: low (visualization only)
+Location: `pandoramoon/pandora.py:184-185`
+Fixed in: "Draw full-size stellar disk in video() (bug #24)"
+
+`for i in reversed(range(ld_circles)): impact = i / ld_circles` makes the
+largest limb-darkening circle radius (n - 1)/n: 0.99 R_star for the
+default 100 circles, 0.9 for 10, so planets near the limb appear off-star
+while the model has them on-star. Each annulus is also coloured with the
+intensity of its outer edge. The fix draws radii (i + 1)/n, each coloured
+with the intensity at its annulus mid-radius.
+
 ## Known limitations (documented, not bugs)
 
 - `eclipse()` models only "planet occults moon" (the moon behind the planet).
