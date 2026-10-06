@@ -289,7 +289,7 @@ def occult(zs, k, u1, u2):
             q = sqrt((1 - (k - z) ** 2) / 4 / z / k)
 
             # Numerical stability: if k=0.06 then q is close to 1, ellpicb goes to hell
-            if (q - 1) < 1e-8:
+            if (1 - q) < 1e-8:
                 q -= 1e-8
             ld[i] = (
                 1
