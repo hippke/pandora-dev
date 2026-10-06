@@ -182,8 +182,9 @@ class moon_model(object):
             g_star = star_colors[row, 2]
             b_star = star_colors[row, 3]
             for i in reversed(range(ld_circles)):
-                impact = i / ld_circles
-                m = sqrt(1 - min(impact ** 2, 1))
+                impact = (i + 1) / ld_circles
+                r_mid = (i + 0.5) / ld_circles
+                m = sqrt(1 - min(r_mid ** 2, 1))
                 ld = 1 - self.u1 * (1 - m) - self.u2 * (1 - m) ** 2
                 r = r_star * ld
                 g = g_star * ld
