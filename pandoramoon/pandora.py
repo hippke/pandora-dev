@@ -11,7 +11,7 @@ from pandoramoon.eclipse import eclipse
 from pandoramoon.ellipse import ellipse, ellipse_ecc
 from pandoramoon.occult import occult, occult_small, occult_hybrid, create_occult_cache, read_occult_cache
 from pandoramoon.helpers import resample
-from pandoramoon.grids import timegrid, x_bary_grid, x_bary_window
+from pandoramoon.grids import timegrid, x_bary_grid, x_bary_window, x_bary_window_sorted
 
 
 class model_params(object):
@@ -463,7 +463,7 @@ def pandora_flux(
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
         occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
-        cache, eclipse_pixelmap
+        cache, eclipse_pixelmap, False
     )
     out_idx, fp, fm, ft = _window_cadences(
         len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
@@ -524,7 +524,7 @@ def pandora_deficit(
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
         occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
-        cache, eclipse_pixelmap
+        cache, eclipse_pixelmap, False
     )
     out_idx, fp, fm, ft = _window_cadences(
         len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
@@ -569,19 +569,23 @@ def pandora_window(
     numerical_grid,
     time,
     cache=None,
-    eclipse_pixelmap=False
+    eclipse_pixelmap=False,
+    time_sorted=False
 ):
     """Sparse model output: same arguments as pandora_flux(), returns
     (idx, flux_planet, flux_moon, flux_total), where idx (int64, ascending)
     are the output cadences near transit and the float64 fluxes are given
     there only. All other output cadences have flux exactly 1 (no full-length
-    array is created). pandora_flux() is this, densified."""
+    array is created). pandora_flux() is this, densified.
+    time_sorted=True: time is ascending (not checked); the window is then
+    found by binary search per epoch (same result, no pass over all
+    samples). Wrong results if time is not sorted."""
     idx, flux_planet_w, flux_moon_w = _window_model(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
         occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
-        cache, eclipse_pixelmap
+        cache, eclipse_pixelmap, time_sorted
     )
     return _window_cadences(
         len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
@@ -594,7 +598,7 @@ def pandora_loglike(
     t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
     i_moon, ecc_moon, w_moon, M_moon, epoch_distance, supersampling_factor,
     occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
-    data, inv_err, flat_terms, chi2_flat, cache, eclipse_pixelmap
+    data, inv_err, flat_terms, chi2_flat, cache, eclipse_pixelmap, time_sorted
 ):
     """Gaussian log-likelihood -chi^2/2 of the total flux, without
     full-length arrays: chi^2 = chi2_flat + sum over window cadences of
@@ -606,7 +610,7 @@ def pandora_loglike(
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
         occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
-        cache, eclipse_pixelmap
+        cache, eclipse_pixelmap, time_sorted
     )
     out_idx, fp, fm, ft = _window_cadences(
         len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
@@ -810,10 +814,13 @@ def _window_model(
     u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
     t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
     i_moon, ecc_moon, w_moon, M_moon, epoch_distance, occult_small_threshold,
-    hill_sphere_threshold, numerical_grid, time, cache, eclipse_pixelmap
+    hill_sphere_threshold, numerical_grid, time, cache, eclipse_pixelmap,
+    time_sorted
 ):
     """Culled model core: (ascending sample indices of the window, planet
-    flux, moon flux there). Samples outside the window have flux exactly 1."""
+    flux, moon flux there). Samples outside the window have flux exactly 1.
+    time_sorted=True (time ascending, caller's guarantee): the window is
+    found by binary search per epoch instead of a pass over all samples."""
     R_star = float(R_star)
     per_bary = float(per_bary)
     a_bary = float(a_bary)
@@ -834,11 +841,17 @@ def _window_model(
         r_planet, r_moon, hill_sphere_threshold
     )
     # Barycentre positions only for samples that can be in transit
-    idx, x_bary = x_bary_window(
-        time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
-        ecc_bary, w_bary,
-        _cull_reach(a_moon, ecc_moon, r_planet, r_moon, unphysical, cache)
-    )
+    reach = _cull_reach(a_moon, ecc_moon, r_planet, r_moon, unphysical, cache)
+    if time_sorted:
+        idx, x_bary = x_bary_window_sorted(
+            time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
+            ecc_bary, w_bary, reach
+        )
+    else:
+        idx, x_bary = x_bary_window(
+            time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
+            ecc_bary, w_bary, reach
+        )
     xm, ym, xp, yp = _orbit(
         time[idx], x_bary, unphysical, a_moon, per_moon, tau_moon,
         Omega_moon, w_moon, i_moon, ecc_moon, M_moon / M_planet, b_bary

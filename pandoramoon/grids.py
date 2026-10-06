@@ -96,3 +96,67 @@ def x_bary_window(
             x_win[m] = x
             m += 1
     return idx[:m].copy(), x_win[:m].copy()
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def x_bary_window_sorted(
+    time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance, ecc_bary,
+    w_bary, reach
+):
+    """Same result as x_bary_window() for ascending time, but only visits
+    samples near each transit: per epoch, x_bary is linear in time,
+    x = 2 (t - t_mid) / tdur with t_mid = t0_bary + per_bary * epoch +
+    t0_bary_offset, so |x| < reach only for |t - t_mid| < reach * tdur / 2.
+    That interval (plus a margin) is found by binary search; x and the test
+    are then evaluated exactly as in x_bary_window(). Falls back to
+    x_bary_window() if the window is not well inside one epoch (huge moon
+    orbits, very short periods) or for non-finite constants.
+    time MUST be ascending (not checked here; Likelihood checks it once)."""
+    tdur = per_bary / pi * arcsin(1 / a_bary)
+    if ecc_bary > 0:
+        tdur /= 1 / sqrt(1 - ecc_bary ** 2) * (1 + ecc_bary * cos((w_bary - 90) / 180 * pi))
+    t0_shift_planet = t0_bary_offset / (tdur / 2)
+    n = len(time)
+    half = reach * tdur / 2  # [days]
+    if n == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0)
+    # Margin covers round-off of t_mid and of x (|x| errors ~1e-12)
+    pad = 1e-6 * tdur + 1e-9 * (abs(time[0]) + abs(time[n - 1]))
+    if not (half + abs(t0_bary_offset) + pad < 0.45 * per_bary):
+        return x_bary_window(
+            time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
+            ecc_bary, w_bary, reach
+        )
+    e_first = int(np.floor((time[0] - t0_bary) / per_bary + 0.5))
+    e_last = int(np.floor((time[n - 1] - t0_bary) / per_bary + 0.5))
+    if e_last - e_first + 1 > n:  # more epochs than samples: scan instead
+        return x_bary_window(
+            time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
+            ecc_bary, w_bary, reach
+        )
+    # Count first (the windows are small), then fill
+    total = 0
+    for e in range(e_first, e_last + 1):
+        t_mid = t0_bary + per_bary * e + t0_bary_offset
+        lo = np.searchsorted(time, t_mid - half - pad, side="left")
+        hi = np.searchsorted(time, t_mid + half + pad, side="right")
+        total += hi - lo
+    idx = np.empty(total, dtype=np.int64)
+    x_win = np.empty(total)
+    m = 0
+    for e in range(e_first, e_last + 1):
+        t_mid = t0_bary + per_bary * e + t0_bary_offset
+        lo = np.searchsorted(time, t_mid - half - pad, side="left")
+        hi = np.searchsorted(time, t_mid + half + pad, side="right")
+        for i in range(lo, hi):
+            epoch = int(np.floor((time[i] - t0_bary) / per_bary + 0.5))
+            x = (
+                (2 * (time[i] - (t0_bary + epoch_distance * epoch))) / tdur
+                - t0_shift_planet
+                - (((per_bary - epoch_distance) * epoch) / (tdur / 2))
+            )
+            if not (abs(x) >= reach):
+                idx[m] = i
+                x_win[m] = x
+                m += 1
+    return idx[:m].copy(), x_win[:m].copy()

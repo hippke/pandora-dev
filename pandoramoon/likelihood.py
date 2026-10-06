@@ -43,6 +43,9 @@ class Likelihood(object):
             raise ValueError("supersampling_factor must be a positive integer")
         self.time = np.ascontiguousarray(time, dtype=np.float64)
         n = len(self.time)
+        # Ascending time (no NaN): the transit windows are found by binary
+        # search instead of a pass over all samples
+        self.time_sorted = bool(n < 2 or np.all(self.time[1:] >= self.time[:-1]))
         n_out = n if supersampling_factor == 1 else -(-n // supersampling_factor)
         data = np.asarray(data, dtype=np.float64)
         yerr = np.broadcast_to(np.asarray(yerr, dtype=np.float64), data.shape)
@@ -78,7 +81,7 @@ class Likelihood(object):
             self.supersampling_factor, self.occult_small_threshold,
             self.hill_sphere_threshold, self.numerical_grid, self.time, self.data,
             self.inv_err, self.flat_terms, self.chi2_flat, self.cache,
-            self.eclipse_pixelmap,
+            self.eclipse_pixelmap, self.time_sorted,
         )
 
     loglike = __call__
