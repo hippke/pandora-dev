@@ -710,12 +710,18 @@ the window by < 1e-9 cadence, which is negligible. Verified by
   order would matter only for non-opaque bodies or the bodies' own light
   (atmospheres, rings, reflected or thermal emission), which Pandora does
   not model.
-- The accuracy of the overlap term is a separate open question (not
-  validated independently yet): it uses the geometric area fraction times
-  the moon's limb-darkened deficit, plus the limb raster below.
-- `pixelart()` mutual-eclipse areas are computed on a
-  `numerical_grid`-sized raster (default 25x25), ~2-4% pixelization error on
-  partial planet-moon overlaps near the limb (design tradeoff).
+- The mutual-eclipse correction scales the moon's limb-darkened deficit by
+  the *geometric* fraction of its on-star area covered by the planet. Limb
+  darkening is not weighted across the overlap. Whether this matters at the
+  ppm level is still open (TASKS_TESTING T4).
+- Overlap *area* on the stellar limb: since the analytic method became the
+  default (`eclipse_method="analytic"`, `pandoramoon/overlap_analytic.py`),
+  it is exact to < 1e-6 of the moon area against an independent
+  integration. The legacy `eclipse_method="pixelmap"` (`pixelart()` on a
+  `numerical_grid` raster, default 25) is off by up to ~1 % of the moon area
+  (er itself is off by up to 1.0 when only a sliver of the moon is on the
+  star). In the regression cases that is up to 4.4 ppm (case 6) and
+  0.07 ppm spurious moon signal in case 7, where the moon is fully hidden.
 - The occultation cache is float32 and bilinear in (z, k): ~0.06 ppm
   quantization plus interpolation error of a few ppm near ingress (measured
   worst case 3.7 ppm over k in [0.002, 0.099]).

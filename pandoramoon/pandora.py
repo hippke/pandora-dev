@@ -52,6 +52,10 @@ class model_params(object):
         self.occult_small_threshold = 0.01
         self.hill_sphere_threshold = 1.1
         self.numerical_grid = 25
+        # Mutual eclipses with a body on the stellar limb:
+        # "analytic" (exact 3-circle overlap, default) or "pixelmap"
+        # (legacy pixel raster of size numerical_grid)
+        self.eclipse_method = "analytic"
         self.time = None
 
 
@@ -110,8 +114,19 @@ class moon_model(object):
         self.occult_small_threshold = params.occult_small_threshold
         self.hill_sphere_threshold = params.hill_sphere_threshold
         self.numerical_grid = params.numerical_grid
+        self.eclipse_method = getattr(params, "eclipse_method", "analytic")
+        self._eclipse_pixelmap()  # validate early
         self.time = params.time
         self.cache = create_occult_cache(self.u1, self.u2, dim=300)
+
+    def _eclipse_pixelmap(self):
+        if self.eclipse_method == "analytic":
+            return False
+        if self.eclipse_method == "pixelmap":
+            return True
+        raise ValueError(
+            'eclipse_method must be "analytic" or "pixelmap", got %r' % (self.eclipse_method,)
+        )
 
     def video(
         self,
@@ -162,7 +177,8 @@ class moon_model(object):
             self.occult_small_threshold,
             self.hill_sphere_threshold,
             self.numerical_grid,
-            time
+            time,
+            eclipse_pixelmap=self._eclipse_pixelmap()
         )
         # Build video with matplotlib
         fig = plt.figure(figsize=(5, 5))
@@ -265,7 +281,8 @@ class moon_model(object):
             self.hill_sphere_threshold,
             self.numerical_grid,
             time,
-            self.cache
+            self.cache,
+            eclipse_pixelmap=self._eclipse_pixelmap()
         )
         return flux_total, flux_planet, flux_moon
 
@@ -302,7 +319,8 @@ class moon_model(object):
             self.occult_small_threshold,
             self.hill_sphere_threshold,
             self.numerical_grid,
-            time
+            time,
+            eclipse_pixelmap=self._eclipse_pixelmap()
         )
         return px, py, mx, my
 
@@ -338,8 +356,11 @@ def pandora(
     hill_sphere_threshold,
     numerical_grid,
     time,
-    cache=None
+    cache=None,
+    eclipse_pixelmap=False
 ):
+    # eclipse_pixelmap=False: limb mutual eclipses via the exact analytic
+    # three-circle overlap (default); True: legacy pixelart() raster.
 
     # Make sure to work with floats. Large values as ints would overflow.
     R_star = float(R_star)
@@ -464,7 +485,9 @@ def pandora(
 
     # Mutual planet-moon occultations
     if not unphysical:# and eclipses_occur:
-        flux_moon = eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid)
+        flux_moon = eclipse(
+            xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, eclipse_pixelmap
+        )
     flux_total = flux_moon + flux_planet - 1
 
     # Supersampling downconversion

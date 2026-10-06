@@ -1,6 +1,7 @@
 import numpy as np
 from numpy import sqrt, pi, arccos, abs, ceil, fliplr, flipud
 from numba import jit
+from pandoramoon.overlap_analytic import er_fast
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
@@ -98,7 +99,7 @@ def pixelart(xp, yp, xm, ym, r_planet, r_moon, numerical_grid):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid):
+def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, use_pixelmap=False):
     """Checks if planet-moon occultation present. If yes, returns adjusted moon flux.
     Parameters
     ----------
@@ -108,6 +109,13 @@ def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid):
         Planet and moon radii. Normalized so that R_star = 1
     flux_moon : float
         Un-occulted moon flux (from Mandel-Agol model) in [0,1]
+    numerical_grid : int
+        Raster diameter [pixels] for pixelart(); used only if use_pixelmap
+        (or as fallback for an exactly degenerate analytic configuration)
+    use_pixelmap : bool
+        False (default): limb eclipses use the exact analytic three-circle
+        overlap (overlap_analytic.er_fast). True: the legacy pixel raster
+        pixelart(), bit-identical to Pandora before the analytic method.
 
     Returns
     -------
@@ -123,7 +131,8 @@ def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid):
     # Planet-Moon occultation
     # Case 1: No occultation
     # Case 2: Occultation, both bodies on star or off star --> 2-circle intersect
-    # Case 3: Occultation, any body on limb --> Numerical solution
+    # Case 3: Occultation, any body on limb --> analytic 3-circle overlap
+    #         (default) or numerical pixel raster (use_pixelmap=True)
     for idx in range(len(xp)):
         planet_moon_occultation = False
         on_limb = False
@@ -147,17 +156,31 @@ def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid):
         if planet_moon_occultation and not on_limb:
             er = eclipse_ratio(distance_p_m, r_planet, r_moon)
 
-        # Case 3: Occultation, any body on limb --> numerical estimate with pixel-art
+        # Case 3: Occultation, any body on limb
         if planet_moon_occultation and on_limb:
-            er = pixelart(
-                xp[idx],
-                yp[idx],
-                xm[idx],
-                ym[idx],
-                r_planet,
-                r_moon,
-                numerical_grid
-            )
+            if use_pixelmap:
+                er = pixelart(
+                    xp[idx],
+                    yp[idx],
+                    xm[idx],
+                    ym[idx],
+                    r_planet,
+                    r_moon,
+                    numerical_grid
+                )
+            else:
+                # Argument order differs from pixelart: (xp, yp, rp, xm, ym, rm)
+                er = er_fast(xp[idx], yp[idx], r_planet, xm[idx], ym[idx], r_moon)
+                if er != er:  # NaN: measure-zero degenerate geometry
+                    er = pixelart(
+                        xp[idx],
+                        yp[idx],
+                        xm[idx],
+                        ym[idx],
+                        r_planet,
+                        r_moon,
+                        numerical_grid
+                    )
 
         # For Cases 2+3: Calculate reduced moon flux
         if er > 0:
