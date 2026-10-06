@@ -782,6 +782,39 @@ has no gap. Pinned by `test_hybrid_second_contact_gap` (both functions; for
 `occult`: continuity with the next float, since it still uses the ellk/ellec
 polynomials, ~2 ppm near z = 1 - k for k ~ 0.001).
 
+## 30. `occult_hybrid` / `occult` replace k by 0.5 for |k - 0.5| < 1e-4: up to 150 ppm - FIXED
+
+Severity: medium for k within 1e-4 of 0.5 (giant planets around small
+stars), none otherwise
+Location: `pandoramoon/occult.py`, first lines of `occult_hybrid` and `occult`
+Fixed in: "Do not snap k to 0.5 in occult_hybrid / occult (bug #30)"
+
+Both functions started with `if abs(k - 0.5) < 1e-4: k = 0.5`, a
+"numerical stability" guard of the original PyTransit-derived code (the
+Table 3 Case V/VI closed forms at z = k need the modulus 2k or 1/(2k) < 1).
+For k in (0.4999, 0.5001) the model therefore described a body of radius
+0.5 instead of k. Verified against mpmath (radial quadrature, dps 30;
+`scratch_k05/scan.py`), at k = 0.5 -+ 1e-4:
+- the error is largest at mid-transit of a central transit (z = 0), where
+  the occulted disk is fully on the star: 2 k |dk| I(r = k) / <I>, i.e.
+  -/+114 ppm for u = (0.4, 0.25), 100 ppm for uniform LD, 130 ppm for
+  u = (1, 0), **150 ppm for u = (2, -1)** (the edge of the physical LD
+  range); about 4.6e-4 of the transit depth;
+- fully on the star (z <= 1 - k) the error depends only on I along the
+  body's rim; on the limb it falls to ~42 ppm at z = 1 and to 0 at first
+  contact; it scales linearly with |k - 0.5| (half at 5e-5).
+
+Since P15 `occult_hybrid` evaluates k = 0.5 and z -> k exactly (lanes the
+fixed-step batch does not converge go to the scalar fallback), so the snap
+is simply removed: now exact (<= 1e-10; <= 3e-9 at z = 1 - k = k = 0.5
+exactly, the limb area's arccos). In `occult` the Case V/VI values were
+always overwritten by Case III/IV, so the snap is removed there too
+(Case VI is skipped for 2k >= 1); `occult` is then within its ellk/ellec
+polynomial accuracy (<= 0.5 ppm near z = 0.5). No regression case or perf
+draw has k near 0.5: outputs there are bit-identical, speed unchanged.
+Pinned by `test_no_k_snap_near_one_half` (embedded mpmath fluxes at
+k = 0.5 -+ 9e-5, -+ 1e-6 and 0.5; fails on the old code by 103 ppm).
+
 ## Known limitations (documented, not bugs)
 
 - Mutual eclipses are independent of which body is in front: this is

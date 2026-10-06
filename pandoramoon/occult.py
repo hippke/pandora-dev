@@ -257,9 +257,8 @@ def occult(zs, k, u1, u2):
     -------
     Transit model evaluated at `z`.
     """
-    if abs(k - 0.5) < 1e-4:
-        k = 0.5
-
+    # No k -> 0.5 snap for |k - 0.5| < 1e-4 any more (bug #30: up to 150 ppm);
+    # the Case V/VI values below are overwritten by Case III/IV anyway
     INV_PI = 1 / pi
     k2 = k**2
     lzs = len(zs)
@@ -327,8 +326,8 @@ def occult(zs, k, u1, u2):
                     * INV_PI
                     * (kap1 + k2 * (k2 + 2 * z2) * kap0 - (1 + 5 * k2 + z2) / 4 * dist)
                 )
-            elif z < 0.5:
-                # ! Table 3, Case VI.:
+            elif z < 0.5 and 2 * k < 1:
+                # ! Table 3, Case VI. (needs modulus 2k < 1):
                 ld[i] = 1 / 3 + 2 / 9 * INV_PI * (
                     4 * (2 * k2 - 1) * ellec(2 * k) + (1 - 4 * k2) * ellk(2 * k)
                 )
@@ -586,9 +585,9 @@ def occult_hybrid(zs, k, u1, u2):
     -------
     Transit model evaluated at `z`.
     """
-    if abs(k - 0.5) < 1e-4:
-        k = 0.5
-
+    # k is used as given: the old snap k -> 0.5 for |k - 0.5| < 1e-4 was up
+    # to 150 ppm off (bug #30); the closed-form operands (P15) are exact at
+    # k = 0.5 and z -> k (non-converged lanes take the scalar fallback)
     INV_PI = 1 / pi
     k2 = k**2
     n_z = len(zs)
