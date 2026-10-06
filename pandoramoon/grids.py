@@ -24,9 +24,7 @@ def timegrid(t0_bary, epochs, epoch_duration, cadences_per_day, epoch_distance, 
     # Then, 5x denser in time sampling, and averaging after, approximates effect
     if supersampling_factor < 1:
         raise ValueError("supersampling_factor must be a positive integer")
-    supersampled_cadences_per_day = cadences_per_day * int(supersampling_factor)
-
-    cadences = int(supersampled_cadences_per_day * epoch_duration)
+    cadences = int(cadences_per_day * epoch_duration) * int(supersampling_factor)
     time = np.empty(shape=(epochs, cadences))
     for epoch in range(epochs):
         time[epoch] = np.linspace(t_starts[epoch], t_ends[epoch], cadences)
