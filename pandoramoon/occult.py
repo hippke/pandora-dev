@@ -225,7 +225,7 @@ def occult(zs, k, u1, u2):
             z = k + 1e-6
 
         # The source is unocculted
-        if z > 1 + k or z < 0:
+        if z >= 1 + k or z < 0:
             flux[i] = 1
             le[i] = 0
             ld[i] = 0
@@ -390,7 +390,7 @@ def occult_hybrid(zs, k, u1, u2):
             z = k + 1e-6
 
         # Source is unocculted
-        if z > 1 + k or z < 0:
+        if z >= 1 + k or z < 0:
             if i >= 0:
                 flux[i] = 1
             continue
