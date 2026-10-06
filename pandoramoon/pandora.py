@@ -8,7 +8,7 @@ from os import path
 
 # Pandora
 from pandoramoon.eclipse import eclipse
-from pandoramoon.ellipse import ellipse, ellipse_ecc
+from pandoramoon.ellipse import ellipse, ellipse_ecc, ellipse_z, ellipse_ecc_z
 from pandoramoon.occult import occult, occult_small, occult_hybrid, create_occult_cache, read_occult_cache
 from pandoramoon.helpers import resample
 from pandoramoon.grids import timegrid, x_bary_grid, x_bary_window, x_bary_window_sorted
@@ -702,6 +702,36 @@ def _orbit(
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _orbit_z(
+    time, x_bary, unphysical, a_moon, per_moon, tau_moon, Omega_moon, w_moon,
+    i_moon, ecc_moon, mass_ratio, b_bary
+):
+    """_orbit() plus the distances from the stellar centre, in one fused
+    loop per sample: (xm, ym, xp, yp, zm, zp). For the culled path
+    (_window_model); pandora() keeps _orbit() and _window_fluxes()."""
+    if unphysical:
+        n = len(x_bary)
+        xp = x_bary
+        yp = np.full(n, b_bary)
+        xm = np.full(n, 1e8)
+        ym = xm.copy()
+        zp = np.empty(n)
+        for j in range(n):
+            zp[j] = sqrt(xp[j] ** 2 + b_bary ** 2)
+        zm = xm.copy()
+        return xm, ym, xp, yp, zm, zp
+    if ecc_moon == 0:
+        return ellipse_z(
+            a_moon, per_moon, tau_moon, Omega_moon, i_moon, time, x_bary,
+            mass_ratio, b_bary
+        )
+    return ellipse_ecc_z(
+        a_moon, per_moon, ecc_moon, tau_moon, Omega_moon, w_moon, i_moon, time,
+        mass_ratio, x_bary, b_bary
+    )
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _cull_reach(a_moon, ecc_moon, r_planet, r_moon, unphysical, cache):
     """Conservative bound on |x_bary| [R_star] beyond which neither body can
     touch the star, so that all fluxes are exactly 1.
@@ -750,7 +780,18 @@ def _window_fluxes(
         z_moon = xm.copy()
     else:
         z_moon = sqrt(xm ** 2 + ym ** 2)
+    return _window_fluxes_z(
+        xp, yp, xm, ym, z_planet, z_moon, unphysical, r_planet, r_moon, u1, u2,
+        occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+    )
 
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _window_fluxes_z(
+    xp, yp, xm, ym, z_planet, z_moon, unphysical, r_planet, r_moon, u1, u2,
+    occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+):
+    """_window_fluxes() with precomputed distances z_planet, z_moon"""
     # Cached Mandel-Agol occultation model for planet < 0.1, else hybrid
     if cache is not None and r_planet < 0.1:
         if r_planet < cache[1][0]:
@@ -852,12 +893,12 @@ def _window_model(
             time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
             ecc_bary, w_bary, reach
         )
-    xm, ym, xp, yp = _orbit(
+    xm, ym, xp, yp, zm, zp = _orbit_z(
         time[idx], x_bary, unphysical, a_moon, per_moon, tau_moon,
         Omega_moon, w_moon, i_moon, ecc_moon, M_moon / M_planet, b_bary
     )
-    flux_planet_w, flux_moon_w = _window_fluxes(
-        xp, yp, xm, ym, unphysical, r_planet, r_moon, u1, u2,
+    flux_planet_w, flux_moon_w = _window_fluxes_z(
+        xp, yp, xm, ym, zp, zm, unphysical, r_planet, r_moon, u1, u2,
         occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
     )
     return idx, flux_planet_w, flux_moon_w
