@@ -11,7 +11,9 @@ from pandoramoon.eclipse import eclipse, eclipse_possible
 from pandoramoon.ellipse import ellipse, ellipse_ecc, ellipse_z, ellipse_ecc_z
 from pandoramoon.occult import occult, occult_small, occult_hybrid, create_occult_cache, read_occult_cache
 from pandoramoon.helpers import resample
-from pandoramoon.grids import timegrid, x_bary_grid, x_bary_window, x_bary_window_sorted
+from pandoramoon.grids import (
+    timegrid, x_bary_grid, x_bary_window, x_bary_window_sorted, x_bary_window_sorted_t
+)
 
 
 class model_params(object):
@@ -889,8 +891,8 @@ def _window_model(
     )
     # Barycentre positions only for samples that can be in transit
     reach = _cull_reach(a_moon, ecc_moon, r_planet, r_moon, unphysical, cache)
-    if time_sorted:
-        idx, x_bary = x_bary_window_sorted(
+    if time_sorted:  # P11: window times come from the search itself
+        idx, x_bary, time_w = x_bary_window_sorted_t(
             time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
             ecc_bary, w_bary, reach
         )
@@ -899,8 +901,9 @@ def _window_model(
             time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
             ecc_bary, w_bary, reach
         )
+        time_w = time[idx]
     xm, ym, xp, yp, zm, zp = _orbit_z(
-        time[idx], x_bary, unphysical, a_moon, per_moon, tau_moon,
+        time_w, x_bary, unphysical, a_moon, per_moon, tau_moon,
         Omega_moon, w_moon, i_moon, ecc_moon, M_moon / M_planet, b_bary
     )
     flux_planet_w, flux_moon_w = _window_fluxes_z(

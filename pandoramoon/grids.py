@@ -99,19 +99,47 @@ def x_bary_window(
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def x_bary_window_sorted(
+def _x_bary_window_t(
     time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance, ecc_bary,
     w_bary, reach
 ):
-    """Same result as x_bary_window() for ascending time, but only visits
-    samples near each transit: per epoch, x_bary is linear in time,
-    x = 2 (t - t_mid) / tdur with t_mid = t0_bary + per_bary * epoch +
+    """x_bary_window() plus the window times time[idx]"""
+    idx, x_win = x_bary_window(
+        time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
+        ecc_bary, w_bary, reach
+    )
+    return idx, x_win, time[idx]
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def x_bary_window_sorted_t(
+    time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance, ecc_bary,
+    w_bary, reach
+):
+    """Window search for ascending time: (idx, x_bary, time[idx]) as
+    x_bary_window(), but only visits samples near each transit. Per epoch
+    e, x_bary is linear in time, x = 2 (t - t_mid) / tdur with t_mid = t0_bary + per_bary * e +
     t0_bary_offset, so |x| < reach only for |t - t_mid| < reach * tdur / 2.
-    That interval (plus a margin) is found by binary search; x and the test
-    are then evaluated exactly as in x_bary_window(). Falls back to
-    x_bary_window() if the window is not well inside one epoch (huge moon
-    orbits, very short periods) or for non-finite constants.
-    time MUST be ascending (not checked here; Likelihood checks it once)."""
+    That interval (plus a margin) is found by binary search.
+
+    P11: the guard below puts every candidate sample within 0.45 per_bary
+    of t0_bary + per_bary * e, so x_bary_window()'s per-sample epoch
+    floor((t - t0_bary) / per_bary + 0.5) equals e: the epoch terms are
+    hoisted out of the per-sample loop (this also avoids the fastmath
+    re-association of t - (t0_bary + epoch_distance * e), so the returned x
+    is within ~1 ulp of exact; the scan's x is off by up to ~4e-13). Inside
+    one epoch x is non-decreasing in t (each rounded operation is
+    monotonic), so the samples with |x| < reach form one contiguous run per
+    epoch: only the margin samples at both ends are tested, and the run is
+    filled branch-free (vectorised) with idx, x and t. The index set equals
+    x_bary_window()'s except possibly for samples with |x| within ~1e-12
+    of reach, where the different x round-off decides; such samples have
+    flux exactly 1 either way (reach carries a 1e-6 margin).
+
+    Falls back to x_bary_window() if the window is not well inside one
+    epoch (huge moon orbits, very short periods) or for non-finite
+    constants. time MUST be ascending (not checked here; Likelihood checks
+    it once)."""
     tdur = per_bary / pi * arcsin(1 / a_bary)
     if ecc_bary > 0:
         tdur /= 1 / sqrt(1 - ecc_bary ** 2) * (1 + ecc_bary * cos((w_bary - 90) / 180 * pi))
@@ -119,44 +147,71 @@ def x_bary_window_sorted(
     n = len(time)
     half = reach * tdur / 2  # [days]
     if n == 0:
-        return np.empty(0, dtype=np.int64), np.empty(0)
+        return np.empty(0, dtype=np.int64), np.empty(0), np.empty(0)
     # Margin covers round-off of t_mid and of x (|x| errors ~1e-12)
     pad = 1e-6 * tdur + 1e-9 * (abs(time[0]) + abs(time[n - 1]))
     if not (half + abs(t0_bary_offset) + pad < 0.45 * per_bary):
-        return x_bary_window(
+        return _x_bary_window_t(
             time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
             ecc_bary, w_bary, reach
         )
     e_first = int(np.floor((time[0] - t0_bary) / per_bary + 0.5))
     e_last = int(np.floor((time[n - 1] - t0_bary) / per_bary + 0.5))
-    if e_last - e_first + 1 > n:  # more epochs than samples: scan instead
-        return x_bary_window(
+    n_ep = e_last - e_first + 1
+    if n_ep > n:  # more epochs than samples: scan instead
+        return _x_bary_window_t(
             time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
             ecc_bary, w_bary, reach
         )
-    # Count first (the windows are small), then fill
+    # Per epoch: exact run [lo, hi) of window samples (the windows are small)
+    los = np.empty(n_ep, dtype=np.int64)
+    his = np.empty(n_ep, dtype=np.int64)
     total = 0
-    for e in range(e_first, e_last + 1):
+    for k in range(n_ep):
+        e = e_first + k
         t_mid = t0_bary + per_bary * e + t0_bary_offset
         lo = np.searchsorted(time, t_mid - half - pad, side="left")
         hi = np.searchsorted(time, t_mid + half + pad, side="right")
+        c_t = t0_bary + epoch_distance * e
+        c_d = ((per_bary - epoch_distance) * e) / (tdur / 2)
+        while lo < hi and abs((2 * (time[lo] - c_t)) / tdur - t0_shift_planet - c_d) >= reach:
+            lo += 1
+        while hi > lo and abs((2 * (time[hi - 1] - c_t)) / tdur - t0_shift_planet - c_d) >= reach:
+            hi -= 1
+        los[k] = lo
+        his[k] = hi
         total += hi - lo
     idx = np.empty(total, dtype=np.int64)
     x_win = np.empty(total)
+    t_win = np.empty(total)
     m = 0
-    for e in range(e_first, e_last + 1):
-        t_mid = t0_bary + per_bary * e + t0_bary_offset
-        lo = np.searchsorted(time, t_mid - half - pad, side="left")
-        hi = np.searchsorted(time, t_mid + half + pad, side="right")
-        for i in range(lo, hi):
-            epoch = int(np.floor((time[i] - t0_bary) / per_bary + 0.5))
-            x = (
-                (2 * (time[i] - (t0_bary + epoch_distance * epoch))) / tdur
-                - t0_shift_planet
-                - (((per_bary - epoch_distance) * epoch) / (tdur / 2))
-            )
-            if not (abs(x) >= reach):
-                idx[m] = i
-                x_win[m] = x
-                m += 1
-    return idx[:m].copy(), x_win[:m].copy()
+    for k in range(n_ep):
+        e = e_first + k
+        c_t = t0_bary + epoch_distance * e
+        c_d = ((per_bary - epoch_distance) * e) / (tdur / 2)
+        lo = los[k]
+        cnt = his[k] - lo
+        for j in range(cnt):
+            t = time[lo + j]
+            idx[m + j] = lo + j
+            t_win[m + j] = t
+            x_win[m + j] = (2 * (t - c_t)) / tdur - t0_shift_planet - c_d
+        m += cnt
+    return idx, x_win, t_win
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def x_bary_window_sorted(
+    time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance, ecc_bary,
+    w_bary, reach
+):
+    """x_bary_window() for ascending time, found by binary search per
+    epoch: (idx, x_bary). See x_bary_window_sorted_t(), which also returns
+    the window times; x agrees with x_bary_window() to ~1e-12 (the index
+    set too, except at |x| = reach within round-off). time MUST be
+    ascending."""
+    idx, x_win, _ = x_bary_window_sorted_t(
+        time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
+        ecc_bary, w_bary, reach
+    )
+    return idx, x_win
