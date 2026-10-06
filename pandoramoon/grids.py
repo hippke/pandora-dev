@@ -23,8 +23,7 @@ def timegrid(t0_bary, epochs, epoch_duration, cadences_per_day, epoch_distance, 
     # To counter the effect: Set supersampling_factor = 5 (recommended value)
     # Then, 5x denser in time sampling, and averaging after, approximates effect
     if supersampling_factor < 1:
-        print("supersampling_factor must be positive integer")
-    supersampled_cadences_per_day = cadences_per_day * int(supersampling_factor)
+        raise ValueError("supersampling_factor must be a positive integer")
     supersampled_cadences_per_day = cadences_per_day * int(supersampling_factor)
 
     cadences = int(supersampled_cadences_per_day * epoch_duration)
