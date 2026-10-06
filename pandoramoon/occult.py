@@ -284,7 +284,7 @@ def occult(zs, k, u1, u2):
         # Occulting body partly occults the source and crosses the limb:
         # Table 3, Case III:
         if (z >= 0.5 + abs(k - 0.5) and z < 1 + k) or (
-            k > 0.5 and z > abs(1 - k) and z < k
+            k > 0.5 and z >= abs(1 - k) and z < k
         ):
             q = sqrt((1 - (k - z) ** 2) / 4 / z / k)
 
@@ -311,7 +311,7 @@ def occult(zs, k, u1, u2):
                 * (
                     kap1
                     + k2 * (k2 + 2 * z2) * kap0
-                    - (1 + 5 * k2 + z2) / 4 * sqrt((1 - x1) * (x2 - 1))
+                    - (1 + 5 * k2 + z2) / 4 * sqrt(max((1 - x1) * (x2 - 1), 0))
                 )
             )
 
@@ -411,10 +411,15 @@ def occult_hybrid(zs, k, u1, u2):
             lex = k2
 
         # Occulting body partly occults source and crosses the limb: Case III:
-        if (z > 0.5 + abs(k - 0.5) and z < 1 + k) or (
-            k > 0.5 and z > abs(1 - k) and z < k
+        if (z >= 0.5 + abs(k - 0.5) and z < 1 + k) or (
+            k > 0.5 and z >= abs(1 - k) and z < k
         ):
             q = sqrt((1 - (k - z) ** 2) / 4 / z / k)
+
+            # Numerical stability: q is close to 1 at the lower z boundary,
+            # which makes ellpicb diverge; push it slightly below 1
+            if (1 - q) < 1e-8:
+                q -= 1e-8
             ldx = (
                 1
                 / 9
@@ -435,7 +440,7 @@ def occult_hybrid(zs, k, u1, u2):
                 * (
                     kap1
                     + k2 * (k2 + 2 * z2) * kap0
-                    - (1 + 5 * k2 + z2) / 4 * sqrt((1 - x1) * (x2 - 1))
+                    - (1 + 5 * k2 + z2) / 4 * sqrt(max((1 - x1) * (x2 - 1), 0))
                 )
             )
 
