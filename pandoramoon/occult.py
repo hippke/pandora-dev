@@ -391,7 +391,8 @@ def occult_hybrid(zs, k, u1, u2):
 
         # Source is unocculted
         if z > 1 + k or z < 0:
-            flux[i] = 1
+            if i >= 0:
+                flux[i] = 1
             continue
 
         z2 = z**2
@@ -493,8 +494,8 @@ def occult_hybrid(zs, k, u1, u2):
         else:
             flux[i] = current_flux
 
-        # Some combinations of (u1,u2) cause flux>1 which is unphysical
-        if flux[i] > 1:
+            # Some combinations of (u1,u2) cause flux>1 which is unphysical
+            if flux[i] > 1:
                 flux[i] = 1
 
     return flux
