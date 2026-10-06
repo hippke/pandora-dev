@@ -139,7 +139,7 @@ def ellpicb(n, k):
             e = kc * m0
         else:
             return HALF_PI * (c * m0 + d) / (m0 * (m0 + p))
-    return 0
+    raise ValueError("ellpicb did not converge")
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
