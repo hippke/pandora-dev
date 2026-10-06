@@ -333,7 +333,7 @@ def occult(zs, k, u1, u2):
             )
             if z < k:
                 ld[i] = ld[i] + 2 / 3
-            if abs(k + z - 1) < 1e-4:
+            if abs(k + z - 1) < 1e-8:
                 ld[i] = 2 / 3 * INV_PI * arccos(1 - 2 * k) - 4 / 9 * INV_PI * sqrt(
                     k * (1 - k)
                 ) * (3 + 2 * k - 8 * k2)
@@ -487,7 +487,7 @@ def occult_hybrid(zs, k, u1, u2):
             )
             if z < k:
                 ldx = ldx + 2 / 3
-            if abs(k + z - 1) < 1e-4:
+            if abs(k + z - 1) < 1e-8:
                 ldx = 2 / 3 * INV_PI * arccos(1 - 2 * k) - 4 / 9 * INV_PI * sqrt(
                     k * (1 - k)
                 ) * (3 + 2 * k - 8 * k2)
