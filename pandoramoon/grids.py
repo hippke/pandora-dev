@@ -26,7 +26,10 @@ def timegrid(t0_bary, epochs, epoch_duration, cadences_per_day, epoch_distance, 
     # int(...) cadences fill at most epoch_duration; the block is centred on
     # the epoch mid-time, so for integer cadences_per_day * epoch_duration
     # the exposures tile [t_start, t_end] exactly.
-    cadences = int(cadences_per_day * epoch_duration) * int(supersampling_factor)
+    # The tolerance keeps float round-off (e.g. 720 * 0.35 = 251.99999999999997)
+    # from dropping a cadence; double round-off is ~1e-16 relative.
+    n_float = np.float64(cadences_per_day) * np.float64(epoch_duration)
+    cadences = int(n_float + 1e-9 * max(1.0, n_float)) * int(supersampling_factor)
     substep = 1.0 / (np.float64(cadences_per_day) * int(supersampling_factor))
     offsets = (np.arange(cadences) + 0.5 - cadences / 2) * substep
     time = np.empty(shape=(epochs, cadences))
