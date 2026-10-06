@@ -326,10 +326,12 @@ def occult(zs, k, u1, u2):
                 ed[i] = k2 / 2 * (k2 + 2 * z2)
 
         # Occulting body partly occults the source and crosses the limb:
-        # Table 3, Case III:
-        if (z >= 0.5 + abs(k - 0.5) and z < 1 + k) or (
-            k > 0.5 and z >= abs(1 - k) and z < k
-        ):
+        # Table 3, Case III. Written as the complement of Case IV below
+        # (z < 1 - k): the former condition (z >= 0.5 + |k - 0.5|, or
+        # k > 0.5 and |1 - k| <= z < k) is the same set mathematically, but
+        # 0.5 + |k - 0.5| can round one ulp above 1 - k, and z = 1 - k then
+        # matched neither case (ld, ed left uninitialised, bug #29)
+        if z >= 1 - k and z < 1 + k:
             q = sqrt((1 - (k - z) ** 2) / 4 / z / k)
 
             # Numerical stability: if k=0.06 then q is close to 1, ellpicb goes to hell

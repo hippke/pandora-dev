@@ -729,12 +729,13 @@ the exact value. Pinned by `test_ell_combo_and_occultation_exact` (mpmath
 fluxes at k = 0.003, 0.01, 0.03 inside the former zone; fails on the old
 code: 0.74 ppm at k = 0.01, z = 0.297).
 
-## 29. Case III / Case IV conditions leave a 1-ulp gap at z = 1 - k - FIXED in `occult_hybrid`, OPEN in `occult`
+## 29. Case III / Case IV conditions leave a 1-ulp gap at z = 1 - k - FIXED
 
 Severity: low for `occult_hybrid` (stale values), medium for `occult`
 (uninitialised memory, but only at isolated float values)
 Location: `pandoramoon/occult.py`, `occult` and (before P3b) `occult_hybrid`
-Fixed in (`occult_hybrid`): "P3b: vectorised exact Mandel-Agol pass in occult_hybrid"
+Fixed in: "P3b: vectorised exact Mandel-Agol pass in occult_hybrid" (`occult_hybrid`),
+"Fix the 1-ulp Case III/IV gap at z = 1 - k in occult() (bug #29)" (`occult`)
 
 Case III runs for `z >= 0.5 + abs(k - 0.5)` and Case IV for `z < 1 - k`.
 For k < 0.5 both bounds are 1 - k mathematically, but in floating point
@@ -748,11 +749,17 @@ the lower value then matches neither case. Verified: this happens for 388 of
 - `occult`: `ld[i]` and `ed[i]` come from `np.empty` and stay
   uninitialised: 150 ppm ... 17 % errors in a test (`scratch_p3/gap_check.py`).
   `occult` builds the occultation cache, and the cache grid only hits such
-  a z by coincidence. **Still open** (not part of the performance work).
-  Fix: the same as in `occult_hybrid`.
+  a z by coincidence (the default caches are bit-identical before and
+  after the fix). Fixed like `occult_hybrid`: Case III is `1 - k <= z < 1 + k`,
+  the exact complement of Case IV. On a dense (z, k, LD) grid
+  (846k values, `scratch_p3/occult_dump.py`) only the 14 gap points
+  changed. No speed impact (`occult` is not on the likelihood path;
+  `create_occult_cache(dim=300)` 3.4 ms before and after).
 
 P3b rewrote `occult_hybrid` as "Case IV if z < 1 - k, else Case III", which
-has no gap. Pinned by `test_hybrid_second_contact_gap`.
+has no gap. Pinned by `test_hybrid_second_contact_gap` (both functions; for
+`occult`: continuity with the next float, since it still uses the ellk/ellec
+polynomials, ~2 ppm near z = 1 - k for k ~ 0.001).
 
 ## Known limitations (documented, not bugs)
 
