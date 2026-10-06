@@ -143,6 +143,50 @@ def ellpicb(n, k):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def ell_combo(q, n, A, B, C):
+    """A K(q) + B E(q) + C Pi(n, q) in one Bulirsch iteration (P3a).
+
+    q is the modulus (K(q) = ellk(q), E(q) = ellec(q) up to their ~2e-8
+    polynomial error), Pi(n, q) = ellpicb(n, q) = Bulirsch cel(kc, n+1, 1, 1).
+    All three share the AGM sequence (kc, m0, e) of Bulirsch's cel
+    algorithm (Bulirsch 1969, Numer. Math. 13, 305; as in ellpicb).
+    K and E: cel(kc, 1, A + B, A + B kc^2); for p = 1 the cel p-sequence
+    equals m0, so this pair needs no p update. Pi: cel(kc, n+1, C, C).
+    Exact to ~1e-16 relative (quadratic convergence after the 1e-8 test),
+    instead of ellk/ellec's ~2e-8."""
+    kc = sqrt(1 - q * q)
+    a1 = A + B
+    b1 = A + B * kc * kc
+    p = sqrt(n + 1)
+    a2 = C
+    b2 = C / p
+    e = kc
+    m0 = 1.0
+    for nit in range(1000):
+        # K/E pair (its p equals m0)
+        f1 = a1
+        a1 = a1 + b1 / m0
+        b1 = 2 * (b1 + f1 * kc)
+        # Pi pair (as ellpicb)
+        inv_p = 1 / p
+        f2 = a2
+        a2 = a2 + b2 * inv_p
+        g = e * inv_p
+        b2 = 2 * (b2 + f2 * g)
+        p = g + p
+        g = m0
+        m0 = kc + m0
+        if abs(g - kc) > 1e-8 * g:
+            kc = 2 * sqrt(e)
+            e = kc * m0
+        else:
+            return 0.5 * pi * (
+                (b1 + a1 * m0) / (2 * m0 * m0) + (b2 + a2 * m0) / (m0 * (m0 + p))
+            )
+    raise ValueError("ell_combo did not converge")
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def ellec(k):
     a1 = 0.443251414630
     a2 = 0.062606012200
@@ -432,10 +476,12 @@ def occult_hybrid(zs, k, u1, u2):
                 / 9
                 * INV_PI
                 / sqrt(k * z)
-                * (
-                    ((1 - x2) * (2 * x2 + x1 - 3) - 3 * x3 * (x2 - 2)) * ellk(q)
-                    + 4 * k * z * (z2 + 7 * k2 - 4) * ellec(q)
-                    - 3 * x3 / x1 * ellpicb((1 / x1 - 1), q)
+                * ell_combo(
+                    q,
+                    1 / x1 - 1,
+                    (1 - x2) * (2 * x2 + x1 - 3) - 3 * x3 * (x2 - 2),
+                    4 * k * z * (z2 + 7 * k2 - 4),
+                    -3 * x3 / x1,
                 )
             )
             if z < k:
@@ -479,10 +525,12 @@ def occult_hybrid(zs, k, u1, u2):
                 / 9
                 * INV_PI
                 / sqrt(1 - x1)
-                * (
-                    (1 - 5 * z2 + k2 + x3 * x3) * ellk(q)
-                    + (1 - x1) * (z2 + 7 * k2 - 4) * ellec(q)
-                    - 3 * x3 / x1 * ellpicb((x2 / x1 - 1), q)
+                * ell_combo(
+                    q,
+                    x2 / x1 - 1,
+                    1 - 5 * z2 + k2 + x3 * x3,
+                    (1 - x1) * (z2 + 7 * k2 - 4),
+                    -3 * x3 / x1,
                 )
             )
             if z < k:
