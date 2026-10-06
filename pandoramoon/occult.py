@@ -154,12 +154,21 @@ def ell_combo(q, n, A, B, C):
     equals m0, so this pair needs no p update. Pi: cel(kc, n+1, C, C).
     Exact to ~1e-16 relative (quadratic convergence after the 1e-8 test),
     instead of ellk/ellec's ~2e-8."""
-    kc = sqrt(1 - q * q)
+    p = sqrt(n + 1)
+    return ell_combo_kc(sqrt(1 - q * q), p, A, B, C, C / p)
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def ell_combo_kc(kc, p, A, B, C, Cp):
+    """ell_combo() with its operands given directly (P15): the complementary
+    modulus kc = sqrt(1 - q^2) > 0, p = sqrt(n + 1) > 0 and Cp = C / p.
+    Lets the caller form kc, p and C / p from (z, k) in closed form, without
+    the cancellation of 1 - q^2 near q = 1 (Agol, Luger & Foreman-Mackey
+    2020, eq. 41)."""
     a1 = A + B
     b1 = A + B * kc * kc
-    p = sqrt(n + 1)
     a2 = C
-    b2 = C / p
+    b2 = Cp
     e = kc
     m0 = 1.0
     for nit in range(1000):
@@ -393,11 +402,21 @@ def occult(zs, k, u1, u2):
 
 
 # Fixed iteration count of the vectorised Bulirsch loop (P3b). 5 steps pass
-# ell_combo's 1e-8 test for q <= ~0.9; lanes with q closer to 1 (<= 0.5 % of
-# the on-star samples for any k, mostly near second contact) fail the test
-# after the last step and are recomputed with the scalar ell_combo, so the
-# result is always the converged one.
+# ell_combo's 1e-8 test for kc >= ~0.45 (q <= ~0.9); lanes with smaller kc
+# (<= 0.5 % of the on-star samples for any k, mostly near second contact)
+# fail the test after the last step and are recomputed with the scalar
+# ell_combo_kc, so the result is always the converged one.
 ELL_BATCH_ITERATIONS = 5
+
+# Floor of the complementary modulus kc (P15). kc = 0 only at z = 1 - k
+# exactly (or below it by rounding), where K and Pi diverge
+# logarithmically but A K + B E + C Pi stays finite; with kc >= 1e-150 the
+# result is off by O(kc^2 log kc), i.e. not at all, and the AGM converges
+# in ~15 steps (scalar fallback).
+KC_MIN = 1e-150
+
+# Smallest |z - k| passed to the batch (occult_hybrid, pass 1), see there.
+Z_K_MIN = 1e-150
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
@@ -414,43 +433,52 @@ def _occult_exact_batch(zb, m, k, c1, c2, u2, omega, flux, dev):
     (the caller adds their arccos terms); dev[j] > 0 marks a lane whose last
     step fails ell_combo's 1e-8 test (recompute it with the scalar code).
 
+    Operands in closed form (P15; Agol, Luger & Foreman-Mackey 2020, eq. 41):
+    with s = z + k, d = z - k, sg = sign(d)
+      Case IV: kc^2 = (1 - s)(1 + s) / (1 - d^2), p = sqrt(n + 1) = s / |d|
+      Case III: kc^2 = (s - 1)(s + 1) / (4 z k),  p = 1 / |d|
+      C = -3 x3 / x1 = 3 s / d;  C / p = 3 sg (IV) or 3 s sg (III);
+      prefactor 2 / (9 pi sqrt(den)) in both cases (den = 1 - d^2 or 4 z k).
+    No modulus q, no 1 - q^2 cancellation, no q -> 1 - 1e-8 nudges (which
+    were up to 2.6e-8 off in ldx at z -> 1 - k), 3 divisions and 2 square
+    roots fewer per sample, and exact down to |z - k| = 1 ulp (the old
+    z -> k + 1e-6 nudge is gone; only z == k exactly is moved by one ulp in
+    occult_hybrid).
+
     error_model="numpy" is required for vectorisation: numba's default
     ("python") inserts a zero-divisor check before every division, and that
-    branch stops LLVM. All divisors are > 0 here (z > 0, x1 >= 1e-12 by the
-    z -> k + 1e-6 nudge, 1 - x1 > 0 for z < 1 - k, m0 >= 1, p > 0)."""
+    branch stops LLVM. All divisors are > 0 here (z != k, den > 0 on the
+    star, m0 >= 1, p > 0)."""
     INV_PI = 1 / pi
     k2 = k * k
     for j in range(m):
         z = zb[j]
         z2 = z * z
-        x1 = (k - z) ** 2
-        x2 = (k + z) ** 2
+        s = z + k
+        d = z - k
+        x1 = d * d
+        x2 = s * s
         x3 = k2 - z2
         inner = z < 1 - k
-        # Case IV (inner) / Case III (limb): select operands, divide once
-        num = x2 - x1 if inner else 1 - x1
+        # Case IV (inner) / Case III (limb): kc^2 = num / den
+        num = (1 - s) * (1 + s) if inner else (s - 1) * (s + 1)
         den = 1 - x1 if inner else 4 * z * k
-        q = sqrt(num / den)
-        # Case IV: float rounding guard; Case III: q -> 1 at the lower z
-        # boundary makes the iteration diverge, push it slightly below 1
-        q = min(q, 1 - 1e-8) if inner else (q - 1e-8 if 1 - q < 1e-8 else q)
-        inv_x1 = 1 / x1
-        n = (x2 if inner else 1.0) * inv_x1 - 1
+        inv_sden = 1 / sqrt(den)
+        kc = max(sqrt(max(num, 0.0)) * inv_sden, KC_MIN)
+        sg = 1.0 if d > 0 else -1.0
+        inv_ad = 1 / abs(d)
+        p = s * inv_ad if inner else inv_ad
+        a2 = 3 * s * sg * inv_ad
+        b2 = 3 * sg if inner else 3 * s * sg
         A = (1 - 5 * z2 + k2 + x3 * x3) if inner else ((1 - x2) * (2 * x2 + x1 - 3) - 3 * x3 * (x2 - 2))
-        B = (1 - x1) * (z2 + 7 * k2 - 4) if inner else 4 * k * z * (z2 + 7 * k2 - 4)
-        C = -3 * x3 * inv_x1
-        pref = (2 / 9 * INV_PI if inner else 1 / 9 * INV_PI) / sqrt(den if inner else k * z)
-        # A K(q) + B E(q) + C Pi(n, q): ell_combo's iteration, one
-        # reciprocal r = 1 / (m0 p) per step instead of two divisions
-        kc = sqrt(1 - q * q)
+        B = den * (z2 + 7 * k2 - 4)
+        # A K + B E + C Pi: ell_combo's iteration, one reciprocal
+        # r = 1 / (m0 p) per step instead of two divisions
         a1 = A + B
         b1 = A + B * kc * kc
-        p = sqrt(n + 1)
-        a2 = C
-        b2 = C / p
         e = kc
         m0 = 1.0
-        d = 0.0
+        dd = 0.0
         for it in range(ELL_BATCH_ITERATIONS):
             r = 1 / (m0 * p)
             f1 = a1
@@ -464,48 +492,46 @@ def _occult_exact_batch(zb, m, k, c1, c2, u2, omega, flux, dev):
             p = g + p
             g = m0
             m0 = kc + m0
-            d = abs(g - kc) - 1e-8 * g
+            dd = abs(g - kc) - 1e-8 * g
             kc = 2 * sqrt(e)
             e = kc * m0
-        ell = 0.5 * pi * ((b1 + a1 * m0) / (2 * m0 * m0) + (b2 + a2 * m0) / (m0 * (m0 + p)))
-        ldx = pref * ell + (2 / 3 if z < k else 0.0)
+        # (b1 + a1 m0) / (2 m0^2) + (b2 + a2 m0) / (m0 (m0 + p)), one division
+        mp = m0 + p
+        ell = 0.25 * pi * ((b1 + a1 * m0) * mp + 2 * m0 * (b2 + a2 * m0)) / (m0 * m0 * mp)
+        ldx = (2 / 9 * INV_PI) * inv_sden * ell + (2 / 3 if z < k else 0.0)
         lex = k2 if inner else 0.0
         edx = k2 / 2 * (k2 + 2 * z2) if inner else 0.0
         flux[j] = 1 - (c1 * lex + c2 * ldx + u2 * edx) * omega
-        dev[j] = d
+        dev[j] = dd
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _occult_point(z, k, u1, u2):
-    """Unclamped exact Mandel-Agol flux at one on-star z (after the z -> k +
-    1e-6 nudge; 0 < z < 1 + k, not fully occulted), scalar ell_combo. Same
-    cases as _occult_exact_batch: Case IV for z < 1 - k, else Case III.
-    Used for the batch's non-converged lanes and the k + z = 1 special case."""
+    """Unclamped exact Mandel-Agol flux at one on-star z (z != k,
+    0 <= z < 1 + k, not fully occulted), scalar ell_combo_kc. Same cases and
+    closed-form operands as _occult_exact_batch (P15): Case IV for
+    z < 1 - k, else Case III. Used for the batch's non-converged lanes."""
     INV_PI = 1 / pi
     k2 = k**2
     omega = 1 / (1 - u1 / 3 - u2 / 6)
     c1 = 1 - u1 - 2 * u2
     c2 = u1 + 2 * u2
     z2 = z**2
-    x1 = (k - z) ** 2
-    x2 = (k + z) ** 2
+    s = z + k
+    d = z - k
+    x1 = d * d
+    x2 = s * s
     x3 = k**2 - z2
+    sg = 1.0 if d > 0 else -1.0
     if z < 1 - k:
         # Occulting body transits the source: Table 3, Case IV
         lex = k2
         edx = k2 / 2 * (k2 + 2 * z2)
-        if abs(k + z - 1) < 1e-8:
-            ldx = 2 / 3 * INV_PI * arccos(1 - 2 * k) - 4 / 9 * INV_PI * sqrt(
-                k * (1 - k)) * (3 + 2 * k - 8 * k2)
-        else:
-            q = sqrt((x2 - x1) / (1 - x1))
-            if q >= 1:
-                q = 1 - 1e-8  # float rounding guard
-            ldx = 2 / 9 * INV_PI / sqrt(1 - x1) * ell_combo(
-                q, x2 / x1 - 1, 1 - 5 * z2 + k2 + x3 * x3, (1 - x1) * (z2 + 7 * k2 - 4),
-                -3 * x3 / x1)
-            if z < k:
-                ldx = ldx + 2 / 3
+        num = (1 - s) * (1 + s)
+        den = 1 - x1
+        A = 1 - 5 * z2 + k2 + x3 * x3
+        p = s / abs(d)
+        Cp = 3 * sg
     else:
         # Partly occults the source and crosses the limb: Table 3, Case III
         kap1 = arccos(max(min((1 - k2 + z2) / (2 * z), 1), -1))
@@ -513,14 +539,16 @@ def _occult_point(z, k, u1, u2):
         lex = (k2 * kap0 + kap1 - 0.5 * sqrt(max(4 * z2 - (1 + z2 - k2) ** 2, 0))) * INV_PI
         edx = 1 / 2 * INV_PI * (kap1 + k2 * (k2 + 2 * z2) * kap0
                                 - (1 + 5 * k2 + z2) / 4 * sqrt(max((1 - x1) * (x2 - 1), 0)))
-        q = sqrt((1 - x1) / 4 / z / k)
-        if (1 - q) < 1e-8:
-            q -= 1e-8
-        ldx = 1 / 9 * INV_PI / sqrt(k * z) * ell_combo(
-            q, 1 / x1 - 1, (1 - x2) * (2 * x2 + x1 - 3) - 3 * x3 * (x2 - 2),
-            4 * k * z * (z2 + 7 * k2 - 4), -3 * x3 / x1)
-        if z < k:
-            ldx = ldx + 2 / 3
+        num = (s - 1) * (s + 1)
+        den = 4 * z * k
+        A = (1 - x2) * (2 * x2 + x1 - 3) - 3 * x3 * (x2 - 2)
+        p = 1 / abs(d)
+        Cp = 3 * s * sg
+    sden = sqrt(den)
+    kc = max(sqrt(max(num, 0.0)) / sden, KC_MIN)
+    ldx = 2 / 9 * INV_PI / sden * ell_combo_kc(kc, p, A, den * (z2 + 7 * k2 - 4), 3 * s / d, Cp)
+    if z < k:
+        ldx = ldx + 2 / 3
     return 1 - (c1 * lex + c2 * ldx + u2 * edx) * omega
 
 
@@ -534,14 +562,17 @@ def occult_hybrid(zs, k, u1, u2):
     existed only for speed and was off by up to ~1.1 ppm (bug #28). It is
     gone: the batched exact model below is cheaper than it was.
 
-    Batched (P3b): pass 1 classifies the samples (off star, fully occulted,
-    the z + k = 1 special case) and collects the remaining on-star z; pass 2
-    computes their exact flux in the vectorised _occult_exact_batch(); pass 3
-    recomputes non-converged lanes with the scalar _occult_point(), adds the
-    limb's arccos terms and clamps.
-    Formulas, guards and nudges as before (P3a); Case III is now simply
-    "not Case IV", which closes a 1-ulp gap at z = 1 - k where the old
-    conditions matched neither case and reused the previous sample's terms.
+    Batched (P3b): pass 1 classifies the samples (off star, fully occulted)
+    and collects the remaining on-star z; pass 2 computes their exact flux
+    in the vectorised _occult_exact_batch(); pass 3 recomputes non-converged
+    lanes with the scalar _occult_point(), adds the limb's arccos terms and
+    clamps. Case III is simply "not Case IV", which closes a 1-ulp gap at
+    z = 1 - k where the old conditions matched neither case and reused the
+    previous sample's terms (bug #29).
+    Since P15 the elliptic operands come in closed form from (z, k), exact
+    at the contact points: the z -> k + 1e-6 and q -> 1 - 1e-8 nudges and
+    the closed-form special case for |k + z - 1| < 1e-8 (up to ~2.6e-8 off
+    in the limb-darkening term) are gone.
 
     Parameters
     ----------
@@ -572,8 +603,12 @@ def occult_hybrid(zs, k, u1, u2):
     m = 0
     for i in range(n_z):
         z = zs[i]
-        if abs(z - k) < 1e-6:
-            z = k + 1e-6
+        # The closed-form operands (P15) are exact down to |z - k| = 1 ulp;
+        # only z == k itself (C = 3 (z + k) / (z - k)) moves, by one ulp
+        # (k + k 2^-52 is at least the next float above k). Z_K_MIN keeps
+        # 1 / |z - k| finite for k < ~1e-134, where ulps are smaller.
+        if abs(z - k) < Z_K_MIN:
+            z = k + max(k * 2.220446049250313e-16, Z_K_MIN)
 
         # Source is unocculted
         if z >= 1 + k or z < 0:
@@ -583,14 +618,6 @@ def occult_hybrid(zs, k, u1, u2):
         # The source is completely occulted
         elif k >= 1 and z <= k - 1:
             flux[i] = 0
-            continue
-
-        # Case IV special case k + z = 1 (closed form for ldx)
-        if z < 1 - k and abs(k + z - 1) < 1e-8:
-            f = _occult_point(z, k, u1, u2)
-            if f > 1:
-                f = 1
-            flux[i] = f
             continue
 
         zb[m] = z
