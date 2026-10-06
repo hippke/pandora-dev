@@ -13,10 +13,6 @@ def timegrid(t0_bary, epochs, epoch_duration, cadences_per_day, epoch_distance, 
     stop = np.float64(t0_bary + epoch_distance * epochs)
     ti_epoch_midtimes = np.arange(start, stop, step)
 
-    # arrays of epoch start and end dates [day]
-    t_starts = ti_epoch_midtimes - epoch_duration / 2
-    t_ends = ti_epoch_midtimes + epoch_duration / 2
-
     # "Morphological light-curve distortions due to finite integration time"
     # https://ui.adsabs.harvard.edu/abs/2010MNRAS.408.1758K/abstract
     # Data gets smeared over long integration. Relevant for e.g., 30min cadences
@@ -24,10 +20,18 @@ def timegrid(t0_bary, epochs, epoch_duration, cadences_per_day, epoch_distance, 
     # Then, 5x denser in time sampling, and averaging after, approximates effect
     if supersampling_factor < 1:
         raise ValueError("supersampling_factor must be a positive integer")
+    # Cadences are spaced by exactly 1 / cadences_per_day. Each cadence is an
+    # exposure of that length, split into supersampling_factor sub-exposures
+    # whose mid-times are returned (their mean is the cadence mid-time). The
+    # int(...) cadences fill at most epoch_duration; the block is centred on
+    # the epoch mid-time, so for integer cadences_per_day * epoch_duration
+    # the exposures tile [t_start, t_end] exactly.
     cadences = int(cadences_per_day * epoch_duration) * int(supersampling_factor)
+    substep = 1.0 / (np.float64(cadences_per_day) * int(supersampling_factor))
+    offsets = (np.arange(cadences) + 0.5 - cadences / 2) * substep
     time = np.empty(shape=(epochs, cadences))
     for epoch in range(epochs):
-        time[epoch] = np.linspace(t_starts[epoch], t_ends[epoch], cadences)
+        time[epoch] = ti_epoch_midtimes[epoch] + offsets
     return time.ravel()
 
 
