@@ -28,7 +28,7 @@ class Likelihood(object):
         yerr,
         epoch_distance,
         supersampling_factor=1,
-        occult_small_threshold=0.01,
+        occult_small_threshold=0.0,
         hill_sphere_threshold=1.1,
         numerical_grid=25,
         cache=None,

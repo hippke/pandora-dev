@@ -49,7 +49,10 @@ class model_params(object):
         self.cadences_per_day = None
         self.epoch_distance = None
         self.supersampling_factor = 1
-        self.occult_small_threshold = 0.01
+        # Moons with r_moon below this use the small-body approximation
+        # occult_small (bug #9: 4 ppm off at k = 0.01, 105 ppm at 0.035);
+        # 0 = exact Mandel-Agol for every moon (default since bug #9 was fixed)
+        self.occult_small_threshold = 0.0
         self.hill_sphere_threshold = 1.1
         self.numerical_grid = 25
         # Mutual eclipses with a body on the stellar limb:
@@ -807,7 +810,8 @@ def _window_fluxes_z(
         flux_planet = occult_hybrid(zs=z_planet, u1=u1, u2=u2, k=r_planet)
         #flux_planet = occult(zs=z_planet, u1=u1, u2=u2, k=r_planet)
     
-    # For moon transit: User can "set occult_small_threshold > 0"
+    # For moon transit: small-body approximation only if the user sets
+    # occult_small_threshold > 0 (default 0: exact, bug #9)
     if r_moon < occult_small_threshold:
         flux_moon = occult_small(zs=z_moon, k=r_moon, u1=u1, u2=u2)
     elif cache is not None and r_moon < 0.1:

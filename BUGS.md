@@ -304,11 +304,12 @@ documented `[deg]` convention and from the e = 0 model. The fix uses the
 positive radius. Note: this changes model output for all `e_moon > 0`
 injections (the moon now appears where the parameters say it should).
 
-## 9. Examples use `occult_small` far beyond its validity range - IGNORED (per project decision)
+## 9. Examples use `occult_small` far beyond its validity range - FIXED
 
 Severity: medium (model error larger than injected noise in the examples)
 Location: `examples/*.py` (`params.occult_small_threshold = 0.1`),
 `pandoramoon/occult.py:70-71` (docstring: "Adequate for k<~0.01")
+Fixed in: "Exact moon occultation by default: occult_small_threshold = 0 (bug #9)"
 
 The small-planet approximation assumes the occulted stellar patch is
 uniformly lit. Measured error against the exact Mandel-Agol model
@@ -326,8 +327,28 @@ All examples set `occult_small_threshold = 0.1` with `r_moon = 0.03526`, so
 the moon light curve carries ~105 ppm model error - larger than the 100 ppm
 injected noise. The default in `model_params` (0.01, ~4.3 ppm at the
 boundary) is consistent with the docstring; the examples' 0.1 is not.
-Accepted for now; consider lowering the examples' threshold to 0.01 or
-routing through the cache instead.
+Accepted at first (project decision). **Fixed** once the exact model was
+cheap (P3: `occult_hybrid` exact for every k and vectorised, ~10–15 ns per
+on-star sample vs ~2.7 ns for `occult_small`): the user accepted the speed
+cost and the model change.
+
+- The default `occult_small_threshold` is now 0 in `model_params` and
+  `Likelihood` (exact Mandel–Agol for every moon); examples, notebooks,
+  README and `docs/Interface.rst` use 0. A positive value still selects
+  the approximation (opt-in).
+- Even the old default 0.01 was not safe: moons just below it were
+  1.9 / 3.0 / 4.4 ppm off mpmath at k = 0.007 / 0.0085 / 0.0099
+  (LD 0.4, 0.25), up to 8.0 ppm with the perf workload's free LD.
+- Perf workload (sampler likelihood, r_moon 0.007–0.012): moon flux change
+  ≤ 3.6 ppm (Kepler) / 8.0 ppm (PLATO), |ΔlogL| ≤ 1.9; cost ~4–6 % per
+  likelihood call (interleaved, same code).
+- `examples/example.py` (r_moon = 0.03526, `light_curve()`): the moon flux
+  error vs the exact model drops from 62 ppm to 1.0 ppm; what is left is the
+  float32 occultation cache that `light_curve()` uses for fixed LD.
+- The regression cases set their thresholds explicitly and are unchanged
+  (they still cover the `occult_small` path). Pinned by
+  `test_moon_exact_by_default` (defaults, examples/notebooks, and the
+  default moon path equals the exact model; fails on `50cb806`).
 
 ## 10. `x_bary_grid()` epoch rounding truncates toward zero for data before t0 - FIXED
 

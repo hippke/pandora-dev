@@ -36,7 +36,7 @@ params.epoch_duration = 0.6  # 5  # [days]
 params.cadences_per_day = 250  # [int]
 params.epoch_distance = 365.26   # [days]
 params.supersampling_factor = 1  # [int]
-params.occult_small_threshold = 0.1  # [0..1]
+params.occult_small_threshold = 0  # 0: exact moon occultation (bug #9)
 params.hill_sphere_threshold = 1.2
 
 # Obtain time grid

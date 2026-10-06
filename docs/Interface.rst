@@ -47,7 +47,7 @@ Other model parameters:
 
 :epoch_distance: (*float*) Time distance between each epoch [days]. Should NOT be a free parameter.
 :supersampling_factor: (*int*) (Optional parameter, default value: 1, which represents no supersampling). Higher values are integer multiples for higher supersampling. This compensates for morphological deformation at the cost of computational expense.
-:occult_small_threshold: (*float*) (Optional parameter, default value: 0.01) If the moon radius (:math:`R_{S}/R_{\odot}`) is smaller than this value, its occultation is approximated with constant limb darkening under its area. To obtain a precise estimate even for very small moons, set `occult_small_threshold` to a very small value (e.g., :math:`1^{-8}`).
+:occult_small_threshold: (*float*) (Optional parameter, default value: 0) If the moon radius (:math:`R_{S}/R_{\odot}`) is smaller than this value, its occultation is approximated with constant limb darkening under its area (small-body approximation; about 4 ppm error at 0.01, 105 ppm at 0.035, 1300 ppm at 0.1). The default 0 always uses the exact Mandel-Agol model, which is fast enough for sampling. Set a positive value only to trade accuracy for a few percent of speed.
 :hill_sphere_threshold: (*float*) (Optional parameter, default value: 1.1) If the moon semimajor axis is larger than *hill_sphere_threshold*, the moon is considered unphysical. Then, a planet-only model is returned. The usual threshold should be close to *hill_sphere_threshold=1*. To keep unphysical systems, set a high value, e.g. *hill_sphere_threshold=100*.
 :eclipse_method: (*str*) (Optional parameter, default value: ``"analytic"``) Method for mutual planet-moon eclipses while at least one body is on the stellar limb. ``"analytic"`` computes the exact common overlap area of star, planet and moon (three-circle intersection) and is also faster. ``"pixelmap"`` uses the legacy numerical pixel raster of size *numerical_grid*, bit-identical to Pandora versions before the analytic method. Eclipses with both bodies fully on (or off) the stellar disk always use the exact two-circle overlap. In the low-level function ``pandora.pandora()`` the switch is the optional last argument ``eclipse_pixelmap`` (*bool*, default ``False``).
 :numerical_grid: (*int*) (Optional parameter, default value: 25) Diameter in pixels of the numerical grid used with ``eclipse_method="pixelmap"`` (and as a fallback for exactly degenerate geometries in the analytic method). The raster error at 25 pixels reaches about 1 % of the moon area on the limb, i.e. up to a few ppm for an Earth-sized moon around an M dwarf.
@@ -108,7 +108,7 @@ Example:
    params.cadences_per_day = 250        # [int]
    params.epoch_distance = 365.26       # [days]
    params.supersampling_factor = 1      # [int]
-   params.occult_small_threshold = 0.1  # [0..1]
+   params.occult_small_threshold = 0    # 0: exact
    params.hill_sphere_threshold = 1.2
 
 
