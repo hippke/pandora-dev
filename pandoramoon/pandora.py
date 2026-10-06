@@ -455,42 +455,85 @@ def pandora_flux(
 ):
     """Same arguments and fluxes as pandora(), but returns only
     (flux_planet, flux_moon, flux_total) and computes the orbit only for
-    samples that can be in transit. Use it in likelihood functions."""
-    R_star = float(R_star)
-    per_bary = float(per_bary)
-    a_bary = float(a_bary)
-    r_planet = float(r_planet)
-    b_bary = float(b_bary)
-    t0_bary = float(t0_bary)
-    t0_bary_offset = float(t0_bary_offset)
-    M_planet = float(M_planet)
-    r_moon = float(r_moon)
-    per_moon = float(per_moon)
-    tau_moon = float(tau_moon)
-    Omega_moon = float(Omega_moon)
-    i_moon = float(i_moon)
-    M_moon = float(M_moon)
-
-    a_moon, unphysical = _moon_setup(
-        R_star, per_bary, a_bary, M_planet, M_moon, per_moon, ecc_moon,
-        r_planet, r_moon, hill_sphere_threshold
+    samples that can be in transit. float64, full length (output cadence).
+    For likelihoods, Likelihood (no full-length arrays) or pandora_deficit()
+    (float32) are faster."""
+    idx, flux_planet_w, flux_moon_w = _window_model(
+        u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+        t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
+        Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
+        occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
+        cache, eclipse_pixelmap
     )
-    # Barycentre positions only for samples that can be in transit
-    idx, x_bary = x_bary_window(
-        time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
-        ecc_bary, w_bary,
-        _cull_reach(a_moon, ecc_moon, r_planet, r_moon, unphysical, cache)
-    )
-    xm, ym, xp, yp = _orbit(
-        time[idx], x_bary, unphysical, a_moon, per_moon, tau_moon,
-        Omega_moon, w_moon, i_moon, ecc_moon, M_moon / M_planet, b_bary
-    )
-    flux_planet_w, flux_moon_w = _window_fluxes(
-        xp, yp, xm, ym, unphysical, r_planet, r_moon, u1, u2,
-        occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
-    )
-    return _assemble_window(
+    out_idx, fp, fm, ft = _window_cadences(
         len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
+    )
+    n_out = _n_out(len(time), supersampling_factor)
+    return (
+        _densify(n_out, out_idx, fp, 1.0),
+        _densify(n_out, out_idx, fm, 1.0),
+        _densify(n_out, out_idx, ft, 1.0),
+    )
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def pandora_deficit(
+    u1,
+    u2,
+    R_star,
+    # Planet parameters
+    per_bary,
+    a_bary,
+    r_planet,
+    b_bary,
+    w_bary,
+    ecc_bary,
+    t0_bary,
+    t0_bary_offset,
+    M_planet,
+    # Moon parameters
+    r_moon,
+    per_moon,
+    tau_moon,
+    Omega_moon,
+    i_moon,
+    ecc_moon,
+    w_moon,
+    M_moon,
+    # Other model parameters
+    epoch_distance,
+    supersampling_factor,
+    occult_small_threshold,
+    hill_sphere_threshold,
+    numerical_grid,
+    time,
+    cache=None,
+    eclipse_pixelmap=False
+):
+    """Same arguments as pandora_flux(), but returns the flux deficits
+    (1 - flux_planet, 1 - flux_moon, 1 - flux_total) as float32 arrays
+    (full length, output cadence; exactly 0 out of transit).
+
+    Half the memory of float64 flux arrays. The deficit, unlike the flux,
+    keeps float32's full relative precision (2^-24 ~ 6e-8 of the deficit
+    itself, i.e. ~1e-9 absolute for a 1 % transit); float32 flux would be
+    quantised to 6e-8 absolute near 1. All computations are float64; only
+    the stored result is rounded. In a chi^2 use (1 - data) - deficit."""
+    idx, flux_planet_w, flux_moon_w = _window_model(
+        u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+        t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
+        Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
+        occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
+        cache, eclipse_pixelmap
+    )
+    out_idx, fp, fm, ft = _window_cadences(
+        len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
+    )
+    n_out = _n_out(len(time), supersampling_factor)
+    return (
+        _densify_deficit32(n_out, out_idx, fp),
+        _densify_deficit32(n_out, out_idx, fm),
+        _densify_deficit32(n_out, out_idx, ft),
     )
 
 
@@ -681,31 +724,82 @@ def _total_and_resample(flux_planet, flux_moon, supersampling_factor):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _assemble_window(n, idx, flux_planet_w, flux_moon_w, supersampling_factor):
-    """Output fluxes (planet, moon, total) of n samples from the fluxes at the
-    (ascending) window indices; flux is 1 elsewhere. Equivalent to _scatter()
-    followed by _total_and_resample(), but without full-length temporaries:
-    with supersampling, only output cadences that contain window samples are
-    averaged (the mean of exact 1s is exactly 1)."""
+def _window_model(
+    u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+    t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
+    i_moon, ecc_moon, w_moon, M_moon, epoch_distance, occult_small_threshold,
+    hill_sphere_threshold, numerical_grid, time, cache, eclipse_pixelmap
+):
+    """Culled model core: (ascending sample indices of the window, planet
+    flux, moon flux there). Samples outside the window have flux exactly 1."""
+    R_star = float(R_star)
+    per_bary = float(per_bary)
+    a_bary = float(a_bary)
+    r_planet = float(r_planet)
+    b_bary = float(b_bary)
+    t0_bary = float(t0_bary)
+    t0_bary_offset = float(t0_bary_offset)
+    M_planet = float(M_planet)
+    r_moon = float(r_moon)
+    per_moon = float(per_moon)
+    tau_moon = float(tau_moon)
+    Omega_moon = float(Omega_moon)
+    i_moon = float(i_moon)
+    M_moon = float(M_moon)
+
+    a_moon, unphysical = _moon_setup(
+        R_star, per_bary, a_bary, M_planet, M_moon, per_moon, ecc_moon,
+        r_planet, r_moon, hill_sphere_threshold
+    )
+    # Barycentre positions only for samples that can be in transit
+    idx, x_bary = x_bary_window(
+        time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
+        ecc_bary, w_bary,
+        _cull_reach(a_moon, ecc_moon, r_planet, r_moon, unphysical, cache)
+    )
+    xm, ym, xp, yp = _orbit(
+        time[idx], x_bary, unphysical, a_moon, per_moon, tau_moon,
+        Omega_moon, w_moon, i_moon, ecc_moon, M_moon / M_planet, b_bary
+    )
+    flux_planet_w, flux_moon_w = _window_fluxes(
+        xp, yp, xm, ym, unphysical, r_planet, r_moon, u1, u2,
+        occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+    )
+    return idx, flux_planet_w, flux_moon_w
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _n_out(n, supersampling_factor):
+    """Number of output cadences for n samples (as resample())"""
+    if supersampling_factor <= 1:
+        return n
+    return int(np.ceil(n / supersampling_factor))
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _window_cadences(n, idx, flux_planet_w, flux_moon_w, supersampling_factor):
+    """Output cadences touched by the (ascending) window sample indices, and
+    planet/moon/total flux there; all other output cadences have flux 1.
+    With supersampling, a touched cadence is the mean over its block with
+    flux 1 at non-window samples (as resample() of the full array; the mean
+    of exact 1s is exactly 1). Same values as _scatter() followed by
+    _total_and_resample(), without full-length temporaries."""
     m = len(idx)
     if supersampling_factor <= 1:
-        flux_planet = np.ones(n)
-        flux_moon = np.ones(n)
-        flux_total = np.ones(n)
+        flux_total_w = np.empty(m)
         for j in range(m):
-            flux_planet[idx[j]] = flux_planet_w[j]
-            flux_moon[idx[j]] = flux_moon_w[j]
-            flux_total[idx[j]] = flux_moon_w[j] + flux_planet_w[j] - 1
-        return flux_planet, flux_moon, flux_total
+            flux_total_w[j] = flux_moon_w[j] + flux_planet_w[j] - 1
+        return idx, flux_planet_w, flux_moon_w, flux_total_w
 
     factor = supersampling_factor
-    out_samples = int(np.ceil(n / factor))
-    flux_planet = np.ones(out_samples)
-    flux_moon = np.ones(out_samples)
-    flux_total = np.ones(out_samples)
+    out_idx = np.empty(m, dtype=np.int64)
+    flux_planet = np.empty(m)
+    flux_moon = np.empty(m)
+    flux_total = np.empty(m)
     block_planet = np.empty(factor)
     block_moon = np.empty(factor)
     j = 0
+    k = 0
     while j < m:
         out = idx[j] // factor
         start = out * factor
@@ -721,7 +815,27 @@ def _assemble_window(n, idx, flux_planet_w, flux_moon_w, supersampling_factor):
             j += 1
         bp = block_planet[:length]
         bm = block_moon[:length]
-        flux_planet[out] = np.mean(bp)
-        flux_moon[out] = np.mean(bm)
-        flux_total[out] = np.mean(bm + bp - 1)
-    return flux_planet, flux_moon, flux_total
+        out_idx[k] = out
+        flux_planet[k] = np.mean(bp)
+        flux_moon[k] = np.mean(bm)
+        flux_total[k] = np.mean(bm + bp - 1)
+        k += 1
+    return out_idx[:k], flux_planet[:k], flux_moon[:k], flux_total[:k]
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _densify(n_out, out_idx, values, fill):
+    """Full-length float64 array: fill, with values at out_idx"""
+    out = np.full(n_out, fill)
+    for k in range(len(out_idx)):
+        out[out_idx[k]] = values[k]
+    return out
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _densify_deficit32(n_out, out_idx, flux):
+    """Full-length float32 deficit 1 - flux (0 elsewhere)"""
+    out = np.zeros(n_out, dtype=np.float32)
+    for k in range(len(out_idx)):
+        out[out_idx[k]] = 1.0 - flux[k]
+    return out
