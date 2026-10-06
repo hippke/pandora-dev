@@ -317,7 +317,9 @@ def occult(zs, k, u1, u2):
 
         # Occulting body transits the source:
         if k <= 1 and z < (1 - k):
-            q = sqrt((x2 - x1) / (1 - x1) + 1e-8)  # re-calc because different condition
+            q = sqrt((x2 - x1) / (1 - x1))  # re-calc because different condition
+            if q >= 1:
+                q = 1 - 1e-8  # float rounding guard; ld is overwritten by the special case below
             ld[i] = (
                 2
                 / 9
