@@ -69,24 +69,38 @@ which is always `False`. The reflection branch is dead code: `flip` is always
 confirmed by static analysis and by matching the numba function's output
 against a pure-Python replication of the same (unreflected) code path.
 
-**Measured impact.** Comparing the code's eccentric anomaly against a
-reference Newton solver (tolerance 1e-14) over a full orbit:
+**Measured impact.** Comparing the code's eccentric anomaly `k` against a
+bisection reference solver (converged to machine precision) over a full
+orbit (20,000 mean anomalies; numba replica with the same `fastmath=True`
+flags verified identical to the shipped function to 7e-16):
 
 | e    | max error for M in [0, pi) | max error for M in [pi, 2*pi) |
 |------|----------------------------|-------------------------------|
-| 0.2  | 4.4e-16                    | 4.5e-07                       |
-| 0.5  | 4.4e-16                    | 4.7e-04                       |
-| 0.9  | 4.4e-16                    | 1.5e-01                       |
+| 0.2  | 8.9e-16                    | 4.6e-07                       |
+| 0.5  | 8.9e-16                    | 5.6e-04                       |
+| 0.9  | 8.9e-16                    | 1.9e-01                       |
 
-The solver is machine-precision accurate on the first half of the orbit and
-increasingly wrong on the second half. At `e_moon = 0.9` - the value used in
-`examples/example.py` and the tutorial notebook - the eccentric anomaly is off
-by up to ~0.15 rad (~9 deg), i.e. moon position errors of order
-`0.15 * a_moon`. Because the error is not a pure phase shift, the path traced
-for `M` in `(pi, 2*pi)` is *not a Keplerian ellipse* with the stated
-`(a, e, tau, w)` elements: the radius/true-anomaly relation is inconsistent
-(verified: `|d(t) - a(1 - e*cos(E(t)))|` reaches 3e-2 * a at e = 0.9 over one
-orbit).
+The first half of the orbit is machine-precision accurate. On the second
+half the error is not uniform: it stays near machine precision until
+roughly M ~ 4.8 (~60% into the second half) and then grows rapidly toward
+M -> 2*pi, i.e. as the moon approaches the *next* periastron passage
+(the starter formula `alpha ~ (pi - abs(M))` is progressively further
+outside its design range as |M| exceeds pi, and the fixed-order g/h/k
+corrector amplifies rather than fully corrects a poor starter). At e = 0.9
+the anomaly error reaches ~0.18 rad near M -> 2*pi. The corresponding sky
+position error is muted near periastron (the orbit is small and slow-moving
+in radius there): measured against a correctly scaled reference, the worst
+sky-position error at e = 0.9 is ~1.7% of a_moon (mean ~0.1% over the
+second half), concentrated in the final ~15% of the orbital period.
+
+What breaks is the *time parameterization*, not the orbit geometry: the
+code's radius `1 - e*cos(k)` and true anomaly `nu(k)` both derive from the
+same (wrong) `k`, so the moon always lies on the correct Keplerian ellipse
+- but at the wrong point of it for the given time stamp. The anomaly offset
+delta(M) varies from ~0 at M ~ pi to ~0.18 rad at M -> 2*pi (e = 0.9), so
+it cannot be absorbed by any fixed redefinition of `tau_moon` or
+`w_moon`; the model family cannot represent the true Keplerian ephemeris
+for that part of the orbit.
 
 **Second, structural problem.** Even if the comparison were fixed to
 `(M > pi).any()`, a single scalar `flip` cannot be correct for a *time array*:
@@ -96,12 +110,16 @@ element: for each time stamp either solve for `M` and use `E`, or solve for
 `2*pi - M` and use `2*pi - E`.
 
 **Consequences.**
-- Any model with `e_moon > 0` misplaces the moon for roughly half of its
-  orbit; the error grows rapidly with eccentricity.
+- Any model with `e_moon > 0` places the moon at the wrong point of its
+  (correctly shaped) orbit for the time stamps in the affected zone near the
+  periastron recurrence; the anomaly error grows rapidly with eccentricity
+  and with proximity to `M -> 2*pi`.
 - Injection-retrieval loops that use the same code for injection and
-  retrieval partially absorb the error into other parameters, but the
-  `e_moon` / `w_moon` / `tau_moon` posteriors are biased, and the model family
-  cannot represent a true Keplerian moon for `M > pi`.
+  retrieval partially absorb the error into other parameters, but because
+  delta(M) varies across the orbit it cannot be fully absorbed: the
+  `e_moon` / `w_moon` / `tau_moon` posteriors are biased, and the model
+  cannot represent the true Keplerian ephemeris near the periastron
+  recurrence.
 - Circular moon orbits (`e_moon = 0`) use `ellipse()` instead and are
   unaffected.
 - Interplay with bug #8 (fixed): the former `r = -(1 - e*cos(k))` negation
