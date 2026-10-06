@@ -696,11 +696,23 @@ the window by < 1e-9 cadence, which is negligible. Verified by
 
 ## Known limitations (documented, not bugs)
 
-- `eclipse()` models only "planet occults moon" (the moon behind the planet).
-  When the moon is in front of the planet their shadows overlap on the star;
-  the total flux then double-counts the overlap. This is the documented
-  approximation of Pandora (see docstring and the paper); fixing it requires
-  the line-of-sight separation, which the 2D model does not track.
+- Mutual eclipses are independent of which body is in front: this is
+  correct, not a limitation. (An earlier version of this list said the
+  overlap was double-counted when the moon is in front. That was wrong.)
+  Both bodies are opaque disks, so the star loses the light under the
+  *union* of their shadows, and the union does not depend on the order.
+  `eclipse()` adds the light under the overlap back to `flux_moon`, so
+  `flux_total = flux_planet + flux_moon - 1` subtracts the overlap exactly
+  once. It uses only sky-plane positions, so the result is the same for
+  both orders by construction. The only order-dependent choice is
+  bookkeeping: the overlap is always charged to the moon component. Read
+  `flux_moon` alone as "the moon's signal" only with that in mind. The
+  order would matter only for non-opaque bodies or the bodies' own light
+  (atmospheres, rings, reflected or thermal emission), which Pandora does
+  not model.
+- The accuracy of the overlap term is a separate open question (not
+  validated independently yet): it uses the geometric area fraction times
+  the moon's limb-darkened deficit, plus the limb raster below.
 - `pixelart()` mutual-eclipse areas are computed on a
   `numerical_grid`-sized raster (default 25x25), ~2-4% pixelization error on
   partial planet-moon overlaps near the limb (design tradeoff).

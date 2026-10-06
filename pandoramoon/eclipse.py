@@ -112,7 +112,12 @@ def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid):
     Returns
     -------
     occulted_flux_moon : float
-        Occulted moon flux <= flux_moon. Assumes planet occults moon.
+        Moon flux >= flux_moon: the light under the planet-moon overlap is
+        added back to the moon component, so that
+        flux_total = flux_planet + flux_moon - 1 is the flux blocked by the
+        union of both opaque disks. This is independent of which body is in
+        front (only sky-plane positions are used); assigning the overlap to
+        the moon component is a bookkeeping convention.
     """
 
     # Planet-Moon occultation
