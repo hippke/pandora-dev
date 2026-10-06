@@ -247,8 +247,8 @@ def occult(zs, k, u1, u2):
 
         # Star partially occulted and the occulting object crosses the limb
         if z >= abs(1 - k) and z <= 1 + k:
-            kap1 = arccos(min((1 - k2 + z2) / (2 * z + epsilon), 1))
-            kap0 = arccos(min((k2 + z2 - 1) / (2 * k * z + epsilon), 1))
+            kap1 = arccos(max(min((1 - k2 + z2) / (2 * z + epsilon), 1), -1))
+            kap0 = arccos(max(min((k2 + z2 - 1) / (2 * k * z + epsilon), 1), -1))
             le[i] = k2 * kap0 + kap1
             le[i] = (le[i] - 0.5 * sqrt(max(4 * z2 - (1 + z2 - k2) ** 2, 0))) * INV_PI
         # Occulting object transits the source star (but doesn't completely cover it):
@@ -408,8 +408,8 @@ def occult_hybrid(zs, k, u1, u2):
 
         # Star partially occulted and the occulting object crosses the limb
         if z >= abs(1 - k) and z <= 1 + k:
-            kap1 = arccos(min((1 - k2 + z2) / (2 * z), 1))
-            kap0 = arccos(min((k2 + z2 - 1) / (2 * k * z), 1))
+            kap1 = arccos(max(min((1 - k2 + z2) / (2 * z), 1), -1))
+            kap0 = arccos(max(min((k2 + z2 - 1) / (2 * k * z), 1), -1))
             lex = k2 * kap0 + kap1
             lex = (lex - 0.5 * sqrt(max(4 * z2 - (1 + z2 - k2) ** 2, 0))) * INV_PI
 
