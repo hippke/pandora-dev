@@ -612,7 +612,7 @@ def pandora_loglike(
         occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
         cache, eclipse_pixelmap, time_sorted
     )
-    out_idx, fp, fm, ft = _window_cadences(
+    out_idx, ft = _window_cadences_total(
         len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
     )
     chi2 = chi2_flat
@@ -876,9 +876,12 @@ def _window_cadences(n, idx, flux_planet_w, flux_moon_w, supersampling_factor):
     """Output cadences touched by the (ascending) window sample indices, and
     planet/moon/total flux there; all other output cadences have flux 1.
     With supersampling, a touched cadence is the mean over its block with
-    flux 1 at non-window samples (as resample() of the full array; the mean
-    of exact 1s is exactly 1). Same values as _scatter() followed by
-    _total_and_resample(), without full-length temporaries."""
+    flux 1 at non-window samples (as resample() of the full array).
+    Same values as _scatter() followed by _total_and_resample() up to
+    rounding (~1e-16), without full-length temporaries: the block mean is
+    accumulated as a deficit, 1 - sum(1 - f)/length (non-window samples
+    contribute 0, so a block of exact 1s stays exactly 1), and the total is
+    1 - (deficit_planet + deficit_moon)."""
     m = len(idx)
     if supersampling_factor <= 1:
         flux_total_w = np.empty(m)
@@ -891,8 +894,6 @@ def _window_cadences(n, idx, flux_planet_w, flux_moon_w, supersampling_factor):
     flux_planet = np.empty(m)
     flux_moon = np.empty(m)
     flux_total = np.empty(m)
-    block_planet = np.empty(factor)
-    block_moon = np.empty(factor)
     j = 0
     k = 0
     while j < m:
@@ -902,20 +903,57 @@ def _window_cadences(n, idx, flux_planet_w, flux_moon_w, supersampling_factor):
         if end > n:
             end = n
         length = end - start
-        block_planet[:] = 1.0
-        block_moon[:] = 1.0
+        dp = 0.0
+        dm = 0.0
         while j < m and idx[j] < end:
-            block_planet[idx[j] - start] = flux_planet_w[j]
-            block_moon[idx[j] - start] = flux_moon_w[j]
+            dp += 1.0 - flux_planet_w[j]
+            dm += 1.0 - flux_moon_w[j]
             j += 1
-        bp = block_planet[:length]
-        bm = block_moon[:length]
+        dp /= length
+        dm /= length
         out_idx[k] = out
-        flux_planet[k] = np.mean(bp)
-        flux_moon[k] = np.mean(bm)
-        flux_total[k] = np.mean(bm + bp - 1)
+        flux_planet[k] = 1.0 - dp
+        flux_moon[k] = 1.0 - dm
+        flux_total[k] = 1.0 - (dp + dm)
         k += 1
     return out_idx[:k], flux_planet[:k], flux_moon[:k], flux_total[:k]
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _window_cadences_total(n, idx, flux_planet_w, flux_moon_w, supersampling_factor):
+    """Total flux only, as (out_idx, flux_total) of _window_cadences()
+    (same values; for the likelihood, which needs no planet/moon outputs)."""
+    m = len(idx)
+    if supersampling_factor <= 1:
+        flux_total_w = np.empty(m)
+        for j in range(m):
+            flux_total_w[j] = flux_moon_w[j] + flux_planet_w[j] - 1
+        return idx, flux_total_w
+
+    factor = supersampling_factor
+    out_idx = np.empty(m, dtype=np.int64)
+    flux_total = np.empty(m)
+    j = 0
+    k = 0
+    while j < m:
+        out = idx[j] // factor
+        start = out * factor
+        end = start + factor
+        if end > n:
+            end = n
+        length = end - start
+        dp = 0.0
+        dm = 0.0
+        while j < m and idx[j] < end:
+            dp += 1.0 - flux_planet_w[j]
+            dm += 1.0 - flux_moon_w[j]
+            j += 1
+        dp /= length
+        dm /= length
+        out_idx[k] = out
+        flux_total[k] = 1.0 - (dp + dm)
+        k += 1
+    return out_idx[:k], flux_total[:k]
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
