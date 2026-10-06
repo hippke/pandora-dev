@@ -694,6 +694,66 @@ the window by < 1e-9 cadence, which is negligible. Verified by
 `test_timegrid_cadence_count_roundoff` in `../test_cases/unit_tests.py`
 (fails on the old code). The light-curve regression reference is unchanged.
 
+## 28. `occult_hybrid` small-body "linear interpolation" zone: wrong formula, up to 2.6 ppm - FIXED
+
+Severity: low (≤ 2.6 ppm; ≤ 0.4 ppm for k ≈ 0.01 moons)
+Location: `pandoramoon/occult.py`, `occult_hybrid` (k ≤ 0.05)
+Fixed in: "Exact occult_hybrid for all k: drop the small-body interpolation zone (bug #28)"
+
+For k ≤ 0.05 and z ≤ 0.65 ... 0.98 (the limit depends on k), `occult_hybrid`
+did not evaluate the exact model. It returned the small-body approximation
+plus a correction meant to interpolate linearly between the exact values at
+z = 0 and z = 0.65:
+
+```python
+flux = occult_small_single_value(z, ...) + interpol_flux_1 + interpol_flux_2 * z
+# interpol_flux_1 = exact(0) - small(0), interpol_flux_2 = exact(0.65) - small(0.65)
+```
+
+That is `c0 + c065 z`, not the interpolation `c0 + (c065 - c0) z / 0.65`.
+Verified against mpmath (radial quadrature, 50 digits), 2394 points over
+k ∈ [0.001, 0.05] and 7 limb-darkening pairs incl. u2 < 0:
+- old code: up to 2.56 ppm (k = 0.05, u = (1.6, -0.6)), 1.49 ppm at
+  k = 0.02, 0.38 ppm at k = 0.01;
+- corrected formula: still up to 1.47 ppm, so fixing the formula is not
+  enough;
+- exact model: ≤ 0.037 ppm, only at the existing z = 1 - k nudge.
+
+The zone existed only for speed. After P3b (vectorised exact elliptic
+integrals) the exact model is cheap, so the zone is removed and
+`occult_hybrid` is exact for every k. `occult_small()` (used below
+`occult_small_threshold`) is a separate approximation and unchanged
+(bug #9). Model change: regression cases ≤ 7.0e-8, perf draws ≤ 9.5e-8,
+random wide draws ≤ 1.15e-6 (small planets/moons without cache), all toward
+the exact value. Pinned by `test_ell_combo_and_occultation_exact` (mpmath
+fluxes at k = 0.003, 0.01, 0.03 inside the former zone; fails on the old
+code: 0.74 ppm at k = 0.01, z = 0.297).
+
+## 29. Case III / Case IV conditions leave a 1-ulp gap at z = 1 - k - FIXED in `occult_hybrid`, OPEN in `occult`
+
+Severity: low for `occult_hybrid` (stale values), medium for `occult`
+(uninitialised memory, but only at isolated float values)
+Location: `pandoramoon/occult.py`, `occult` and (before P3b) `occult_hybrid`
+Fixed in (`occult_hybrid`): "P3b: vectorised exact Mandel-Agol pass in occult_hybrid"
+
+Case III runs for `z >= 0.5 + abs(k - 0.5)` and Case IV for `z < 1 - k`.
+For k < 0.5 both bounds are 1 - k mathematically, but in floating point
+`0.5 + (0.5 - k)` can round one ulp above `1 - k`. A sample with z equal to
+the lower value then matches neither case. Verified: this happens for 388 of
+20000 random k ∈ [0.001, 0.5], e.g. k = 0.051, z = 0.949.
+- `occult_hybrid` (≤ `055fbb6`): the limb-darkening terms of the
+  *previous* sample were reused. Wrong by an arbitrary amount when that
+  sample was elsewhere (within ~0.04 ppm only when it was the adjacent grid
+  point).
+- `occult`: `ld[i]` and `ed[i]` come from `np.empty` and stay
+  uninitialised: 150 ppm ... 17 % errors in a test (`scratch_p3/gap_check.py`).
+  `occult` builds the occultation cache, and the cache grid only hits such
+  a z by coincidence. **Still open** (not part of the performance work).
+  Fix: the same as in `occult_hybrid`.
+
+P3b rewrote `occult_hybrid` as "Case IV if z < 1 - k, else Case III", which
+has no gap. Pinned by `test_hybrid_second_contact_gap`.
+
 ## Known limitations (documented, not bugs)
 
 - Mutual eclipses are independent of which body is in front: this is

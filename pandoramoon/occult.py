@@ -95,8 +95,8 @@ def occult_small(zs, k, u1, u2):
 def occult_small_single_value(z, k, u1, u2):
     """Small body approximation by Mandel-Agol. Adequate for k<~0.01
     This version does not calculate an entire array, but just one value.
-    It is used by occult_hybrid with its linear interpolation between exact values
-    and small-planet approximation."""
+    (Until P3 it was used by occult_hybrid's small-body interpolation zone,
+    bug #28; kept for API compatibility.)"""
     s = 2 * pi * 1 / 12 * (-2 * u1 - u2 + 6)
     m = sqrt(1 - min(z**2, 1))
     limb_darkening = 1 - u1 * (1 - m) - u2 * (1 - m) ** 2
@@ -478,8 +478,7 @@ def _occult_point(z, k, u1, u2):
     """Unclamped exact Mandel-Agol flux at one on-star z (after the z -> k +
     1e-6 nudge; 0 < z < 1 + k, not fully occulted), scalar ell_combo. Same
     cases as _occult_exact_batch: Case IV for z < 1 - k, else Case III.
-    Used for the batch's non-converged lanes and the small-body
-    interpolation constants."""
+    Used for the batch's non-converged lanes and the k + z = 1 special case."""
     INV_PI = 1 / pi
     k2 = k**2
     omega = 1 / (1 - u1 / 3 - u2 / 6)
@@ -525,14 +524,19 @@ def _occult_point(z, k, u1, u2):
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def occult_hybrid(zs, k, u1, u2):
-    """Evaluates the transit model for an array of normalized distances.
-    This version performs linear interpolation between exact values and small-planet.
+    """Evaluates the exact transit model (Mandel & Agol 2002, quadratic limb
+    darkening) for an array of normalized distances, for any k.
+
+    Until P3 this switched to a "linear interpolation" correction of the
+    small-body approximation for k <= 0.05 (z <= 0.65 ... 0.98); that zone
+    existed only for speed and was off by up to ~1.1 ppm (bug #28). It is
+    gone: the batched exact model below is cheaper than it was.
 
     Batched (P3b): pass 1 classifies the samples (off star, fully occulted,
-    small-body zone, the z + k = 1 special case) and collects the remaining
-    on-star z; pass 2 computes their exact flux in the vectorised
-    _occult_exact_batch(); pass 3 recomputes non-converged lanes with the
-    scalar _occult_point(), adds the limb's arccos terms and clamps.
+    the z + k = 1 special case) and collects the remaining on-star z; pass 2
+    computes their exact flux in the vectorised _occult_exact_batch(); pass 3
+    recomputes non-converged lanes with the scalar _occult_point(), adds the
+    limb's arccos terms and clamps.
     Formulas, guards and nudges as before (P3a); Case III is now simply
     "not Case IV", which closes a 1-ulp gap at z = 1 - k where the old
     conditions matched neither case and reused the previous sample's terms.
@@ -560,16 +564,6 @@ def occult_hybrid(zs, k, u1, u2):
     c1 = 1 - u1 - 2 * u2
     c2 = u1 + 2 * u2
 
-    # Linear interpolation constants of the small-body zone (k <= 0.05)
-    interpol_flux_1 = 0.0
-    interpol_flux_2 = 0.0
-    if k <= 0.05:
-        z_0 = 0.0
-        if abs(z_0 - k) < 1e-6:
-            z_0 = k + 1e-6
-        interpol_flux_1 = _occult_point(z_0, k, u1, u2) - occult_small_single_value(z_0, k, u1, u2)
-        interpol_flux_2 = _occult_point(0.65, k, u1, u2) - occult_small_single_value(0.65, k, u1, u2)
-
     # Pass 1: classify; collect the on-star samples that need the exact model
     idx = np.empty(n_z, dtype=np.int64)
     zb = np.empty(n_z)
@@ -587,20 +581,6 @@ def occult_hybrid(zs, k, u1, u2):
         # The source is completely occulted
         elif k >= 1 and z <= k - 1:
             flux[i] = 0
-            continue
-
-        # Use interpolation method
-        if (
-            (k <= 0.05 and z <= 0.65)
-            or (k <= 0.04 and z <= 0.70)
-            or (k <= 0.03 and z <= 0.80)
-            or (k <= 0.02 and z <= 0.95)
-            or (k <= 0.01 and z <= 0.98)
-        ):
-            f = occult_small_single_value(z, k, u1, u2) + interpol_flux_1 + interpol_flux_2 * z
-            if f > 1:
-                f = 1
-            flux[i] = f
             continue
 
         # Case IV special case k + z = 1 (closed form for ldx)
