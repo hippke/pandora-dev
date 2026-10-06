@@ -390,10 +390,152 @@ def occult(zs, k, u1, u2):
     return flux
 
 
+# Fixed iteration count of the vectorised Bulirsch loop (P3b). 5 steps pass
+# ell_combo's 1e-8 test for q <= ~0.9; lanes with q closer to 1 (<= 0.5 % of
+# the on-star samples for any k, mostly near second contact) fail the test
+# after the last step and are recomputed with the scalar ell_combo, so the
+# result is always the converged one.
+ELL_BATCH_ITERATIONS = 5
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
+def _occult_exact_batch(zb, m, k, c1, c2, u2, omega, flux, dev):
+    """Exact Mandel-Agol flux without the limb's arccos terms, for the m
+    on-star samples zb[:m] (P3b); branch-free, so LLVM vectorises it.
+
+    Per sample: Case IV (z < 1 - k) or Case III (else; the limb), the
+    coefficients A, B, C of A K + B E + C Pi selected per case, then the
+    Bulirsch iteration of ell_combo with a fixed ELL_BATCH_ITERATIONS steps
+    and no early exit (iterating past convergence is harmless: the AGM
+    state only scales by 2 per step). flux[j] holds
+    1 - (c1 lex + c2 ldx + u2 edx) omega with lex = edx = 0 for limb samples
+    (the caller adds their arccos terms); dev[j] > 0 marks a lane whose last
+    step fails ell_combo's 1e-8 test (recompute it with the scalar code).
+
+    error_model="numpy" is required for vectorisation: numba's default
+    ("python") inserts a zero-divisor check before every division, and that
+    branch stops LLVM. All divisors are > 0 here (z > 0, x1 >= 1e-12 by the
+    z -> k + 1e-6 nudge, 1 - x1 > 0 for z < 1 - k, m0 >= 1, p > 0)."""
+    INV_PI = 1 / pi
+    k2 = k * k
+    for j in range(m):
+        z = zb[j]
+        z2 = z * z
+        x1 = (k - z) ** 2
+        x2 = (k + z) ** 2
+        x3 = k2 - z2
+        inner = z < 1 - k
+        # Case IV (inner) / Case III (limb): select operands, divide once
+        num = x2 - x1 if inner else 1 - x1
+        den = 1 - x1 if inner else 4 * z * k
+        q = sqrt(num / den)
+        # Case IV: float rounding guard; Case III: q -> 1 at the lower z
+        # boundary makes the iteration diverge, push it slightly below 1
+        q = min(q, 1 - 1e-8) if inner else (q - 1e-8 if 1 - q < 1e-8 else q)
+        inv_x1 = 1 / x1
+        n = (x2 if inner else 1.0) * inv_x1 - 1
+        A = (1 - 5 * z2 + k2 + x3 * x3) if inner else ((1 - x2) * (2 * x2 + x1 - 3) - 3 * x3 * (x2 - 2))
+        B = (1 - x1) * (z2 + 7 * k2 - 4) if inner else 4 * k * z * (z2 + 7 * k2 - 4)
+        C = -3 * x3 * inv_x1
+        pref = (2 / 9 * INV_PI if inner else 1 / 9 * INV_PI) / sqrt(den if inner else k * z)
+        # A K(q) + B E(q) + C Pi(n, q): ell_combo's iteration, one
+        # reciprocal r = 1 / (m0 p) per step instead of two divisions
+        kc = sqrt(1 - q * q)
+        a1 = A + B
+        b1 = A + B * kc * kc
+        p = sqrt(n + 1)
+        a2 = C
+        b2 = C / p
+        e = kc
+        m0 = 1.0
+        d = 0.0
+        for it in range(ELL_BATCH_ITERATIONS):
+            r = 1 / (m0 * p)
+            f1 = a1
+            a1 = a1 + b1 * (p * r)
+            b1 = 2 * (b1 + f1 * kc)
+            inv_p = m0 * r
+            f2 = a2
+            a2 = a2 + b2 * inv_p
+            g = e * inv_p
+            b2 = 2 * (b2 + f2 * g)
+            p = g + p
+            g = m0
+            m0 = kc + m0
+            d = abs(g - kc) - 1e-8 * g
+            kc = 2 * sqrt(e)
+            e = kc * m0
+        ell = 0.5 * pi * ((b1 + a1 * m0) / (2 * m0 * m0) + (b2 + a2 * m0) / (m0 * (m0 + p)))
+        ldx = pref * ell + (2 / 3 if z < k else 0.0)
+        lex = k2 if inner else 0.0
+        edx = k2 / 2 * (k2 + 2 * z2) if inner else 0.0
+        flux[j] = 1 - (c1 * lex + c2 * ldx + u2 * edx) * omega
+        dev[j] = d
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _occult_point(z, k, u1, u2):
+    """Unclamped exact Mandel-Agol flux at one on-star z (after the z -> k +
+    1e-6 nudge; 0 < z < 1 + k, not fully occulted), scalar ell_combo. Same
+    cases as _occult_exact_batch: Case IV for z < 1 - k, else Case III.
+    Used for the batch's non-converged lanes and the small-body
+    interpolation constants."""
+    INV_PI = 1 / pi
+    k2 = k**2
+    omega = 1 / (1 - u1 / 3 - u2 / 6)
+    c1 = 1 - u1 - 2 * u2
+    c2 = u1 + 2 * u2
+    z2 = z**2
+    x1 = (k - z) ** 2
+    x2 = (k + z) ** 2
+    x3 = k**2 - z2
+    if z < 1 - k:
+        # Occulting body transits the source: Table 3, Case IV
+        lex = k2
+        edx = k2 / 2 * (k2 + 2 * z2)
+        if abs(k + z - 1) < 1e-8:
+            ldx = 2 / 3 * INV_PI * arccos(1 - 2 * k) - 4 / 9 * INV_PI * sqrt(
+                k * (1 - k)) * (3 + 2 * k - 8 * k2)
+        else:
+            q = sqrt((x2 - x1) / (1 - x1))
+            if q >= 1:
+                q = 1 - 1e-8  # float rounding guard
+            ldx = 2 / 9 * INV_PI / sqrt(1 - x1) * ell_combo(
+                q, x2 / x1 - 1, 1 - 5 * z2 + k2 + x3 * x3, (1 - x1) * (z2 + 7 * k2 - 4),
+                -3 * x3 / x1)
+            if z < k:
+                ldx = ldx + 2 / 3
+    else:
+        # Partly occults the source and crosses the limb: Table 3, Case III
+        kap1 = arccos(max(min((1 - k2 + z2) / (2 * z), 1), -1))
+        kap0 = arccos(max(min((k2 + z2 - 1) / (2 * k * z), 1), -1))
+        lex = (k2 * kap0 + kap1 - 0.5 * sqrt(max(4 * z2 - (1 + z2 - k2) ** 2, 0))) * INV_PI
+        edx = 1 / 2 * INV_PI * (kap1 + k2 * (k2 + 2 * z2) * kap0
+                                - (1 + 5 * k2 + z2) / 4 * sqrt(max((1 - x1) * (x2 - 1), 0)))
+        q = sqrt((1 - x1) / 4 / z / k)
+        if (1 - q) < 1e-8:
+            q -= 1e-8
+        ldx = 1 / 9 * INV_PI / sqrt(k * z) * ell_combo(
+            q, 1 / x1 - 1, (1 - x2) * (2 * x2 + x1 - 3) - 3 * x3 * (x2 - 2),
+            4 * k * z * (z2 + 7 * k2 - 4), -3 * x3 / x1)
+        if z < k:
+            ldx = ldx + 2 / 3
+    return 1 - (c1 * lex + c2 * ldx + u2 * edx) * omega
+
+
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def occult_hybrid(zs, k, u1, u2):
     """Evaluates the transit model for an array of normalized distances.
     This version performs linear interpolation between exact values and small-planet.
+
+    Batched (P3b): pass 1 classifies the samples (off star, fully occulted,
+    small-body zone, the z + k = 1 special case) and collects the remaining
+    on-star z; pass 2 computes their exact flux in the vectorised
+    _occult_exact_batch(); pass 3 recomputes non-converged lanes with the
+    scalar _occult_point(), adds the limb's arccos terms and clamps.
+    Formulas, guards and nudges as before (P3a); Case III is now simply
+    "not Case IV", which closes a 1-ulp gap at z = 1 - k where the old
+    conditions matched neither case and reused the previous sample's terms.
 
     Parameters
     ----------
@@ -410,149 +552,94 @@ def occult_hybrid(zs, k, u1, u2):
     if abs(k - 0.5) < 1e-4:
         k = 0.5
 
-    interpol_flux_1 = 0
-    interpol_flux_2 = 0
-
     INV_PI = 1 / pi
     k2 = k**2
-    flux = np.empty(len(zs))
+    n_z = len(zs)
+    flux = np.empty(n_z)
     omega = 1 / (1 - u1 / 3 - u2 / 6)
     c1 = 1 - u1 - 2 * u2
     c2 = u1 + 2 * u2
 
-    for i in range(-2, len(zs)):
+    # Linear interpolation constants of the small-body zone (k <= 0.05)
+    interpol_flux_1 = 0.0
+    interpol_flux_2 = 0.0
+    if k <= 0.05:
+        z_0 = 0.0
+        if abs(z_0 - k) < 1e-6:
+            z_0 = k + 1e-6
+        interpol_flux_1 = _occult_point(z_0, k, u1, u2) - occult_small_single_value(z_0, k, u1, u2)
+        interpol_flux_2 = _occult_point(0.65, k, u1, u2) - occult_small_single_value(0.65, k, u1, u2)
 
-        # Linear interpolation method: First two values are to interpolate
-        if i == -2:
-            z = 0
-        elif i == -1:
-            z = 0.65
-        else:
-            z = zs[i]
-
+    # Pass 1: classify; collect the on-star samples that need the exact model
+    idx = np.empty(n_z, dtype=np.int64)
+    zb = np.empty(n_z)
+    m = 0
+    for i in range(n_z):
+        z = zs[i]
         if abs(z - k) < 1e-6:
             z = k + 1e-6
 
         # Source is unocculted
         if z >= 1 + k or z < 0:
-            if i >= 0:
-                flux[i] = 1
+            flux[i] = 1
             continue
 
         # The source is completely occulted
         elif k >= 1 and z <= k - 1:
-            if i >= 0:
-                flux[i] = 0
+            flux[i] = 0
             continue
-
-        z2 = z**2
-        x1 = (k - z) ** 2
-        x2 = (k + z) ** 2
-        x3 = k**2 - z2
-
-        # Star partially occulted and the occulting object crosses the limb
-        if z >= abs(1 - k) and z <= 1 + k:
-            kap1 = arccos(max(min((1 - k2 + z2) / (2 * z), 1), -1))
-            kap0 = arccos(max(min((k2 + z2 - 1) / (2 * k * z), 1), -1))
-            lex = k2 * kap0 + kap1
-            lex = (lex - 0.5 * sqrt(max(4 * z2 - (1 + z2 - k2) ** 2, 0))) * INV_PI
-
-        # Occulting object transits the source star (but doesn't completely cover it):
-        if z <= 1 - k:
-            lex = k2
-
-        # Occulting body partly occults source and crosses the limb: Case III:
-        if (z >= 0.5 + abs(k - 0.5) and z < 1 + k) or (
-            k > 0.5 and z >= abs(1 - k) and z < k
-        ):
-            q = sqrt((1 - (k - z) ** 2) / 4 / z / k)
-
-            # Numerical stability: q is close to 1 at the lower z boundary,
-            # which makes ellpicb diverge; push it slightly below 1
-            if (1 - q) < 1e-8:
-                q -= 1e-8
-            ldx = (
-                1
-                / 9
-                * INV_PI
-                / sqrt(k * z)
-                * ell_combo(
-                    q,
-                    1 / x1 - 1,
-                    (1 - x2) * (2 * x2 + x1 - 3) - 3 * x3 * (x2 - 2),
-                    4 * k * z * (z2 + 7 * k2 - 4),
-                    -3 * x3 / x1,
-                )
-            )
-            if z < k:
-                ldx = ldx + 2 / 3
-            edx = (
-                1
-                / 2
-                * INV_PI
-                * (
-                    kap1
-                    + k2 * (k2 + 2 * z2) * kap0
-                    - (1 + 5 * k2 + z2) / 4 * sqrt(max((1 - x1) * (x2 - 1), 0))
-                )
-            )
 
         # Use interpolation method
         if (
-            (i >= 0 and k <= 0.05 and z <= 0.65)
-            or (i >= 0 and k <= 0.04 and z <= 0.70)
-            or (i >= 0 and k <= 0.03 and z <= 0.80)
-            or (i >= 0 and k <= 0.02 and z <= 0.95)
-            or (i >= 0 and k <= 0.01 and z <= 0.98)
+            (k <= 0.05 and z <= 0.65)
+            or (k <= 0.04 and z <= 0.70)
+            or (k <= 0.03 and z <= 0.80)
+            or (k <= 0.02 and z <= 0.95)
+            or (k <= 0.01 and z <= 0.98)
         ):
-            # Perform linear interpolation correction
-            flux[i] = (
-                occult_small_single_value(z, k, u1, u2)
-                + interpol_flux_1
-                + interpol_flux_2 * z
-            )
-            if flux[i] > 1:
-                flux[i] = 1
+            f = occult_small_single_value(z, k, u1, u2) + interpol_flux_1 + interpol_flux_2 * z
+            if f > 1:
+                f = 1
+            flux[i] = f
             continue
 
-        # Occulting body transits the source: Table 3, Case IV:
-        if z < (1 - k):
-            q = sqrt((x2 - x1) / (1 - x1))
-            if q >= 1:
-                q = 1 - 1e-8  # float rounding guard; ldx is overwritten by the special case below
-            ldx = (
-                2
-                / 9
-                * INV_PI
-                / sqrt(1 - x1)
-                * ell_combo(
-                    q,
-                    x2 / x1 - 1,
-                    1 - 5 * z2 + k2 + x3 * x3,
-                    (1 - x1) * (z2 + 7 * k2 - 4),
-                    -3 * x3 / x1,
-                )
-            )
-            if z < k:
-                ldx = ldx + 2 / 3
-            if abs(k + z - 1) < 1e-8:
-                ldx = 2 / 3 * INV_PI * arccos(1 - 2 * k) - 4 / 9 * INV_PI * sqrt(
-                    k * (1 - k)
-                ) * (3 + 2 * k - 8 * k2)
-            edx = k2 / 2 * (k2 + 2 * z2)
+        # Case IV special case k + z = 1 (closed form for ldx)
+        if z < 1 - k and abs(k + z - 1) < 1e-8:
+            f = _occult_point(z, k, u1, u2)
+            if f > 1:
+                f = 1
+            flux[i] = f
+            continue
 
-        current_flux = 1 - (c1 * lex + c2 * ldx + u2 * edx) * omega
+        zb[m] = z
+        idx[m] = i
+        m += 1
 
-        # Linear interpolation method: First two values are to interpolate
-        if i == -2:
-            interpol_flux_1 = current_flux - occult_small_single_value(z, k, u1, u2)
-        elif i == -1:
-            interpol_flux_2 = current_flux - occult_small_single_value(z, k, u1, u2)
+    # Pass 2: exact flux of all collected samples (vectorised), limb terms excluded
+    fb = np.empty(m)
+    dev = np.empty(m)
+    _occult_exact_batch(zb, m, k, c1, c2, u2, omega, fb, dev)
+
+    # Pass 3: non-converged lanes, limb arccos terms, clamp
+    for j in range(m):
+        z = zb[j]
+        if not dev[j] <= 0:
+            f = _occult_point(z, k, u1, u2)
+        elif z >= 1 - k:
+            # Star partially occulted and the occulting object crosses the limb
+            z2 = z * z
+            x1 = (k - z) ** 2
+            x2 = (k + z) ** 2
+            kap1 = arccos(max(min((1 - k2 + z2) / (2 * z), 1), -1))
+            kap0 = arccos(max(min((k2 + z2 - 1) / (2 * k * z), 1), -1))
+            lex = (k2 * kap0 + kap1 - 0.5 * sqrt(max(4 * z2 - (1 + z2 - k2) ** 2, 0))) * INV_PI
+            edx = 1 / 2 * INV_PI * (kap1 + k2 * (k2 + 2 * z2) * kap0
+                                    - (1 + 5 * k2 + z2) / 4 * sqrt(max((1 - x1) * (x2 - 1), 0)))
+            f = fb[j] - (c1 * lex + u2 * edx) * omega
         else:
-            flux[i] = current_flux
-
-            # Some combinations of (u1,u2) cause flux>1 which is unphysical
-            if flux[i] > 1:
-                flux[i] = 1
-
+            f = fb[j]
+        # Some combinations of (u1,u2) cause flux>1 which is unphysical
+        if f > 1:
+            f = 1
+        flux[idx[j]] = f
     return flux
