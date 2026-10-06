@@ -53,6 +53,26 @@ Videos approximate the true light curve as calculated by Pandora very well. They
 
 [![Video](https://github.com/hippke/Pandora/blob/main/docs/source/Screenshot%202022-05-19%20at%2023.39.03.png?raw=true)](https://youtu.be/89lEuPgrl8s)
 
+### Log-likelihood for samplers
+For fits (e.g. with UltraNest), use the `Likelihood` object. It precomputes the data terms once, evaluates the model only for samples near transit, and allocates no full-length arrays per call (one call on a 3-year, 1-minute-cadence light curve takes ~0.25 ms on one laptop core). It returns `-0.5 * nansum(((flux_total - data) / yerr)**2)`; NaN data get weight 0:
+
+```
+like = pandora.Likelihood(time, data, yerr, epoch_distance=params.epoch_distance,
+                          supersampling_factor=1, occult_small_threshold=0.01,
+                          hill_sphere_threshold=1.1, numerical_grid=25)
+logL = like(u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+            t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
+            Omega_moon, i_moon, ecc_moon, w_moon, M_moon)
+```
+See the [example workflow](https://github.com/hippke/Pandora/blob/main/examples/injection_retrieval_simple_ultranest.ipynb). The model functions take the same arguments as `pandora()`:
+
+| Function | Returns | Use |
+|---|---|---|
+| `pandora()` | fluxes (planet, moon, total) and planet/moon coordinates, float64 | `video()`, `coordinates()`, everything |
+| `pandora_flux()` | the three fluxes, float64 | plots, `light_curve()`-like use |
+| `pandora_deficit()` | `1 - flux` for the three components, float32 (half the memory; 2^-24 relative precision of the deficit) | own likelihoods on dense arrays |
+| `pandora_window()` | `(idx, flux_planet, flux_moon, flux_total)` at the output cadences near transit only (flux is 1 elsewhere); `time_sorted=True` for ascending time | own likelihoods, sparse |
+
 ### Installation
 Install with `pip install pandoramoon`. Compatibility has been tested for the latest Python 3.14 (January 2026):
 
