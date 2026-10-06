@@ -2,6 +2,8 @@ import numpy as np
 from numpy import sqrt, pi, arccos, abs, log, ceil
 from numba import jit
 
+from pandoramoon.trig import acos_poly
+
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def create_occult_cache(u1, u2, dim):
@@ -608,17 +610,24 @@ assert SERIES_M == 11 and SERIES_ALPHA.shape == (12, 12)  # _occult_series_batch
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
 def _occult_exact_batch(zb, m, k, c1, c2, u2, omega, flux, dev):
-    """Exact Mandel-Agol flux without the limb's arccos terms, for the m
-    on-star samples zb[:m] (P3b); branch-free, so LLVM vectorises it.
+    """Exact Mandel-Agol flux for the m on-star samples zb[:m] (P3b);
+    branch-free, so LLVM vectorises it.
 
     Per sample: Case IV (z < 1 - k) or Case III (else; the limb), the
     coefficients A, B, C of A K + B E + C Pi selected per case, then the
     Bulirsch iteration of ell_combo with a fixed ELL_BATCH_ITERATIONS steps
     and no early exit (iterating past convergence is harmless: the AGM
     state only scales by 2 per step). flux[j] holds
-    1 - (c1 lex + c2 ldx + u2 edx) omega with lex = edx = 0 for limb samples
-    (the caller adds their arccos terms); dev[j] > 0 marks a lane whose last
-    step fails ell_combo's 1e-8 test (recompute it with the scalar code).
+    1 - (c1 lex + c2 ldx + u2 edx) omega (unclamped); dev[j] > 0 marks a
+    lane whose last step fails ell_combo's 1e-8 test (recompute it with the
+    scalar code).
+
+    Since P16 the limb's area terms lex, edx (two arccos, Case III) are
+    computed here for every lane with the branch-free trig.acos_poly and
+    selected for limb lanes, instead of a scalar libm loop in the caller
+    (16.4 ns per limb sample; acos_poly is <= 1 ulp from libm). Their
+    divisors are floored at 1e-300 so that interior lanes (z = 0 or k = 0
+    possible) stay finite under fastmath.
 
     Operands in closed form (P15; Agol, Luger & Foreman-Mackey 2020, eq. 41):
     with s = z + k, d = z - k, sg = sign(d)
@@ -686,8 +695,14 @@ def _occult_exact_batch(zb, m, k, c1, c2, u2, omega, flux, dev):
         mp = m0 + p
         ell = 0.25 * pi * ((b1 + a1 * m0) * mp + 2 * m0 * (b2 + a2 * m0)) / (m0 * m0 * mp)
         ldx = (2 / 9 * INV_PI) * inv_sden * ell + (2 / 3 if z < k else 0.0)
-        lex = k2 if inner else 0.0
-        edx = k2 / 2 * (k2 + 2 * z2) if inner else 0.0
+        # Case III area terms (P16): computed for all lanes, used on the limb
+        kap1 = acos_poly(max(min((1 - k2 + z2) / max(2 * z, 1e-300), 1.0), -1.0))
+        kap0 = acos_poly(max(min((k2 + z2 - 1) / max(2 * k * z, 1e-300), 1.0), -1.0))
+        lex_l = (k2 * kap0 + kap1 - 0.5 * sqrt(max(4 * z2 - (1 + z2 - k2) ** 2, 0.0))) * INV_PI
+        edx_l = 0.5 * INV_PI * (kap1 + k2 * (k2 + 2 * z2) * kap0
+                                - (1 + 5 * k2 + z2) / 4 * sqrt(max((1 - x1) * (x2 - 1), 0.0)))
+        lex = k2 if inner else lex_l
+        edx = k2 / 2 * (k2 + 2 * z2) if inner else edx_l
         flux[j] = 1 - (c1 * lex + c2 * ldx + u2 * edx) * omega
         dev[j] = dd
 
@@ -767,10 +782,11 @@ def _occult_hybrid(zs, k, u1, u2, series_tol):
     Batched (P3b): pass 1 classifies the samples (off star, fully occulted)
     and collects the remaining on-star z; pass 2 computes their exact flux
     in the vectorised _occult_exact_batch(); pass 3 recomputes non-converged
-    lanes with the scalar _occult_point(), adds the limb's arccos terms and
-    clamps. Case III is simply "not Case IV", which closes a 1-ulp gap at
-    z = 1 - k where the old conditions matched neither case and reused the
-    previous sample's terms (bug #29).
+    lanes with the scalar _occult_point() and clamps (the limb's arccos
+    terms are part of the batch since P16, with the vectorisable
+    trig.acos_poly). Case III is simply "not Case IV", which closes a 1-ulp
+    gap at z = 1 - k where the old conditions matched neither case and
+    reused the previous sample's terms (bug #29).
     Since P15 the elliptic operands come in closed form from (z, k), exact
     at the contact points: the z -> k + 1e-6 and q -> 1 - 1e-8 nudges and
     the closed-form special case for |k + z - 1| < 1e-8 (up to ~2.6e-8 off
@@ -798,7 +814,6 @@ def _occult_hybrid(zs, k, u1, u2, series_tol):
     # k is used as given: the old snap k -> 0.5 for |k - 0.5| < 1e-4 was up
     # to 150 ppm off (bug #30); the closed-form operands (P15) are exact at
     # k = 0.5 and z -> k (non-converged lanes take the scalar fallback)
-    INV_PI = 1 / pi
     k2 = k**2
     n_z = len(zs)
     flux = np.empty(n_z)
@@ -859,24 +874,12 @@ def _occult_hybrid(zs, k, u1, u2, series_tol):
     dev = np.empty(m)
     _occult_exact_batch(zx, m, k, c1, c2, u2, omega, fb, dev)
 
-    # Pass 3: non-converged lanes, limb arccos terms, clamp
+    # Pass 3: non-converged lanes (scalar), clamp, scatter. The limb's
+    # arccos terms are in the batch since P16.
     for j in range(m):
-        z = zx[j]
+        f = fb[j]
         if not dev[j] <= 0:
-            f = _occult_point(z, k, u1, u2)
-        elif z >= 1 - k:
-            # Star partially occulted and the occulting object crosses the limb
-            z2 = z * z
-            x1 = (k - z) ** 2
-            x2 = (k + z) ** 2
-            kap1 = arccos(max(min((1 - k2 + z2) / (2 * z), 1), -1))
-            kap0 = arccos(max(min((k2 + z2 - 1) / (2 * k * z), 1), -1))
-            lex = (k2 * kap0 + kap1 - 0.5 * sqrt(max(4 * z2 - (1 + z2 - k2) ** 2, 0))) * INV_PI
-            edx = 1 / 2 * INV_PI * (kap1 + k2 * (k2 + 2 * z2) * kap0
-                                    - (1 + 5 * k2 + z2) / 4 * sqrt(max((1 - x1) * (x2 - 1), 0)))
-            f = fb[j] - (c1 * lex + u2 * edx) * omega
-        else:
-            f = fb[j]
+            f = _occult_point(zx[j], k, u1, u2)
         # Some combinations of (u1,u2) cause flux>1 which is unphysical
         if f > 1:
             f = 1
