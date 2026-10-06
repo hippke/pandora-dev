@@ -211,6 +211,17 @@ The fix removes the `+ 1e-8` (q is mathematically < 1 inside case IV, and
 q = 0 at z = 0 is handled fine by `ellk`/`ellec`/`ellpicb`) and adds a
 defensive `q >= 1 -> q = 1 - 1e-8` clamp for float-rounding edge cases.
 
+A follow-up commit applies the same clamp to `occult_hybrid`'s case IV,
+which had no guard at all: at the `z = 1 - k` boundary float rounding can
+make `q` *exactly* 1.0 (e.g. z = 0.3, k = 0.7), so `kc = sqrt(1 - q**2) = 0`
+and the `ellpicb` iteration can never converge. Before bug #18's fix this
+silently returned 0 after 1000 dead iterations (harmless only because the
+`|k + z - 1| < 1e-4` special case overwrites `ldx` there); with #18 it
+raised. `ellpicb` itself converges for any q < 1 (verified down to
+1 - q ~ 3e-16), so clamping q below 1 is sufficient. Verified with a dense
+boundary sweep (k = 0.02...0.98, z within 1e-9...1e-3 of 1 - k and of k):
+no exceptions, both functions agree with the reference.
+
 ## 6. Boundary gaps at z = 1 - k / z = k leave `ld`/`ed` uninitialized -> garbage flux or crash - FIXED
 
 Severity: high (silently wrong flux at exact boundary values)
