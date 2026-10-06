@@ -11,7 +11,7 @@ def create_occult_cache(u1, u2, dim):
     k_min = 0.001
     k_max = 0.1
     zs = np.linspace(0, z_max, dim)
-    ks = np.linspace(0.001, k_max, dim)
+    ks = np.linspace(k_min, k_max, dim)
     fs = np.empty((dim, dim), dtype="float32")
     for count, k in enumerate(ks):
         fs[count] = occult(zs, k, u1, u2)
