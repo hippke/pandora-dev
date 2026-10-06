@@ -436,6 +436,31 @@ returns 0, which flows into the limb-darkening terms as a silently wrong
 value. In practice convergence takes < 10 iterations, but the failure mode
 should be loud. The fix raises `ValueError`.
 
+## 19. Examples set `params.e_moon`, but the model reads `params.ecc_moon` - OPEN (fix together with #2)
+
+Severity: medium (examples silently ignore the moon eccentricity)
+Location: `examples/example.py:29`, `examples/example_figure.py:29`,
+`examples/example_video.py:29`, `examples/example.ipynb`,
+`examples/injection_retrieval_simple_ultranest.ipynb`; attribute defined as
+`ecc_moon` in `pandoramoon/pandora.py:42` and read in `moon_model.__init__`.
+
+Discovered during final verification of this patch series: the standard
+example output was bit-identical before and after fixing bug #8, although it
+claims `e_moon = 0.9` and should have exercised `ellipse_ecc()`. The reason:
+all examples assign `params.e_moon = 0.9`, but `model_params` defines the
+attribute as `ecc_moon` (default 0) and `moon_model` reads `params.ecc_moon`.
+The misspelled attribute is silently ignored, so the examples actually model a
+*circular* moon orbit via `ellipse()`; the intended eccentric case never runs.
+(The injection-retrieval notebook uses `e_moon = 0`, which coincides with the
+effective default, so its injection is unaffected.)
+
+Not fixed in this series on purpose: renaming the attribute would make the
+examples exercise `ellipse_ecc()` with e = 0.9, i.e. the still-open bug #2
+(broken M > pi reflection), and the tutorial video would show a
+non-Keplerian moon for half of each orbit. Fix `examples/*.py` and both
+notebooks (`e_moon` -> `ecc_moon`) together with bug #2, then verify that
+injection-retrieval recovers the injected parameters.
+
 ## Known limitations (documented, not bugs)
 
 - `eclipse()` models only "planet occults moon" (the moon behind the planet).
@@ -465,5 +490,11 @@ The model output changes relative to the base commit only for:
 - eccentric moon positions (bug #8 - previously mirrored by 180 deg),
 - the exact boundary/crash points (bugs #4-#7, #16 - previously garbage or
   exceptions).
+
+The standard `examples/example.py` run is bit-identical to the base commit
+(its planet uses `occult_hybrid`, its moon uses `occult_small` with the
+default circular orbit - see bug #19 - and none of its (z, k) values hit the
+fixed boundary points), confirming the fixes are non-regressive on the
+normal path. Its 450-frame video renders in ~26 s.
 Everything else (including the standard example planet light curve) is
 unchanged to numerical precision.
