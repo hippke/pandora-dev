@@ -589,6 +589,25 @@ while the model has them on-star. Each annulus is also coloured with the
 intensity of its outer edge. The fix draws radii (i + 1)/n, each coloured
 with the intensity at its annulus mid-radius.
 
+## 25. Exact first/last contact z = 1 + k left the limb-darkening terms unset - FIXED
+
+Severity: medium (garbage flux at a single, exactly-hit point)
+Location: `pandoramoon/occult.py:228` (`occult`), `393` (`occult_hybrid`)
+Fixed in: "Treat z = 1+k (contact point) as unocculted (bug #25)"
+
+Found while adding unit tests (a cache-accuracy test failed only on cold
+runs). The unocculted branch used `z > 1 + k` while case III requires
+`z < 1 + k`, so at exactly z = 1 + k no branch sets `ld`/`ed`:
+`occult` then returns uninitialised `np.empty` memory (non-deterministic;
+observed -0.43 and -5e98), `occult_hybrid` reuses the previous element's
+`ldx`/`edx` (e.g. 0.960 instead of 1 for k = 0.3). The exact value at the
+contact point is 1 (zero overlap). Real time grids essentially never hit the
+point exactly, but synthetic grids do (e.g. `np.linspace(0, 1 + k, n)`), as
+does any caller evaluating the contact point. The fix uses `z >= 1 + k` in
+both functions. Verified by `test_occult_first_contact_is_unity` in
+`../test_cases/unit_tests.py` (fails on the old code every run); the
+light-curve regression reference is unchanged.
+
 ## Known limitations (documented, not bugs)
 
 - `eclipse()` models only "planet occults moon" (the moon behind the planet).
