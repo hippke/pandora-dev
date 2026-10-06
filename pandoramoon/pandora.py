@@ -537,6 +537,88 @@ def pandora_deficit(
     )
 
 
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def pandora_window(
+    u1,
+    u2,
+    R_star,
+    # Planet parameters
+    per_bary,
+    a_bary,
+    r_planet,
+    b_bary,
+    w_bary,
+    ecc_bary,
+    t0_bary,
+    t0_bary_offset,
+    M_planet,
+    # Moon parameters
+    r_moon,
+    per_moon,
+    tau_moon,
+    Omega_moon,
+    i_moon,
+    ecc_moon,
+    w_moon,
+    M_moon,
+    # Other model parameters
+    epoch_distance,
+    supersampling_factor,
+    occult_small_threshold,
+    hill_sphere_threshold,
+    numerical_grid,
+    time,
+    cache=None,
+    eclipse_pixelmap=False
+):
+    """Sparse model output: same arguments as pandora_flux(), returns
+    (idx, flux_planet, flux_moon, flux_total), where idx (int64, ascending)
+    are the output cadences near transit and the float64 fluxes are given
+    there only. All other output cadences have flux exactly 1 (no full-length
+    array is created). pandora_flux() is this, densified."""
+    idx, flux_planet_w, flux_moon_w = _window_model(
+        u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+        t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
+        Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
+        occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
+        cache, eclipse_pixelmap
+    )
+    return _window_cadences(
+        len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
+    )
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def pandora_loglike(
+    u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+    t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
+    i_moon, ecc_moon, w_moon, M_moon, epoch_distance, supersampling_factor,
+    occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
+    data, inv_err, flat_terms, chi2_flat, cache, eclipse_pixelmap
+):
+    """Gaussian log-likelihood -chi^2/2 of the total flux, without
+    full-length arrays: chi^2 = chi2_flat + sum over window cadences of
+    [((f - data) inv_err)^2 - flat_terms], where flat_terms =
+    ((1 - data) inv_err)^2 and chi2_flat = sum(flat_terms) (model = 1
+    everywhere) are precomputed per dataset. Use it via Likelihood."""
+    idx, flux_planet_w, flux_moon_w = _window_model(
+        u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+        t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
+        Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
+        occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
+        cache, eclipse_pixelmap
+    )
+    out_idx, fp, fm, ft = _window_cadences(
+        len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
+    )
+    chi2 = chi2_flat
+    for k in range(len(out_idx)):
+        i = out_idx[k]
+        r = (ft[k] - data[i]) * inv_err[i]
+        chi2 += r * r - flat_terms[i]
+    return -0.5 * chi2
+
+
 # ----------------------------------------------------------------------------
 # Building blocks of pandora()
 # ----------------------------------------------------------------------------
