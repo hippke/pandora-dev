@@ -608,6 +608,62 @@ both functions. Verified by `test_occult_first_contact_is_unity` in
 `../test_cases/unit_tests.py` (fails on the old code every run); the
 light-curve regression reference is unchanged.
 
+## 26. `timegrid()` cadence spacing is not `1 / cadences_per_day` - FIXED
+
+Severity: medium (every grid built by `pandora.time(...).grid()` is off;
+supersampled exposures have the wrong length)
+Location: `pandoramoon/grids.py:30` (`timegrid`)
+Fixed in: "Space timegrid() cadences by 1/cadences_per_day, centre sub-exposures (bug #26)"
+
+```python
+cadences = int(cadences_per_day * epoch_duration) * int(supersampling_factor)
+time[epoch] = np.linspace(t_starts[epoch], t_ends[epoch], cadences)
+```
+
+`linspace` includes both window edges, so the sample spacing is
+`epoch_duration / (cadences - 1)` instead of
+`1 / (cadences_per_day * supersampling_factor)`. Because `int()` also
+truncates the cadence count, the remaining fraction of a cadence is spread
+over all samples too. With supersampling the sub-samples are spread evenly
+over the whole window rather than centred inside each exposure: the first
+group starts exactly at `t_start`, and the group span (the modelled exposure
+time) is wrong.
+
+Measured:
+- 250/day over 0.6 d: 5.7987 min instead of 5.76 min (+0.67 %).
+- With ssf = 5, the cadence spacing is 5.7677 min, the first cadence
+  centre is 2.307 min after `t_start` (should be 2.88), and the sub-step
+  is 1.1535 min (should be 1.152).
+- Kepler LC (29.4244 min) over 1 d: 30.13 min (+2.4 %).
+- The 10 regression cases have cadence errors between +0.06 % (Kepler SC)
+  and +1.5 % (Kepler LC, ssf = 3).
+- For the two supersampled Kepler LC cases, the flux at the same cadence
+  mid-times differs from correctly placed sub-exposures by up to 2.9 ppm
+  (ssf = 5) and 4.0 ppm (ssf = 3). This is the exposure-smearing error alone.
+
+Impact: model-vs-data fits that pass the user's own time stamps are
+unaffected, apart from the supersampling convention, which `pandora()`
+leaves to the caller. Anything that relies on `grid()` reproducing an
+instrument cadence is affected: injection–retrieval tests, simulated
+data, and supersampled exposure smearing.
+
+Fix: the cadences are spaced exactly `1 / cadences_per_day`. Each cadence
+holds `supersampling_factor` sub-exposure mid-times, spaced
+`1 / (cpd * ssf)`, whose mean is the cadence mid-time. The block of
+`int(cpd * dur)` cadences is centred on the epoch mid-time, like the old
+grid. When `cpd * dur` is an integer, the exposures tile
+`[t_start, t_end]` exactly. The number of points is unchanged, so bug #22's
+epoch-aligned groups still hold. Verified by
+`test_timegrid_cadence_spacing` in `../test_cases/unit_tests.py`, which
+fails on the old code. Feeding the old `linspace` grid into the fixed
+code reproduces the old regression reference bit-for-bit, so the time grid
+is the only change. The reference was regenerated deliberately for the new
+grid.
+
+Not changed here: `int(cpd * dur)` truncates float round-off. For example
+`int(100 * 0.29)` gives 28, not 29, so one cadence may be missing when
+`cpd * dur` is meant to be an integer.
+
 ## Known limitations (documented, not bugs)
 
 - `eclipse()` models only "planet occults moon" (the moon behind the planet).
@@ -675,3 +731,7 @@ cleanly. Bug #22 changes the time grid only for `supersampling_factor > 1`;
 bug #23 only rejects orbits whose periapsis/apoapsis violate the existing
 limits; bugs #20/#21 change flux only at the former NaN points and within
 1e-4 of z = 1 - k.
+
+Bug #26 changes every time grid built with `pandora.time(...).grid()`, and
+with it the light-curve regression reference. The model functions
+themselves are unchanged: the old grid gives bit-identical old output.
