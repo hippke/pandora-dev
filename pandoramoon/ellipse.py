@@ -173,6 +173,54 @@ def ellipse_z_runs(
     return xm, ym, xp, yp, zm, zp
 
 
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def ellipse_z_only_runs(
+    a, per, tau, Omega, i, time, los, his, c_t, c_d, tdur, t0_shift_planet,
+    mass_ratio, b_bary
+):
+    """ellipse_z_runs() without the positions: (zm, zp) only (P24b). For
+    draws where no planet-moon eclipse is possible
+    (eclipse.eclipse_impossible_circular), the positions are not needed;
+    two output arrays instead of six (fewer stores and allocations), same
+    arithmetic per sample as ellipse_z_runs()."""
+    O = Omega / 180 * pi
+    inc = i / 180 * pi
+    cos_O = cos(O)
+    sin_O = sin(O)
+    cos_i = cos(inc)
+    a_planet = (a * mass_ratio) / (1 + mass_ratio)
+    a_moon = a - a_planet
+    n = 0
+    for k in range(len(los)):
+        n += his[k] - los[k]
+    zm = np.empty(n)
+    zp = np.empty(n)
+    t_ref = tau * per
+    m = 0
+    for k in range(len(los)):
+        ct = c_t[k]
+        cd = c_d[k]
+        lo = los[k]
+        cnt = his[k] - lo
+        tr = time[lo:lo + cnt]
+        zmr = zm[m:m + cnt]
+        zpr = zp[m:m + cnt]
+        for j in range(cnt):
+            t = tr[j]
+            x_bary = (2 * (t - ct)) / tdur - t0_shift_planet - cd
+            sin_Q, cos_Q = sincos_turns((t - t_ref) / per)
+            vector_x = cos_O * cos_Q - sin_O * sin_Q * cos_i
+            vector_y = sin_O * cos_Q + cos_O * sin_Q * cos_i
+            xmj = vector_x * a_moon + x_bary
+            ymj = vector_y * a_moon + b_bary
+            xpj = -vector_x * a_planet + x_bary
+            ypj = -vector_y * a_planet + b_bary
+            zmr[j] = sqrt(xmj ** 2 + ymj ** 2)
+            zpr[j] = sqrt(xpj ** 2 + ypj ** 2)
+        m += cnt
+    return zm, zp
+
+
 # P10: per-body windows inside the epoch runs. Moon cells span about
 # sqrt(8 SUBRUN_SLACK / (a_m omega^2)) days (curvature slack SUBRUN_SLACK
 # [R_star]), at most SUBRUN_DT_MAX days and SUBRUN_H_MAX samples. Runs whose

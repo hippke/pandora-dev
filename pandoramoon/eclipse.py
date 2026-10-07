@@ -1,5 +1,5 @@
 import numpy as np
-from numpy import sqrt, pi, arccos, abs, ceil, fliplr, flipud
+from numpy import sqrt, pi, arccos, abs, ceil, fliplr, flipud, cos
 from numba import jit
 from pandoramoon.overlap_analytic import er_fast
 
@@ -116,6 +116,24 @@ def eclipse_possible(xp, yp, xm, ym, r_planet, r_moon):
         dy = ym[i] - yp[i]
         n_close += (dx * dx + dy * dy) < r2
     return n_close > 0
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def eclipse_impossible_circular(a, i, r_planet, r_moon):
+    """True if a circular moon orbit (planet-moon separation a [R_star],
+    inclination i [deg], as in ellipse_z_runs()) can never bring planet and
+    moon closer than r_planet + r_moon on the sky, so eclipse() would
+    return flux_moon unchanged at every sample (P24b).
+
+    The sky-plane separation is a |v| with v the rotated unit vector of
+    ellipse_z_runs(): |v|^2 = cos^2 Q + sin^2 Q cos^2 i >= cos^2 i, so it is
+    at least a |cos i| at every phase. The margins (relative 1e-9 on a,
+    absolute 1e-12 R_star) cover the rounding of the positions (a few ulp of
+    |x_bary| + a) and of sincos_turns (|v|^2 = 1 +- 1e-15); with them this
+    never claims "impossible" where eclipse_possible() could count a sample.
+    NaN gives False."""
+    cos_i = cos(i / 180 * pi)
+    return abs(a * cos_i) * (1 - 1e-9) - 1e-12 > r_planet + r_moon
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)

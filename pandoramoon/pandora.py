@@ -7,9 +7,10 @@ from matplotlib.animation import FuncAnimation
 from os import path
 
 # Pandora
-from pandoramoon.eclipse import eclipse, eclipse_possible
+from pandoramoon.eclipse import eclipse, eclipse_possible, eclipse_impossible_circular
 from pandoramoon.ellipse import (
-    ellipse, ellipse_ecc, ellipse_z, ellipse_ecc_z, ellipse_z_runs, ellipse_subruns,
+    ellipse, ellipse_ecc, ellipse_z, ellipse_ecc_z, ellipse_z_runs, ellipse_z_only_runs,
+    ellipse_subruns,
     subrun_cell_dt, subruns_pay
 )
 from pandoramoon.occult import occult, occult_small, occult_hybrid, create_occult_cache, read_occult_cache
@@ -798,7 +799,9 @@ def _window_fluxes_z(
     xp, yp, xm, ym, z_planet, z_moon, unphysical, r_planet, r_moon, u1, u2,
     occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
 ):
-    """_window_fluxes() with precomputed distances z_planet, z_moon"""
+    """_window_fluxes() with precomputed distances z_planet, z_moon.
+    unphysical=True also means "no eclipse()": the positions xp, yp, xm, ym
+    are then not read (P24b passes empty arrays)."""
     # Cached Mandel-Agol occultation model for planet < 0.1, else hybrid
     if cache is not None and r_planet < 0.1:
         if r_planet < cache[1][0]:
@@ -955,7 +958,10 @@ def _window_model_runs(
     P10: for a circular physical moon without occultation cache the runs are
     then narrowed to the sub-runs where a body can be on the star
     (ellipse_subruns); the other window samples have flux exactly 1 and are
-    not part of the returned runs."""
+    not part of the returned runs.
+    P24b: on that path, when the orbit's geometry rules out a planet-moon
+    eclipse (eclipse_impossible_circular), only z is computed
+    (ellipse_z_only_runs) and eclipse() is skipped (same fluxes)."""
     R_star = float(R_star)
     per_bary = float(per_bary)
     a_bary = float(a_bary)
@@ -1001,11 +1007,26 @@ def _window_model_runs(
                 c_t, c_d, tdur, t0_shift, M_moon / M_planet, b_bary, r_planet,
                 r_moon
             )
-        xm, ym, xp, yp, zm, zp = ellipse_z_runs(
-            a_moon, per_moon, tau_moon, Omega_moon, i_moon, time, los, his,
-            c_t, c_d, tdur, t0_shift, M_moon / M_planet, b_bary
-        )
+        # P24b: if the orbit's geometry rules out a planet-moon eclipse
+        # (~90 % of the draws), only z is needed: no positions, no
+        # eclipse_possible() pass
+        no_eclipse = eclipse_impossible_circular(a_moon, i_moon, r_planet, r_moon)
+        if no_eclipse:
+            zm, zp = ellipse_z_only_runs(
+                a_moon, per_moon, tau_moon, Omega_moon, i_moon, time, los, his,
+                c_t, c_d, tdur, t0_shift, M_moon / M_planet, b_bary
+            )
+            xm = np.empty(0)
+            ym = xm
+            xp = xm
+            yp = xm
+        else:
+            xm, ym, xp, yp, zm, zp = ellipse_z_runs(
+                a_moon, per_moon, tau_moon, Omega_moon, i_moon, time, los, his,
+                c_t, c_d, tdur, t0_shift, M_moon / M_planet, b_bary
+            )
     else:
+        no_eclipse = unphysical
         if ok:
             _, x_bary, time_w = runs_x_t(time, los, his, c_t, c_d, tdur, t0_shift)
         else:
@@ -1020,7 +1041,7 @@ def _window_model_runs(
             Omega_moon, w_moon, i_moon, ecc_moon, M_moon / M_planet, b_bary
         )
     flux_planet_w, flux_moon_w = _window_fluxes_z(
-        xp, yp, xm, ym, zp, zm, unphysical, r_planet, r_moon, u1, u2,
+        xp, yp, xm, ym, zp, zm, no_eclipse, r_planet, r_moon, u1, u2,
         occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
     )
     return los, his, flux_planet_w, flux_moon_w
