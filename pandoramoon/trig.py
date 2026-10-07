@@ -5,14 +5,13 @@ llvmlite), and scalar libm sin + cos cost ~8 ns per sample. sincos_turns()
 is pure arithmetic (floor, multiply, add, select), so LLVM auto-vectorises
 loops that call it (AVX2 / NEON) under fastmath.
 
-The phase is reduced in turns before converting to radians:
-    f = u - round(u)          in [-1/2, 1/2]   (exact)
-    q = round(4 f)            quadrant, in {-2, ..., 2}
-    d = f - q/4               in [-1/8, 1/8]   (exact: Sterbenz)
+The phase is reduced in turns before converting to radians (P24c):
+    q4 = round(4 u)           quarter turns (exact for |u| < 2^50)
+    d = u - q4/4              in [-1/8, 1/8]   (exact: Sterbenz)
     r = 2 pi d                in [-pi/4, pi/4] (one rounding)
 then fdlibm/Cephes minimax polynomials on [-pi/4, pi/4] and a quadrant
-select. The error of sin(2 pi u), cos(2 pi u) is a few 1e-16 for any u and
-independent of |u| (libm on 2 pi u in radians inherits the rounding of
+select on q4 mod 4. The error of sin(2 pi u), cos(2 pi u) is <= 2e-16 for
+|u| < 2^50 and independent of |u| (libm on 2 pi u in radians inherits the rounding of
 2 pi u, i.e. the argument's ulp, which grows with |u|).
 NaN or inf input gives NaN.
 
@@ -42,22 +41,26 @@ C6 = -1.13596475577881948265e-11
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def sincos_turns(u):
-    """(sin(2 pi u), cos(2 pi u)) for a phase u in turns (any size)."""
-    f = u - np.floor(u + 0.5)
-    q = np.floor(4.0 * f + 0.5)
-    r = TWO_PI * (f - 0.25 * q)
+    """(sin(2 pi u), cos(2 pi u)) for a phase u in turns, |u| < 2^50."""
+    # P24c: the quarter-turn count directly from u, q4 = round(4 u) (4 u and
+    # + 0.5 exact for |u| < 2^50), d = u - q4/4 in [-1/8, 1/8] exact
+    # (Sterbenz): one floor less on the dependency chain than reducing
+    # f = u - round(u) first (the orbit loop is latency-bound), and the
+    # quadrant select runs in parallel with the polynomials
+    q4 = np.floor(4.0 * u + 0.5)
+    r = TWO_PI * (u - 0.25 * q4)
     z = r * r
     s = r + r * z * (S1 + z * (S2 + z * (S3 + z * (S4 + z * (S5 + z * S6)))))
     c = 1.0 - 0.5 * z + z * z * (C1 + z * (C2 + z * (C3 + z * (C4 + z * (C5 + z * C6)))))
-    # quadrant select on the float q in {-2, ..., 2} (q mod 4 = 0, 1, 2, 3, 2
-    # for q = 0, 1, 2, -1, -2): no float -> int conversion, which AVX2 has
-    # no vector instruction for (P24: 4 scalar vcvttsd2si per vector)
-    aq = abs(q)
-    odd = aq == 1.0
+    # quadrant k = q4 mod 4 in {0, 1, 2, 3} (exact), selected in float lanes:
+    # no float -> int conversion, which AVX2 has no vector instruction for
+    # (P24a: it cost 4 scalar vcvttsd2si per vector)
+    k = q4 - 4.0 * np.floor(0.25 * q4)
+    odd = (k == 1.0) | (k == 3.0)
     s2 = c if odd else s
     c2 = s if odd else c
-    c2 = -c2 if (q == 1.0) | (aq == 2.0) else c2
-    s2 = -s2 if (q == -1.0) | (aq == 2.0) else s2
+    c2 = -c2 if (k == 1.0) | (k == 2.0) else c2
+    s2 = -s2 if k >= 2.0 else s2
     return s2, c2
 
 
