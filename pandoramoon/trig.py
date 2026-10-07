@@ -15,6 +15,11 @@ select on q4 mod 4. The error of sin(2 pi u), cos(2 pi u) is <= 2e-16 for
 2 pi u, i.e. the argument's ulp, which grows with |u|).
 NaN or inf input gives NaN.
 
+sincos_small(phi) (P24d) is sin / cos of a small angle |phi| <= 0.3 rad
+(two short polynomials, no reduction): the orbit loops on the runs take
+sincos_turns() once per block anchor and sincos_small() of the angle
+from the anchor per sample.
+
 acos_poly(x) (P16) is a branch-free arccos for |x| <= 1 (fdlibm's e_acos
 with selects instead of branches), so loops that call it vectorise too;
 <= 1 ulp from libm, ~0.9 instead of ~8.4 ns per element.
@@ -62,6 +67,34 @@ def sincos_turns(u):
     c2 = -c2 if (k == 1.0) | (k == 2.0) else c2
     s2 = -s2 if k >= 2.0 else s2
     return s2, c2
+
+
+# P24d: sin / cos of a small angle |phi| <= SMALL_PHI_MAX [rad]; near-minimax
+# odd / even polynomials (Lawson-weighted fit in mpmath, scratch_p24d/coef.py):
+# sin = phi + phi z S(z), cos = 1 + z C(z), z = phi^2; fit error 6e-17 /
+# 6e-19, in double <= 1.1e-16 (the rounding of 1 + ...)
+SMALL_PHI_MAX = 0.3
+SS1 = -0.16666666666648974
+SS2 = 0.008333333317368548
+SS3 = -0.00019841222081918382
+SS4 = 2.749903241858877e-06
+SC1 = -0.4999999999999997
+SC2 = 0.04166666666661884
+SC3 = -0.0013888888864428722
+SC4 = 2.480153269904455e-05
+SC5 = -2.75019806552096e-07
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def sincos_small(ph):
+    """(sin ph, cos ph) for |ph| <= SMALL_PHI_MAX = 0.3 rad, error <= 1.2e-16
+    (P24d). No reduction and no quadrant select: about half the work of
+    sincos_turns(); the orbit loop uses it for the angle from a block
+    anchor. Outside the range the error grows quickly (ph^11 / 11!)."""
+    z = ph * ph
+    s = ph + ph * z * (SS1 + z * (SS2 + z * (SS3 + z * SS4)))
+    c = 1.0 + z * (SC1 + z * (SC2 + z * (SC3 + z * (SC4 + z * SC5))))
+    return s, c
 
 
 # fdlibm e_asin / e_acos rational kernel R(z) ~ (asin(sqrt z) / sqrt z - 1) / z

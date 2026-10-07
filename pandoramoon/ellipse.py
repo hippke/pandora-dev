@@ -2,7 +2,7 @@ import numpy as np
 from numpy import sqrt, pi, sin, cos, abs, tan, arctan
 from numba import jit
 
-from pandoramoon.trig import sincos_turns
+from pandoramoon.trig import sincos_turns, sincos_small, SMALL_PHI_MAX, TWO_PI
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
@@ -110,21 +110,57 @@ def ellipse_z(a, per, tau, Omega, i, time, x_bary, mass_ratio, b_bary):
     return xm, ym, xp, yp, zm, zp
 
 
+# P24d: the orbit loops on the runs evaluate the moon's phase in blocks of
+# samples around an anchor sample: one sincos_turns() per block and, per
+# sample, sin / cos of the angle phi = omega (t - t_anchor) from the short
+# polynomial trig.sincos_small() (|phi| <= SMALL_PHI_MAX), combined by angle
+# addition folded into the projection constants. Blocks are balanced,
+# multiples of 4 samples (no scalar remainder except at the end of a run)
+# and at most ANCHOR_BMAX long; runs whose blocks would be shorter than
+# ANCHOR_BMIN samples (short moon periods at coarse cadence, ss1) use
+# sincos_turns() per sample as before, so does any block whose time span
+# exceeds the polynomial's range (gaps).
+ANCHOR_BMIN = 32
+ANCHOR_BMAX = 4096
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _anchor_block(tr, cnt, omega):
+    """Block length [samples] for the run tr[:cnt] (ascending): balanced
+    multiple of 4 with a half-span of about SMALL_PHI_MAX / omega on the
+    mean step; cnt (one block, checked by the caller) if that is below
+    ANCHOR_BMIN; >= 1"""
+    if cnt < 2:
+        return 1
+    w = omega * ((tr[cnt - 1] - tr[0]) / (cnt - 1))
+    hb = ANCHOR_BMAX if w * ANCHOR_BMAX <= 2.0 * SMALL_PHI_MAX else 2.0 * SMALL_PHI_MAX / w
+    if not hb >= ANCHOR_BMIN:  # also NaN
+        return cnt
+    b4 = (int(hb) >> 2) << 2
+    nblk = (cnt + b4 - 1) // b4
+    return ((((cnt + nblk - 1) // nblk) + 3) >> 2) << 2
+
+
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def ellipse_z_runs(
     a, per, tau, Omega, i, time, los, his, c_t, c_d, tdur, t0_shift_planet,
     mass_ratio, b_bary
 ):
     """ellipse_z() on the window runs of grids.x_bary_runs_sorted() (P18):
-    the samples are time[los[k]:his[k]] for all k, in this order, and
-    x_bary is computed inline with the expression of grids.runs_x_t(), so
-    no window arrays (idx, x_bary, time) are filled and read back. Same
-    output as ellipse_z() on the materialised window."""
+    the samples are time[los[k]:his[k]] for all k, in this order (each run
+    ascending), and x_bary is computed inline with the expression of
+    grids.runs_x_t(), so no window arrays (idx, x_bary, time) are filled
+    and read back. Same output as ellipse_z() on the materialised window,
+    to the ulp of the phase (t - tau per) / per: the phase comes from block
+    anchors plus a small-angle polynomial of t - t_anchor (P24d, see
+    ANCHOR_BMIN)."""
     O = Omega / 180 * pi
     inc = i / 180 * pi
     cos_O = cos(O)
     sin_O = sin(O)
     cos_i = cos(inc)
+    sc = sin_O * cos_i
+    cc = cos_O * cos_i
     a_planet = (a * mass_ratio) / (1 + mass_ratio)
     a_moon = a - a_planet
     n = 0
@@ -137,6 +173,7 @@ def ellipse_z_runs(
     zm = np.empty(n)
     zp = np.empty(n)
     t_ref = tau * per
+    omega = abs(TWO_PI / per)
     m = 0
     for k in range(len(los)):
         ct = c_t[k]
@@ -147,28 +184,59 @@ def ellipse_z_runs(
         # emits no wraparound selects and the loop vectorises (time[lo + j]
         # does not)
         tr = time[lo:lo + cnt]
-        xmr = xm[m:m + cnt]
-        ymr = ym[m:m + cnt]
-        xpr = xp[m:m + cnt]
-        ypr = yp[m:m + cnt]
-        zmr = zm[m:m + cnt]
-        zpr = zp[m:m + cnt]
-        for j in range(cnt):
-            t = tr[j]
-            x_bary = (2 * (t - ct)) / tdur - t0_shift_planet - cd
-            sin_Q, cos_Q = sincos_turns((t - t_ref) / per)
-            vector_x = cos_O * cos_Q - sin_O * sin_Q * cos_i
-            vector_y = sin_O * cos_Q + cos_O * sin_Q * cos_i
-            xmj = vector_x * a_moon + x_bary
-            ymj = vector_y * a_moon + b_bary
-            xpj = -vector_x * a_planet + x_bary
-            ypj = -vector_y * a_planet + b_bary
-            xmr[j] = xmj
-            ymr[j] = ymj
-            xpr[j] = xpj
-            ypr[j] = ypj
-            zmr[j] = sqrt(xmj ** 2 + ymj ** 2)
-            zpr[j] = sqrt(xpj ** 2 + ypj ** 2)
+        bl = _anchor_block(tr, cnt, omega)
+        for b0 in range(0, cnt, bl):
+            b1 = min(b0 + bl, cnt)
+            nb = b1 - b0
+            ta = tr[b0 + (nb >> 1)]
+            trb = tr[b0:b1]
+            xmr = xm[m + b0:m + b1]
+            ymr = ym[m + b0:m + b1]
+            xpr = xp[m + b0:m + b1]
+            ypr = yp[m + b0:m + b1]
+            zmr = zm[m + b0:m + b1]
+            zpr = zp[m + b0:m + b1]
+            if max(ta - trb[0], trb[nb - 1] - ta) * omega <= SMALL_PHI_MAX:
+                # Q = Q_a + phi: (cos Q, sin Q) = R(phi) (cos Q_a, sin Q_a),
+                # folded into the projection
+                s_a, c_a = sincos_turns((ta - t_ref) / per)
+                vxc = cos_O * c_a - sc * s_a
+                vxs = -cos_O * s_a - sc * c_a
+                vyc = sin_O * c_a + cc * s_a
+                vys = cc * c_a - sin_O * s_a
+                for j in range(nb):
+                    t = trb[j]
+                    x_bary = (2 * (t - ct)) / tdur - t0_shift_planet - cd
+                    sin_p, cos_p = sincos_small((t - ta) * omega)
+                    vector_x = vxc * cos_p + vxs * sin_p
+                    vector_y = vyc * cos_p + vys * sin_p
+                    xmj = vector_x * a_moon + x_bary
+                    ymj = vector_y * a_moon + b_bary
+                    xpj = -vector_x * a_planet + x_bary
+                    ypj = -vector_y * a_planet + b_bary
+                    xmr[j] = xmj
+                    ymr[j] = ymj
+                    xpr[j] = xpj
+                    ypr[j] = ypj
+                    zmr[j] = sqrt(xmj ** 2 + ymj ** 2)
+                    zpr[j] = sqrt(xpj ** 2 + ypj ** 2)
+            else:
+                for j in range(nb):
+                    t = trb[j]
+                    x_bary = (2 * (t - ct)) / tdur - t0_shift_planet - cd
+                    sin_Q, cos_Q = sincos_turns((t - t_ref) / per)
+                    vector_x = cos_O * cos_Q - sin_O * sin_Q * cos_i
+                    vector_y = sin_O * cos_Q + cos_O * sin_Q * cos_i
+                    xmj = vector_x * a_moon + x_bary
+                    ymj = vector_y * a_moon + b_bary
+                    xpj = -vector_x * a_planet + x_bary
+                    ypj = -vector_y * a_planet + b_bary
+                    xmr[j] = xmj
+                    ymr[j] = ymj
+                    xpr[j] = xpj
+                    ypr[j] = ypj
+                    zmr[j] = sqrt(xmj ** 2 + ymj ** 2)
+                    zpr[j] = sqrt(xpj ** 2 + ypj ** 2)
         m += cnt
     return xm, ym, xp, yp, zm, zp
 
@@ -182,12 +250,15 @@ def ellipse_z_only_runs(
     draws where no planet-moon eclipse is possible
     (eclipse.eclipse_impossible_circular), the positions are not needed;
     two output arrays instead of six (fewer stores and allocations), same
-    arithmetic per sample as ellipse_z_runs()."""
+    arithmetic per sample as ellipse_z_runs() (incl. P24d's block
+    anchors)."""
     O = Omega / 180 * pi
     inc = i / 180 * pi
     cos_O = cos(O)
     sin_O = sin(O)
     cos_i = cos(inc)
+    sc = sin_O * cos_i
+    cc = cos_O * cos_i
     a_planet = (a * mass_ratio) / (1 + mass_ratio)
     a_moon = a - a_planet
     n = 0
@@ -196,6 +267,7 @@ def ellipse_z_only_runs(
     zm = np.empty(n)
     zp = np.empty(n)
     t_ref = tau * per
+    omega = abs(TWO_PI / per)
     m = 0
     for k in range(len(los)):
         ct = c_t[k]
@@ -203,20 +275,45 @@ def ellipse_z_only_runs(
         lo = los[k]
         cnt = his[k] - lo
         tr = time[lo:lo + cnt]
-        zmr = zm[m:m + cnt]
-        zpr = zp[m:m + cnt]
-        for j in range(cnt):
-            t = tr[j]
-            x_bary = (2 * (t - ct)) / tdur - t0_shift_planet - cd
-            sin_Q, cos_Q = sincos_turns((t - t_ref) / per)
-            vector_x = cos_O * cos_Q - sin_O * sin_Q * cos_i
-            vector_y = sin_O * cos_Q + cos_O * sin_Q * cos_i
-            xmj = vector_x * a_moon + x_bary
-            ymj = vector_y * a_moon + b_bary
-            xpj = -vector_x * a_planet + x_bary
-            ypj = -vector_y * a_planet + b_bary
-            zmr[j] = sqrt(xmj ** 2 + ymj ** 2)
-            zpr[j] = sqrt(xpj ** 2 + ypj ** 2)
+        bl = _anchor_block(tr, cnt, omega)
+        for b0 in range(0, cnt, bl):
+            b1 = min(b0 + bl, cnt)
+            nb = b1 - b0
+            ta = tr[b0 + (nb >> 1)]
+            trb = tr[b0:b1]
+            zmr = zm[m + b0:m + b1]
+            zpr = zp[m + b0:m + b1]
+            if max(ta - trb[0], trb[nb - 1] - ta) * omega <= SMALL_PHI_MAX:
+                s_a, c_a = sincos_turns((ta - t_ref) / per)
+                vxc = cos_O * c_a - sc * s_a
+                vxs = -cos_O * s_a - sc * c_a
+                vyc = sin_O * c_a + cc * s_a
+                vys = cc * c_a - sin_O * s_a
+                for j in range(nb):
+                    t = trb[j]
+                    x_bary = (2 * (t - ct)) / tdur - t0_shift_planet - cd
+                    sin_p, cos_p = sincos_small((t - ta) * omega)
+                    vector_x = vxc * cos_p + vxs * sin_p
+                    vector_y = vyc * cos_p + vys * sin_p
+                    xmj = vector_x * a_moon + x_bary
+                    ymj = vector_y * a_moon + b_bary
+                    xpj = -vector_x * a_planet + x_bary
+                    ypj = -vector_y * a_planet + b_bary
+                    zmr[j] = sqrt(xmj ** 2 + ymj ** 2)
+                    zpr[j] = sqrt(xpj ** 2 + ypj ** 2)
+            else:
+                for j in range(nb):
+                    t = trb[j]
+                    x_bary = (2 * (t - ct)) / tdur - t0_shift_planet - cd
+                    sin_Q, cos_Q = sincos_turns((t - t_ref) / per)
+                    vector_x = cos_O * cos_Q - sin_O * sin_Q * cos_i
+                    vector_y = sin_O * cos_Q + cos_O * sin_Q * cos_i
+                    xmj = vector_x * a_moon + x_bary
+                    ymj = vector_y * a_moon + b_bary
+                    xpj = -vector_x * a_planet + x_bary
+                    ypj = -vector_y * a_planet + b_bary
+                    zmr[j] = sqrt(xmj ** 2 + ymj ** 2)
+                    zpr[j] = sqrt(xpj ** 2 + ypj ** 2)
         m += cnt
     return zm, zp
 
