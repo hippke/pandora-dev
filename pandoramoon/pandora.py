@@ -608,13 +608,15 @@ def pandora_loglike(
     t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
     i_moon, ecc_moon, w_moon, M_moon, epoch_distance, supersampling_factor,
     occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
-    data, inv_err, flat_terms, chi2_flat, cache, eclipse_pixelmap, time_sorted
+    inv_var, lin_terms, chi2_flat, cache, eclipse_pixelmap, time_sorted
 ):
     """Gaussian log-likelihood -chi^2/2 of the total flux, without
     full-length arrays: chi^2 = chi2_flat + sum over window cadences of
-    [((f - data) inv_err)^2 - flat_terms], where flat_terms =
-    ((1 - data) inv_err)^2 and chi2_flat = sum(flat_terms) (model = 1
-    everywhere) are precomputed per dataset. Use it via Likelihood.
+    ((f - data) inv_err)^2 - ((1 - data) inv_err)^2 = D (inv_var D -
+    lin_terms) with the deficit D = 1 - f (P13b), where inv_var = inv_err^2,
+    lin_terms = 2 (1 - data) inv_err^2 and chi2_flat = sum(((1 - data)
+    inv_err)^2) (model = 1 everywhere) are precomputed per dataset. Use it
+    via Likelihood.
     P18: the window is kept as per-epoch sample runs (no idx/x/time window
     arrays, see _window_model_runs) and the chi^2 is summed per run."""
     los, his, flux_planet_w, flux_moon_w = _window_model_runs(
@@ -626,7 +628,7 @@ def pandora_loglike(
     )
     chi2 = chi2_flat + _window_chi2_runs(
         len(time), los, his, flux_planet_w, flux_moon_w, supersampling_factor,
-        data, inv_err, flat_terms
+        inv_var, lin_terms
     )
     return -0.5 * chi2
 
@@ -1107,9 +1109,10 @@ def _window_cadences(n, idx, flux_planet_w, flux_moon_w, supersampling_factor):
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _window_chi2_runs(n, los, his, flux_planet_w, flux_moon_w,
-                      supersampling_factor, data, inv_err, flat_terms):
+                      supersampling_factor, inv_var, lin_terms):
     """chi^2 part of the window cadences, sum of ((f - data) inv_err)^2 -
-    flat_terms over them (see pandora_loglike), for the total flux f of the
+    ((1 - data) inv_err)^2 = D (inv_var D - lin_terms) over them (D = 1 - f,
+    see pandora_loglike), for the total flux f of the
     output cadences touched by the window samples, given as ascending,
     disjoint runs [los[k], his[k]) (fluxes in run order): the same cadences
     and block means as _window_cadences() on the concatenated indices, to
@@ -1122,7 +1125,11 @@ def _window_chi2_runs(n, los, his, flux_planet_w, flux_moon_w,
     Per run: a partial first block (or the continuation of a block left
     open by the previous run, if the runs touch), full blocks, a partial
     last block that stays open for the next run. Without supersampling the
-    loop runs over data[lo:hi] directly."""
+    loop runs over inv_var[lo:hi] directly.
+    P13b: the difference to the flat model in the form D (inv_var D -
+    lin_terms) instead of r^2 - flat_terms: two data arrays instead of three
+    (the loop is load-bound: PLATO 1-min windows 1.15 -> 0.93 us in numba),
+    and no cancellation of r^2 against flat_terms."""
     chi2 = 0.0
     m = 0
     nr = len(los)
@@ -1131,14 +1138,13 @@ def _window_chi2_runs(n, los, his, flux_planet_w, flux_moon_w,
             lo = los[k]
             cnt = his[k] - lo
             # slices: no wraparound selects for data[lo + j] (cf. ellipse_z_runs)
-            dr = data[lo:lo + cnt]
-            wr = inv_err[lo:lo + cnt]
-            fr = flat_terms[lo:lo + cnt]
+            wr = inv_var[lo:lo + cnt]
+            cr = lin_terms[lo:lo + cnt]
             fpr = flux_planet_w[m:m + cnt]
             fmr = flux_moon_w[m:m + cnt]
             for j in range(cnt):
-                r = (fmr[j] + fpr[j] - 1 - dr[j]) * wr[j]
-                chi2 += r * r - fr[j]
+                d = (1.0 - fpr[j]) + (1.0 - fmr[j])
+                chi2 += d * (wr[j] * d - cr[j])
             m += cnt
         return chi2
 
@@ -1158,8 +1164,8 @@ def _window_chi2_runs(n, los, his, flux_planet_w, flux_moon_w,
                     m += q - p
                     p = q
                     continue
-                r = (1.0 - s / (end - out * factor) - data[out]) * inv_err[out]
-                chi2 += r * r - flat_terms[out]
+                d = s / (end - out * factor)
+                chi2 += d * (inv_var[out] * d - lin_terms[out])
                 out = -1
             o = p // factor
             start = o * factor
@@ -1170,8 +1176,8 @@ def _window_chi2_runs(n, los, his, flux_planet_w, flux_moon_w,
                     s = 0.0
                     for j in range(m, m + factor):
                         s += (1.0 - flux_planet_w[j]) + (1.0 - flux_moon_w[j])
-                    r = (1.0 - s / factor - data[o + b]) * inv_err[o + b]
-                    chi2 += r * r - flat_terms[o + b]
+                    d = s / factor
+                    chi2 += d * (inv_var[o + b] * d - lin_terms[o + b])
                     m += factor
                 p += nb * factor
                 if nb > 0:
@@ -1186,8 +1192,8 @@ def _window_chi2_runs(n, los, his, flux_planet_w, flux_moon_w,
             m += q - p
             p = q
     if out >= 0:
-        r = (1.0 - s / (end - out * factor) - data[out]) * inv_err[out]
-        chi2 += r * r - flat_terms[out]
+        d = s / (end - out * factor)
+        chi2 += d * (inv_var[out] * d - lin_terms[out])
     return chi2
 
 

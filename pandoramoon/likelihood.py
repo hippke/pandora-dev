@@ -7,7 +7,7 @@ from pandoramoon.pandora import pandora_loglike
 def _compiled_loglike(tail):
     """P8: the compiled pandora_loglike for 20 float64 model parameters and
     this dataset's fixed arguments (tail), i.e. its entry point. Calling it
-    skips numba's per-call type dispatch over all 33 arguments (~0.4 us per
+    skips numba's per-call type dispatch over all 32 arguments (~0.4 us per
     call); the parameters are converted to float like float(x). Falls back
     to the dispatcher if the entry point cannot be obtained."""
     try:
@@ -76,8 +76,11 @@ class Likelihood(object):
             raise ValueError("yerr must be positive")
         self.data = np.ascontiguousarray(np.where(valid, data, 1.0))
         self.inv_err = np.ascontiguousarray(np.where(valid, 1.0 / np.where(valid, yerr, 1.0), 0.0))
-        self.flat_terms = ((1.0 - self.data) * self.inv_err) ** 2
-        self.chi2_flat = float(np.sum(self.flat_terms))
+        flat_terms = ((1.0 - self.data) * self.inv_err) ** 2
+        self.chi2_flat = float(np.sum(flat_terms))
+        # P13b: per cadence chi^2 - flat term = D (inv_var D - lin_terms), D = 1 - model
+        self.inv_var = self.inv_err ** 2
+        self.lin_terms = 2.0 * (1.0 - self.data) * self.inv_var
         self.epoch_distance = float(epoch_distance)
         self.supersampling_factor = supersampling_factor
         self.occult_small_threshold = float(occult_small_threshold)
@@ -88,8 +91,8 @@ class Likelihood(object):
         # P8: fixed trailing arguments and the compiled entry point
         self._tail = (
             self.epoch_distance, self.supersampling_factor, self.occult_small_threshold,
-            self.hill_sphere_threshold, self.numerical_grid, self.time, self.data,
-            self.inv_err, self.flat_terms, self.chi2_flat, self.cache,
+            self.hill_sphere_threshold, self.numerical_grid, self.time,
+            self.inv_var, self.lin_terms, self.chi2_flat, self.cache,
             self.eclipse_pixelmap, self.time_sorted,
         )
         self._loglike = _compiled_loglike(self._tail)
