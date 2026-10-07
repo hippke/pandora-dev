@@ -236,6 +236,94 @@ def subruns_pay(time, los, his, cell_dt):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _search_sorted(tr, x, right, t0, scale):
+    """np.searchsorted(tr, x, side="right" if right else "left") for
+    ascending tr, walked from the linear-interpolation guess (x - t0) scale
+    (scale = (len - 1) / (tr[-1] - t0)): 0-2 steps on uniform sampling,
+    binary search after 16 steps (gaps)"""
+    n = len(tr)
+    g = (x - t0) * scale
+    if not g > 0:
+        j = 0
+    elif not g < n:
+        j = n
+    else:
+        j = int(g)
+    steps = 0
+    if right:
+        while j > 0 and tr[j - 1] > x:
+            j -= 1
+            steps += 1
+            if steps > 16:
+                return np.searchsorted(tr, x, side="right")
+        while j < n and not tr[j] > x:
+            j += 1
+            steps += 1
+            if steps > 16:
+                return np.searchsorted(tr, x, side="right")
+    else:
+        while j > 0 and not tr[j - 1] < x:
+            j -= 1
+            steps += 1
+            if steps > 16:
+                return np.searchsorted(tr, x, side="left")
+        while j < n and tr[j] < x:
+            j += 1
+            steps += 1
+            if steps > 16:
+                return np.searchsorted(tr, x, side="left")
+    return j
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _moon_cells(
+    tr, s, e, h, lo, t_ref, inv_per, cos_O, sin_O, cos_i, a_moon, ct, two_tdur,
+    sh, b_bary, z_lim_m, curv, cur_s, cur_e, los2, his2, n_out
+):
+    """Moon cells [ja, jb] (samples s, s + h, ..., e of the run tr, e
+    included; e > s) whose arc can come closer to the star centre than
+    z_lim_m, appended (as lo + ja .. lo + jb + 1) to the merged interval list.
+    Kept if the distance of the centre from the chord P_a P_b, minus the
+    curvature bound curv (t_b - t_a)^2, is < z_lim_m; tested without
+    division or sqrt: with lim = z_lim_m + curv dt^2 and s_ = -P_a.(P_b -
+    P_a), the closest chord point is P_a (s_ <= 0), P_b (s_ >= |P_b -
+    P_a|^2) or the foot of the perpendicular (distance |P_a x (P_b - P_a)| /
+    |P_b - P_a|)."""
+    ja = s
+    ta = tr[ja]
+    sin_Q, cos_Q = sincos_turns((ta - t_ref) * inv_per)
+    xa = (cos_O * cos_Q - sin_O * sin_Q * cos_i) * a_moon + ((ta - ct) * two_tdur - sh)
+    ya = (sin_O * cos_Q + cos_O * sin_Q * cos_i) * a_moon + b_bary
+    while ja < e:
+        jb = min(ja + h, e)
+        tb = tr[jb]
+        sin_Q, cos_Q = sincos_turns((tb - t_ref) * inv_per)
+        xb = (cos_O * cos_Q - sin_O * sin_Q * cos_i) * a_moon + ((tb - ct) * two_tdur - sh)
+        yb = (sin_O * cos_Q + cos_O * sin_Q * cos_i) * a_moon + b_bary
+        dx = xb - xa
+        dy = yb - ya
+        dtc = tb - ta
+        lim = z_lim_m + curv * dtc * dtc
+        lim2 = lim * lim
+        s_ = -(xa * dx + ya * dy)
+        dd = dx * dx + dy * dy
+        if s_ <= 0:
+            keep = xa * xa + ya * ya < lim2
+        elif s_ >= dd:
+            keep = xb * xb + yb * yb < lim2
+        else:
+            cr = xa * dy - ya * dx
+            keep = cr * cr < lim2 * dd
+        if keep:
+            cur_s, cur_e, n_out = _emit_interval(lo + ja, lo + jb + 1, cur_s, cur_e, los2, his2, n_out)
+        ja = jb
+        ta = tb
+        xa = xb
+        ya = yb
+    return cur_s, cur_e, n_out
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def ellipse_subruns(
     a, per, tau, Omega, i, time, los, his, c_t, c_d, tdur, t0_shift_planet,
     mass_ratio, b_bary, r_planet, r_moon
@@ -251,39 +339,57 @@ def ellipse_subruns(
       |x_p| >= |x_bary| - a_p and |y_p| >= |b| - a_p; on the star
       (z_p < 1 + r_p) only if |x_bary| < a_p + sqrt((1 + r_p)^2 -
       max(|b| - a_p, 0)^2). x_bary is linear in t within a run: one
-      interval, found by binary search (padded: extra samples are harmless).
-    - Moon: the sky position P(t) = (x_bary(t) + a_m v_x, b + a_m v_y) at
-      every h-th sample of a run (and the last one), with the orbit loop's
-      formulas (a_m = a / (1 + q)). x_bary is linear in t and |d^2 v /
-      dt^2| = omega^2 |v| <= omega^2, so on a cell [t_a, t_b] P deviates
-      from the chord P_a P_b by at most a_m omega^2 (t_b - t_a)^2 / 8: the
-      cell is kept if the distance of the star centre from the chord minus
-      that is < 1 + r_moon. h gives cells of ~sqrt(8 SUBRUN_SLACK /
-      (a_m omega^2)) days, at most SUBRUN_DT_MAX (shorter cells keep fewer
-      samples, but cost a point evaluation each, ~10 ns); runs with cells
-      of fewer than SUBRUN_H_MIN samples are returned whole.
-    - Margins 1e-6 (R_star) on both bounds cover round-off."""
+      interval [pl, ph), found by search (padded: extra samples are
+      harmless).
+    - Moon (P20: first the analytic range): a_m v = a_m (cos O cos Q - sin O
+      sin Q cos i, sin O cos Q + cos O sin Q cos i) has |a_m v_x| <= A_x =
+      a_m sqrt(cos^2 O + sin^2 O cos^2 i) and |a_m v_y| <= A_y = a_m
+      sqrt(sin^2 O + cos^2 O cos^2 i), so the moon is on the star only if
+      |b| - A_y < 1 + r_moon and |x_bary| < 1 + r_moon + A_x: one interval
+      [ml, mh) per run, found like the planet's. Inside it, the sky
+      position P(t) = (x_bary(t) + a_m v_x, b + a_m v_y) at every h-th
+      sample (and the last one; a_m = a / (1 + q)). x_bary is linear in t
+      and |d^2 v / dt^2| = omega^2 |v| <= omega^2, so on a cell [t_a, t_b]
+      P deviates from the chord P_a P_b by at most a_m omega^2 (t_b -
+      t_a)^2 / 8: the cell is kept if the distance of the star centre from
+      the chord minus that is < 1 + r_moon (_moon_cells). Cells inside the
+      planet interval would be kept anyway, so they are not evaluated
+      (P20): cells cover ml .. min(pl, mh - 1) and max(ph - 1, ml) .. mh -
+      1. h gives cells of ~sqrt(8 SUBRUN_SLACK / (a_m omega^2)) days, at
+      most SUBRUN_DT_MAX (shorter cells keep fewer samples, but cost a
+      point evaluation each, ~7 ns); runs with cells of fewer than
+      SUBRUN_H_MIN samples are returned whole.
+    - Margins 1e-6 (R_star) on all bounds cover round-off (the cell points
+      use reciprocals, not the orbit loop's divisions: ~1e-12 R_star)."""
     a_planet = (a * mass_ratio) / (1 + mass_ratio)
     a_moon = a - a_planet
     cell_dt, curv = subrun_cell_dt(a, per, mass_ratio)
     n_runs = len(los)
-    # Output capacity: at most one sub-run per moon cell plus one per run
+    # Output capacity: per run at most one sub-run per moon cell (cells on
+    # both sides of the planet interval: one partial cell more) plus the
+    # planet's
     cap = 1
     for k in range(n_runs):
         h = _cell_samples(time, los[k], his[k], cell_dt)
         cnt = his[k] - los[k]
-        cap += (cnt + h - 1) // h + 1 if h > 0 else 1
+        cap += (cnt + h - 1) // h + 2 if h > 0 else 1
     O = Omega / 180 * pi
     inc = i / 180 * pi
     cos_O = cos(O)
     sin_O = sin(O)
     cos_i = cos(inc)
     t_ref = tau * per
+    inv_per = 1.0 / per
+    two_tdur = 2.0 / tdur
     z_lim_m = 1 + r_moon + 1e-6
     yp_min = max(abs(b_bary) - a_planet, 0.0)
     rp_lim = 1 + r_planet + 1e-6
     has_p = rp_lim > yp_min
     x_lim_p = a_planet + sqrt(max(rp_lim * rp_lim - yp_min * yp_min, 0.0)) + 1e-6
+    A_x = a_moon * sqrt(cos_O * cos_O + sin_O * sin_O * cos_i * cos_i) * (1 + 1e-9)
+    A_y = a_moon * sqrt(sin_O * sin_O + cos_O * cos_O * cos_i * cos_i) * (1 + 1e-9)
+    has_m = abs(b_bary) - A_y < z_lim_m
+    x_lim_m = z_lim_m + A_x + 1e-6
     half = tdur / 2
     los2 = np.empty(cap, dtype=np.int64)
     his2 = np.empty(cap, dtype=np.int64)
@@ -307,57 +413,52 @@ def ellipse_subruns(
             c_d2[n_out] = cd
             n_out += 1
             continue
-        # planet interval [plo, phi)
-        plo = hi
-        phi = hi
+        sh = t0_shift_planet + cd
+        # start guess of the searches (h > 0: cnt >= SUBRUN_H_MIN)
+        t0r = tr[0]
+        span = tr[cnt - 1] - t0r
+        scale = (cnt - 1) / span if span > 0 else 0.0
+        # planet interval [pl, ph) of the run
+        pl = cnt
+        ph = cnt
         if has_p:
-            t_a = ct + (-x_lim_p + t0_shift_planet + cd) * half
-            t_b = ct + (x_lim_p + t0_shift_planet + cd) * half
+            t_a = ct + (-x_lim_p + sh) * half
+            t_b = ct + (x_lim_p + sh) * half
             pad = 1e-6 * tdur + 1e-12 * (abs(t_a) + abs(t_b))
-            plo = lo + np.searchsorted(tr, t_a - pad, side="left")
-            phi = lo + np.searchsorted(tr, t_b + pad, side="right")
-        pending = plo < phi
+            pl = _search_sorted(tr, t_a - pad, False, t0r, scale)
+            ph = _search_sorted(tr, t_b + pad, True, t0r, scale)
+        # moon range [ml, mh) of the run (at least 2 samples, or empty)
+        ml = 0
+        mh = 0
+        if has_m:
+            t_a = ct + (-x_lim_m + sh) * half
+            t_b = ct + (x_lim_m + sh) * half
+            pad = 1e-6 * tdur + 1e-12 * (abs(t_a) + abs(t_b))
+            ml = _search_sorted(tr, t_a - pad, False, t0r, scale)
+            mh = _search_sorted(tr, t_b + pad, True, t0r, scale)
+            if mh - ml == 1:
+                if mh < cnt:
+                    mh += 1
+                else:
+                    ml -= 1
         start = n_out
         cur_s = -1
         cur_e = -1
-        # moon cells between the samples 0, h, 2h, ..., cnt - 1 of the run
-        ja = 0
-        ta = tr[0]
-        sin_Q, cos_Q = sincos_turns((ta - t_ref) / per)
-        xa = (cos_O * cos_Q - sin_O * sin_Q * cos_i) * a_moon + ((2 * (ta - ct)) / tdur - t0_shift_planet - cd)
-        ya = (sin_O * cos_Q + cos_O * sin_Q * cos_i) * a_moon + b_bary
-        if cnt == 1 and sqrt(xa * xa + ya * ya) < z_lim_m:
-            if pending and plo <= lo:
-                cur_s, cur_e, n_out = _emit_interval(plo, phi, cur_s, cur_e, los2, his2, n_out)
-                pending = False
-            cur_s, cur_e, n_out = _emit_interval(lo, lo + 1, cur_s, cur_e, los2, his2, n_out)
-        while ja < cnt - 1:
-            jb = min(ja + h, cnt - 1)
-            tb = tr[jb]
-            sin_Q, cos_Q = sincos_turns((tb - t_ref) / per)
-            xb = (cos_O * cos_Q - sin_O * sin_Q * cos_i) * a_moon + ((2 * (tb - ct)) / tdur - t0_shift_planet - cd)
-            yb = (sin_O * cos_Q + cos_O * sin_Q * cos_i) * a_moon + b_bary
-            # distance of the star centre from the chord P_a P_b, minus the
-            # curvature bound of the arc
-            dx = xb - xa
-            dy = yb - ya
-            dd = dx * dx + dy * dy
-            u = -(xa * dx + ya * dy) / dd if dd > 0 else 0.0
-            u = min(max(u, 0.0), 1.0)
-            cx = xa + u * dx
-            cy = ya + u * dy
-            dtc = tb - ta
-            if sqrt(cx * cx + cy * cy) - curv * dtc * dtc < z_lim_m:
-                if pending and plo <= lo + ja:
-                    cur_s, cur_e, n_out = _emit_interval(plo, phi, cur_s, cur_e, los2, his2, n_out)
-                    pending = False
-                cur_s, cur_e, n_out = _emit_interval(lo + ja, lo + jb + 1, cur_s, cur_e, los2, his2, n_out)
-            ja = jb
-            ta = tb
-            xa = xb
-            ya = yb
-        if pending:
-            cur_s, cur_e, n_out = _emit_interval(plo, phi, cur_s, cur_e, los2, his2, n_out)
+        s = ml
+        if pl < ph:
+            e = min(pl, mh - 1)
+            if e > ml:
+                cur_s, cur_e, n_out = _moon_cells(
+                    tr, ml, e, h, lo, t_ref, inv_per, cos_O, sin_O, cos_i, a_moon, ct,
+                    two_tdur, sh, b_bary, z_lim_m, curv, cur_s, cur_e, los2, his2, n_out
+                )
+            cur_s, cur_e, n_out = _emit_interval(lo + pl, lo + ph, cur_s, cur_e, los2, his2, n_out)
+            s = max(ph - 1, ml)
+        if mh - 1 > s:
+            cur_s, cur_e, n_out = _moon_cells(
+                tr, s, mh - 1, h, lo, t_ref, inv_per, cos_O, sin_O, cos_i, a_moon, ct,
+                two_tdur, sh, b_bary, z_lim_m, curv, cur_s, cur_e, los2, his2, n_out
+            )
         if cur_s >= 0:
             los2[n_out] = cur_s
             his2[n_out] = cur_e
