@@ -608,58 +608,8 @@ def _occult_series_batch(zb, m, a, A0, A1, flux):
 assert SERIES_M == 11 and SERIES_ALPHA.shape == (12, 12)  # _occult_series_batch is unrolled for 11
 
 # P23: block length of the per-sample path's pass 1 (vectorised counts and
-# series per block; blocks without exact samples are not scanned again)
+# interior approximation per block; blocks without exact samples are not scanned again)
 BLOCK_N = 32
-
-
-@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
-def _occult_series_select(zs, lo, hi, a, A0, A1, z_c, one_k, flux):
-    """P23: flux[i] = 1 off the star (z >= 1 + k or z < 0), else the P14
-    series at min(z, z_c) (the same arithmetic as _occult_series_batch for
-    z < z_c; the other samples are overwritten by the exact model), for
-    lo <= i < hi, branch-free (vectorised). Returns the number of samples
-    that need the exact model (z_c <= z < 1 + k). The arrays are sliced
-    here, not by the caller: views passed into it made the whole pass
-    ~1.5x slower (cf. PERFORMANCE_LOG.md §29.1)."""
-    zr = zs[lo:hi]
-    fr = flux[lo:hi]
-    a0 = a[0]
-    a1 = a[1]
-    a2 = a[2]
-    a3 = a[3]
-    a4 = a[4]
-    a5 = a[5]
-    a6 = a[6]
-    a7 = a[7]
-    a8 = a[8]
-    a9 = a[9]
-    a10 = a[10]
-    a11 = a[11]
-    c = 0
-    for j in range(hi - lo):
-        z = zr[j]
-        zz = min(max(z, 0.0), z_c)
-        z2 = zz * zz
-        w = 1 - z2
-        v = 1 / w
-        P = a11
-        P = P * v + a10
-        P = P * v + a9
-        P = P * v + a8
-        P = P * v + a7
-        P = P * v + a6
-        P = P * v + a5
-        P = P * v + a4
-        P = P * v + a3
-        P = P * v + a2
-        P = P * v + a1
-        P = P * v + a0
-        f = A0 + A1 * z2 - np.sqrt(w) * P
-        f = f if f < 1 else 1.0
-        off = (z >= one_k) | (z < 0)
-        fr[j] = 1.0 if off else f
-        c += 1 if (z >= z_c) & (z < one_k) else 0
-    return c
 
 
 # ---------------------------------------------------------------------------
@@ -822,6 +772,292 @@ def _occult_limb_batch(zl, m, k, coef, flux):
         flux[j] = f if f < 1 else 1.0
 
 
+# ---------------------------------------------------------------------------
+# P21c: per-call polynomial interpolant of the interior 0 <= z <= 1 - k
+#
+# For fixed (k, u1, u2) the deficit D(z) = (c1 k^2 + c2 ldx + u2 edx) omega of a
+# body fully on the star is analytic in z^2 on [0, (1 - k)^2) (edx is a
+# polynomial in z^2, ldx = k^2 <mu>); its only singularity is at internal
+# tangency, D = D_t + a delta + b delta^2 ln delta + ... (delta = 1 - k - z).
+# In s = sqrt((1 - k)^2 - z^2) (s^2 ~ 2 (1 - k) delta, analytic in z^2) that is
+# D_t + a' s^2 + b' s^4 ln s + ... (only even powers plus s^(2n) ln s terms),
+# so a polynomial in x = 2 s / (1 - k) - 1 converges like N^-8 (transit
+# project, PERFORMANCE_LOG.md §28; Option A of its ASSESSMENT.md). Conditions:
+# the values at the Lobatto nodes x_j = cos(pi j / N), with the end values in
+# closed form (x_0 = 1: z = 0, D_0 from <mu> = 2 (1 - (1 - k^2)^(3/2)) / (3 k^2);
+# x_N = -1: z = 1 - k, D_t as in _limb_coeffs) and node N-1 (next to contact,
+# a scalar-fallback lane) replaced by dD/dx = 0 at x = -1: INT_NODES = N - 2
+# = 12 exact lanes (one of them, x_{N-2}, takes the scalar fallback for
+# k >~ 0.05). lex = k^2 and edx are polynomials in x, so only the ldx part
+# depends on the nodes: for 0.0005 <= k <= 0.5 its coefficients come from
+# an offline table in sqrt(k) (INT_TAB below, ~0.05 us per call), else
+# from the 12 exact lanes per call (~0.3 us). Replaces the P14 series
+# (z < z_c) *and* the exact band z_c <= z < 1 - k: one sqrt and a 15-term
+# Horner per interior sample, no division, no z_c search, no z == k
+# nudge. Measured (scratch_p21c/acc.py, interior_err.py; converged kernel,
+# which agrees with an mpmath rim quadrature to ~1e-14; dense z incl.
+# 1e-15 from contact and z = k): max ldx error 1.3e-11 (k = 1e-4), 5.5e-10
+# (0.0092), 1.3e-9 (0.1), 1.5e-9 (0.2 ... 0.3), 1.2e-9 (0.5), 6.5e-10
+# (0.7), so <= 3.7e-9 in flux for the LD laws tested, unphysical ones
+# included (c2 omega <= 2.4 for physical LD); the error is measured, not
+# proven (P14's series had a rigorous bound at 1e-8; it is kept below as
+# the reference of the unit tests).
+# ---------------------------------------------------------------------------
+INT_N = 14              # degree (the kernels below are unrolled for 14)
+INT_NODES = INT_N - 2   # exact lanes x_1 .. x_{N-2}: 12, a multiple of 4
+INT_W = 16              # coefficient slots (>= INT_N + 1)
+
+
+def _int_tables(N):
+    """(z_j / (1 - k) at the exact nodes x_1 .. x_{N-2}; transposed matrix M:
+    M[j, i] = monomial coefficient i (in x) per unit value of condition j,
+    j = 0: x_0 (z = 0), j = 1 .. N-2: x_j, j = N-1: x_N (z = 1 - k); the
+    dD/dx(-1) = 0 condition has right-hand side 0 and no column)"""
+    x = np.cos(np.pi * np.arange(N + 1) / N)
+    sf = (x + 1) / 2                                  # s / (1 - k)
+    d1 = np.zeros(N + 1)                              # d/dx x^i at x = -1
+    for i in range(1, N + 1):
+        d1[i] = i * (-1.0) ** (i - 1)
+    V = np.vander(x, N + 1, increasing=True)
+    A = np.vstack([V[:N - 1], V[N], d1])
+    M = np.linalg.inv(A)[:, :N]
+    zf = np.sqrt(1 - sf[1:N - 1] ** 2)
+    return np.ascontiguousarray(zf), np.ascontiguousarray(M.T)
+
+
+INT_ZF, INT_M = _int_tables(INT_N)
+assert INT_N == 14 and INT_NODES % 4 == 0 and INT_M.shape == (INT_N, INT_N + 1)
+
+# Offline table of the ldx part (LD-independent) of the interior
+# interpolant: its monomial coefficients c_j(k) as Chebyshev series of
+# degree INT_TAB_M in t = 2 (sqrt(k) - sqrt(k_min)) / (sqrt(k_max) - sqrt(k_min)) - 1
+# (sqrt(k): the coefficients have a sqrt(k) behaviour at small k). Built by
+# _int_table_build() from _int_coeffs_exact (interpolation at the
+# first-kind Chebyshev nodes in t) and stored in interior_table.py;
+# test_interior_interpolant rebuilds it. Reconstruction vs the per-call
+# build at 400 random k (scratch_p21c/gen_table.py): coefficient error
+# <= 1.3e-11, sum of |errors| <= 6.3e-11 (a bound of the ldx change on the
+# whole interior). The per-call build then costs ~0.05 instead of ~0.3 us
+# (12 exact lanes). Outside [k_min, k_max] the per-call build is used.
+INT_TAB_KMIN = 0.0005
+INT_TAB_KMAX = 0.5
+INT_TAB_M = 32
+INT_TAB_Y0 = float(np.sqrt(INT_TAB_KMIN))
+INT_TAB_SCALE = float(2 / (np.sqrt(INT_TAB_KMAX) - np.sqrt(INT_TAB_KMIN)))
+
+
+def _int_table_build(M=INT_TAB_M, kmin=INT_TAB_KMIN, kmax=INT_TAB_KMAX):
+    """(M + 1, INT_W) table of the Chebyshev coefficients (in t) of the ldx
+    monomial coefficients c_j(k) (u = (1, 0): deficit = 1.5 ldx), from
+    per-call builds at the M + 1 first-kind Chebyshev nodes in t. Run
+    `python -c "import pandoramoon.occult as o; o._int_table_write()"` to
+    regenerate interior_table.py (only needed if INT_N, the nodes, the
+    range or M change), then clear the numba cache (__pycache__/*.nb*): the
+    cached functions do not notice a changed table module."""
+    from numpy.polynomial import chebyshev
+    y0, y1 = np.sqrt(kmin), np.sqrt(kmax)
+    t = np.cos(np.pi * (np.arange(M + 1) + 0.5) / (M + 1))
+    ks = (y0 + (t + 1) / 2 * (y1 - y0)) ** 2
+    C = np.array([_int_coeffs_exact(float(k), 1.0, 0.0) / 1.5 for k in ks])   # (M + 1, INT_W)
+    T = chebyshev.chebfit(t, C, M)
+    T[:, INT_N + 1:] = 0.0
+    return T
+
+
+def _int_table_write():
+    import os
+    T = _int_table_build()
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interior_table.py")
+    with open(path, "w") as f:
+        f.write('"""P21c: offline table of the interior interpolant (see occult.py,\n'
+                'INT_TAB_*). Generated by occult._int_table_write(); do not edit."""\n')
+        f.write(f"INT_TAB_DATA = (  # INT_TAB_M = {INT_TAB_M}, k in [{INT_TAB_KMIN}, {INT_TAB_KMAX}], INT_N = {INT_N}\n")
+        for row in T:
+            f.write("    (" + ", ".join(repr(float(v)) for v in row) + "),\n")
+        f.write(")\n")
+
+
+try:
+    from pandoramoon.interior_table import INT_TAB_DATA
+    INT_TAB = np.ascontiguousarray(np.array(INT_TAB_DATA, dtype=np.float64))
+except ImportError:                      # only while generating the table
+    INT_TAB = np.zeros((INT_TAB_M + 1, INT_W))
+assert INT_TAB.shape == (INT_TAB_M + 1, INT_W)
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _int_coeffs(k, u1, u2):
+    """Monomial coefficients in x (coef[0:INT_N+1]) of the P21c interior
+    interpolant of the deficit 1 - flux for (k, u1, u2), 0 < k < 1: from
+    the offline table for INT_TAB_KMIN <= k <= INT_TAB_KMAX, else built
+    from the exact kernel (_int_coeffs_exact)."""
+    if k >= INT_TAB_KMIN and k <= INT_TAB_KMAX:
+        return _int_coeffs_tab(k, u1, u2)
+    return _int_coeffs_exact(k, u1, u2)
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _int_coeffs_tab(k, u1, u2):
+    """_int_coeffs() from the offline table (INT_TAB_KMIN <= k <= INT_TAB_KMAX):
+    the ldx coefficients c_j(k) = sum_m INT_TAB[m, j] T_m(t), t linear in
+    sqrt(k), plus the exact polynomials in x of lex = k^2 and
+    edx = k^2 / 2 (k^2 + 2 z^2), z^2 = (1 - k)^2 (3 - 2 x - x^2) / 4."""
+    omega = 1 / (1 - u1 / 3 - u2 / 6)
+    c1 = 1 - u1 - 2 * u2
+    c2 = u1 + 2 * u2
+    k2 = k * k
+    t = (np.sqrt(k) - INT_TAB_Y0) * INT_TAB_SCALE - 1
+    t2 = 2 * t
+    coef = np.zeros(INT_W)
+    tm1 = 1.0                              # T_0
+    tm = t                                 # T_1
+    for j in range(INT_W):
+        coef[j] = INT_TAB[0, j] + INT_TAB[1, j] * t
+    for m in range(2, INT_TAB_M + 1):
+        tn = t2 * tm - tm1
+        tm1 = tm
+        tm = tn
+        for j in range(INT_W):
+            coef[j] += INT_TAB[m, j] * tn
+    # deficit = omega (c1 k^2 + c2 ldx + u2 edx)
+    q = k2 * (1 - k) * (1 - k)
+    for j in range(INT_W):
+        coef[j] *= c2 * omega
+    coef[0] += omega * (c1 * k2 + u2 * (0.5 * k2 * k2 + 0.75 * q))
+    coef[1] -= omega * u2 * 0.5 * q
+    coef[2] -= omega * u2 * 0.25 * q
+    return coef
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _int_coeffs_exact(k, u1, u2):
+    """_int_coeffs() built per call: exact kernel at INT_NODES nodes
+    (non-converged lanes scalar), closed forms at z = 0 and z = 1 - k
+    (~0.3 us; also the source of the offline table)."""
+    N = INT_N
+    nn = INT_NODES
+    omega = 1 / (1 - u1 / 3 - u2 / 6)
+    c1 = 1 - u1 - 2 * u2
+    c2 = u1 + 2 * u2
+    k2 = k * k
+    omk = 1 - k
+    buf = np.empty(3 * nn)
+    zn = buf[:nn]
+    fn = buf[nn:2 * nn]
+    dv = buf[2 * nn:]
+    for j in range(nn):
+        z = omk * INT_ZF[j]
+        if abs(z - k) < Z_K_MIN:           # as occult_hybrid's pass 2
+            z = k + max(k * 2.220446049250313e-16, Z_K_MIN)
+        zn[j] = z
+    # The trip count must not be a compile-time constant: with m = nn
+    # LLVM compiles the inlined batch loop for exactly 12 lanes without
+    # vectorising it (466 instead of 131 ns, scratch_p21c/batch_probe.py).
+    # k > 0 always holds here, but LLVM cannot know that.
+    m = nn if k > 0 else 0
+    _occult_exact_batch(zn, m, k, c1, c2, u2, omega, fn, dv)
+    for j in range(nn):
+        if not dv[j] <= 0:
+            fn[j] = _occult_point(zn[j], k, u1, u2)
+    # z = 0: ldx = k^2 <mu> = 2/3 (1 - (1 - k^2)^(3/2)), edx = k^4 / 2
+    ldx_0 = -(2 / 3) * np.expm1(1.5 * np.log1p(-k2))
+    d_0 = (c1 * k2 + c2 * ldx_0 + u2 * (0.5 * k2 * k2)) * omega
+    # z = 1 - k: closed form (Case IV with z + k = 1), as in _limb_coeffs
+    ldx_t = (2 / 3 / pi) * np.arccos(1 - 2 * k) - (4 / 9 / pi) * np.sqrt(k * omk) * (3 + 2 * k - 8 * k2)
+    edx_t = k2 / 2 * (k2 + 2 * omk * omk)
+    d_t = (c1 * k2 + c2 * ldx_t + u2 * edx_t) * omega
+    coef = np.zeros(INT_W)
+    for i in range(N + 1):
+        s = INT_M[0, i] * d_0 + INT_M[N - 1, i] * d_t
+        for j in range(nn):
+            s += INT_M[j + 1, i] * (1 - fn[j])
+        coef[i] = s
+    return coef
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
+def _occult_int_batch(zs, lo, hi, coef, omk, flux):
+    """P21c interior interpolant for zs[lo:hi] (all 0 <= z < 1 - k = omk):
+    flux = 1 - D(z), clamped at 1; coef from _int_coeffs(). Unrolled Horner
+    (vectorised); the arrays are sliced here, not by the caller: views
+    passed into a jitted callee made P23's per-block kernel ~1.5x slower
+    (PERFORMANCE_LOG.md §32.2)."""
+    zr = zs[lo:hi]
+    fr = flux[lo:hi]
+    inv_h = 2 / omk
+    c0 = coef[0]; c1 = coef[1]; c2 = coef[2]; c3 = coef[3]; c4 = coef[4]
+    c5 = coef[5]; c6 = coef[6]; c7 = coef[7]; c8 = coef[8]; c9 = coef[9]
+    c10 = coef[10]; c11 = coef[11]; c12 = coef[12]; c13 = coef[13]; c14 = coef[14]
+    for j in range(hi - lo):
+        z = zr[j]
+        x = np.sqrt(max((omk - z) * (omk + z), 0.0)) * inv_h - 1
+        P = c14
+        P = P * x + c13
+        P = P * x + c12
+        P = P * x + c11
+        P = P * x + c10
+        P = P * x + c9
+        P = P * x + c8
+        P = P * x + c7
+        P = P * x + c6
+        P = P * x + c5
+        P = P * x + c4
+        P = P * x + c3
+        P = P * x + c2
+        P = P * x + c1
+        P = P * x + c0
+        f = 1 - P
+        fr[j] = f if f < 1 else 1.0
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
+def _occult_int_select(zs, lo, hi, coef, omk, one_k, flux):
+    """P21c in the per-sample path (replaces P23's _occult_series_select):
+    flux[i] = 1 off the star (z >= 1 + k or z < 0), else the interior
+    interpolant at min(z, 1 - k) (s clamped at 0; samples with z >= 1 - k
+    are overwritten by the limb pass), for lo <= i < hi, branch-free.
+    Returns the number of limb samples (1 - k <= z < 1 + k)."""
+    zr = zs[lo:hi]
+    fr = flux[lo:hi]
+    inv_h = 2 / omk
+    c0 = coef[0]; c1 = coef[1]; c2 = coef[2]; c3 = coef[3]; c4 = coef[4]
+    c5 = coef[5]; c6 = coef[6]; c7 = coef[7]; c8 = coef[8]; c9 = coef[9]
+    c10 = coef[10]; c11 = coef[11]; c12 = coef[12]; c13 = coef[13]; c14 = coef[14]
+    c = 0
+    for j in range(hi - lo):
+        z = zr[j]
+        x = np.sqrt(max((omk - z) * (omk + z), 0.0)) * inv_h - 1
+        P = c14
+        P = P * x + c13
+        P = P * x + c12
+        P = P * x + c11
+        P = P * x + c10
+        P = P * x + c9
+        P = P * x + c8
+        P = P * x + c7
+        P = P * x + c6
+        P = P * x + c5
+        P = P * x + c4
+        P = P * x + c3
+        P = P * x + c2
+        P = P * x + c1
+        P = P * x + c0
+        f = 1 - P
+        f = f if f < 1 else 1.0
+        off = (z >= one_k) | (z < 0)
+        fr[j] = 1.0 if off else f
+        c += 1 if (z >= omk) & (z < one_k) else 0
+    return c
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _use_interior(k, series_tol):
+    """True if occult_hybrid uses the P21c interior interpolant: with the
+    approximations on (series_tol > 0; occult_exact passes 0) and an
+    interior to interpolate (0 < k < 1)"""
+    return series_tol > 0 and k > 0 and k < 1
+
+
 @jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
 def _occult_exact_batch(zb, m, k, c1, c2, u2, omega, flux, dev):
     """Exact Mandel-Agol flux for the m on-star samples zb[:m] (P3b);
@@ -971,23 +1207,26 @@ def _occult_point(z, k, u1, u2):
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def occult_hybrid(zs, k, u1, u2):
     """Transit model for an array of normalized distances, for any k: the
-    exact Mandel & Agol model (see _occult_hybrid), with the P14 interior
-    series wherever it is within SERIES_TOL = 1e-8 (0.01 ppm) of it."""
+    exact Mandel & Agol model (see _occult_hybrid), with per-call
+    interpolants of the interior (P21c, z < 1 - k) and of the limb band
+    (P21b) that are within SERIES_TOL = 1e-8 (0.01 ppm) of it (measured
+    <= ~4e-9 for physical limb darkening)."""
     return _occult_hybrid(zs, k, u1, u2, SERIES_TOL)
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def occult_exact(zs, k, u1, u2):
-    """occult_hybrid() without the P14 interior series: the exact model for
-    every sample (~6.5 instead of ~0.9 ns per interior sample)."""
+    """occult_hybrid() without the interior / limb interpolants: the exact
+    model for every sample (~10.5 instead of ~0.8 ns per interior sample)."""
     return _occult_hybrid(zs, k, u1, u2, 0.0)
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _occult_hybrid(zs, k, u1, u2, series_tol):
     """Exact Mandel & Agol transit model (quadratic limb darkening) for an
-    array of normalized distances, for any k, with the P14 interior series
-    for z < z_c (series_tol = 0: exact everywhere). See
+    array of normalized distances, for any k, with the P21c interior
+    interpolant for z < 1 - k and the P21b limb interpolant (series_tol =
+    0: exact everywhere; before P21c the P14 series for z < z_c). See
     _occult_hybrid_samples() for the model; P12: _occult_hybrid_stretches()
     for inputs whose classes come in long stretches (e.g. the window samples
     of a time-sorted light curve, _long_stretches()), else (and for z == k
@@ -1005,20 +1244,22 @@ def _occult_hybrid(zs, k, u1, u2, series_tol):
     -------
     Transit model evaluated at `z`.
     """
-    z_c = _hybrid_zcut(k, u1, u2, series_tol)
-    # P21b limb interpolant: with the series only (occult_exact stays exact)
+    # P21c interior interpolant (z < 1 - k) and P21b limb interpolant: with
+    # series_tol > 0 only (occult_exact stays exact)
+    interior = _use_interior(k, series_tol)
     limb = series_tol > 0 and k > 0 and k <= LIMB_K_MAX and len(zs) * k >= LIMB_MIN_LANES * LIMB_FILL
-    if len(zs) >= STRETCH_MIN_N and _long_stretches(zs, k, z_c):
-        ok, flux = _occult_hybrid_stretches(zs, k, u1, u2, z_c, limb)
+    if len(zs) >= STRETCH_MIN_N and _long_stretches(zs, k, 1 - k if interior else 0.0):
+        ok, flux = _occult_hybrid_stretches(zs, k, u1, u2, interior, limb)
         if ok:
             return flux
-    return _occult_hybrid_samples(zs, k, u1, u2, z_c, limb)
+    return _occult_hybrid_samples(zs, k, u1, u2, interior, limb)
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _hybrid_zcut(k, u1, u2, series_tol):
     """P14 series cut z_c for (k, LD) at flux tolerance series_tol (0: no
-    series)"""
+    series). Not used by occult_hybrid since P21c (interior interpolant);
+    kept with the series as the rigorous reference of the unit tests."""
     omega = 1 / (1 - u1 / 3 - u2 / 6)
     den = k * k * abs((u1 + 2 * u2) * omega)  # |d flux / d <mu>|
     return _series_zcut(k, series_tol / den if den > 1e-300 else 1e300) if series_tol > 0 else 0.0
@@ -1083,18 +1324,18 @@ def _end_off(zs, j, n_z, one_k):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _end_series(zs, j, n_z, z_c, k):
-    """First index >= j of a sample that is not an interior-series sample
-    (0 <= z < z_c, z != k)"""
+def _end_interior(zs, j, n_z, z_c):
+    """First index >= j of a sample that is not an interior sample
+    (0 <= z < z_c; P21c: z_c = 1 - k, z == k needs no care there)"""
     while j + STRETCH_BLOCK <= n_z:
         blk = zs[j:j + STRETCH_BLOCK]
         c = 0
         for q in range(STRETCH_BLOCK):
-            c += 1 if (blk[q] >= 0) & (blk[q] < z_c) & (abs(blk[q] - k) >= Z_K_MIN) else 0
+            c += 1 if (blk[q] >= 0) & (blk[q] < z_c) else 0
         if c < STRETCH_BLOCK:
             break
         j += STRETCH_BLOCK
-    while j < n_z and zs[j] < z_c and zs[j] >= 0 and abs(zs[j] - k) >= Z_K_MIN:
+    while j < n_z and zs[j] < z_c and zs[j] >= 0:
         j += 1
     return j
 
@@ -1118,26 +1359,26 @@ def _end_exact(zs, j, n_z, z_c, one_k, k, full, km1):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _occult_hybrid_stretches(zs, k, u1, u2, z_c, limb):
+def _occult_hybrid_stretches(zs, k, u1, u2, interior, limb):
     """_occult_hybrid_samples() by stretches (P12): (ok, flux). Off-star
-    stretches are filled with 1 and interior-series stretches (z < z_c)
-    evaluated in place (no gather, no index scatter); exact-model stretches
-    are copied into one buffer for the vectorised batch, as before; with
-    limb (P21b) limb-band stretches are evaluated in place by the
-    interpolant if they hold >= LIMB_MIN_LANES samples together (else they
-    join the batch). ok =
-    False (the caller then uses the per-sample version) at a sample with
-    z == k (one-ulp nudge) or a fully occulted one (k >= 1). Same values as
-    the per-sample version up to rounding of the series (in place vs
-    gathered: <= 2.2e-16)."""
-    k2 = k**2
+    stretches are filled with 1 and, with interior (P21c), interior
+    stretches (z < 1 - k) evaluated in place by the interpolant (no
+    gather, no index scatter); exact-model stretches are copied into one
+    buffer for the vectorised batch, as before; with limb (P21b) limb-band
+    stretches are evaluated in place by the interpolant if they hold
+    >= LIMB_MIN_LANES samples together (else they join the batch). ok =
+    False (the caller then uses the per-sample version) at an exact-model
+    sample with z == k (one-ulp nudge) or a fully occulted one (k >= 1).
+    Same values as the per-sample version up to rounding (in place vs
+    per block)."""
     n_z = len(zs)
     flux = np.empty(n_z)
     omega = 1 / (1 - u1 / 3 - u2 / 6)
     c1 = 1 - u1 - 2 * u2
     c2 = u1 + 2 * u2
-    kk = k2 * omega
     one_k = 1 + k
+    omk = 1 - k
+    z_c = omk if interior else 0.0
     full = k >= 1
     km1 = k - 1
     idx = np.empty(n_z, dtype=np.int64)
@@ -1148,10 +1389,7 @@ def _occult_hybrid_stretches(zs, k, u1, u2, z_c, limb):
     n_r = 0
     n_l = 0
     m = 0
-    have_a = False
-    a = np.empty(0)
-    A0 = 0.0
-    A1 = -kk * u2
+    ic = _int_coeffs(k, u1, u2) if interior else np.zeros(INT_W)
     i = 0
     while i < n_z:
         z = zs[i]
@@ -1161,15 +1399,11 @@ def _occult_hybrid_stretches(zs, k, u1, u2, z_c, limb):
             fr = flux[i:j]
             for q in range(j - i):
                 fr[q] = 1.0
+        elif z < z_c:                              # interior (P21c), in place
+            j = _end_interior(zs, j, n_z, z_c)
+            _occult_int_batch(zs, i, j, ic, omk, flux)
         elif abs(z - k) < Z_K_MIN or (full and z <= km1):
             return False, flux
-        elif z < z_c:                              # interior series, in place
-            j = _end_series(zs, j, n_z, z_c, k)
-            if not have_a:
-                a = _series_coeffs(k, kk * c2)
-                A0 = 1 - kk * ((1 - u1 - u2) - u2 * (1 - k2 / 2))
-                have_a = True
-            _occult_series_batch(zs[i:j], j - i, a, A0, A1, flux[i:j])
         elif z >= one_mk:                          # limb band (P21b): range
             j = _end_exact(zs, j, n_z, one_mk, one_k, k, full, km1)
             rl[2 * n_r] = i
@@ -1226,16 +1460,17 @@ def _occult_hybrid_stretches(zs, k, u1, u2, z_c, limb):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _occult_hybrid_samples(zs, k, u1, u2, z_c, limb):
+def _occult_hybrid_samples(zs, k, u1, u2, interior, limb):
     """_occult_hybrid() for inputs without long stretches (before P12 this
     was _occult_hybrid; used for windows below STRETCH_MIN_N samples, e.g.
-    Kepler, and unsorted time); z_c from _hybrid_zcut(); limb: use the
+    Kepler, and unsorted time); interior: use the P21c interior
+    interpolant for 0 <= z < 1 - k (from _use_interior()); limb: use the
     P21b limb interpolant if >= LIMB_MIN_LANES samples lie on
     1 - k <= z < 1 + k (only for 0 < k <= LIMB_K_MAX). Since P23 the
-    series is evaluated in place for every sample of a block with any
-    on-star sample (select instead of classify / gather / scatter), and
-    only the exact samples are collected, from the blocks that hold any;
-    same values as before (the series arithmetic is unchanged). The model:
+    interior approximation is evaluated in place for every sample of a
+    block with any on-star sample (select instead of classify / gather /
+    scatter), and only the exact samples are collected, from the blocks
+    that hold any. The model:
 
     Until P3 this switched to a "linear interpolation" correction of the
     small-body approximation for k <= 0.05 (z <= 0.65 ... 0.98); that zone
@@ -1254,38 +1489,35 @@ def _occult_hybrid_samples(zs, k, u1, u2, z_c, limb):
     at the contact points: the z -> k + 1e-6 and q -> 1 - 1e-8 nudges and
     the closed-form special case for |k + z - 1| < 1e-8 (up to ~2.6e-8 off
     in the limb-darkening term) are gone.
-    Since P14, interior samples with z < z_c (body fully on the star, away
-    from the limb) use the series of _occult_series_batch() (~0.9 ns instead
-    of ~6.5 ns per sample); z_c is chosen per call such that the series is
-    within series_tol (occult_hybrid: SERIES_TOL = 1e-8, 0.01 ppm) of the
-    exact flux, by a rigorous tail bound (see the comment block above
-    SERIES_M); series_tol = 0 (occult_exact) disables it. All other on-star
-    samples take the exact path above.
+    From P14 to P21c, interior samples with z < z_c used the P14 series
+    (rigorous bound, z_c per call) and z_c <= z < 1 - k the exact kernel;
+    since P21c the whole interior z < 1 - k uses the interpolant of
+    _int_coeffs() / _occult_int_select() (measured <= ~4e-9 in flux, see
+    the comment block above INT_N). occult_exact disables it. All other
+    on-star samples take the exact path above (or the P21b interpolant).
     """
     # k is used as given: the old snap k -> 0.5 for |k - 0.5| < 1e-4 was up
     # to 150 ppm off (bug #30); the closed-form operands (P15) are exact at
     # k = 0.5 and z -> k (non-converged lanes take the scalar fallback)
-    k2 = k**2
     n_z = len(zs)
     flux = np.empty(n_z)
     omega = 1 / (1 - u1 / 3 - u2 / 6)
     c1 = 1 - u1 - 2 * u2
     c2 = u1 + 2 * u2
-    kk = k2 * omega
     one_k = 1 + k
+    omk = 1 - k
+    z_c = omk if interior else 0.0         # exact model from z_c on
 
     # Pass 1 (P23), per block of BLOCK_N samples: a vectorised count of the
     # on-star samples; blocks without any are filled with 1, the others get
-    # the interior series (or 1 off the star) for every sample, branch-free,
-    # in place, with a count of the samples that need the exact model
-    # (z_c <= z < 1 + k; z < 0 counts as off the star, as before). No
-    # per-sample classification, gather or scatter
-    # for the series; the exact samples are collected in pass 2 from the
-    # blocks that hold any.
-    have_series = z_c > 0
-    a = _series_coeffs(k, kk * c2) if have_series else np.zeros(SERIES_M + 1)
-    A0 = 1 - kk * ((1 - u1 - u2) - u2 * (1 - k2 / 2))
-    A1 = -kk * u2
+    # the interior interpolant (or 1 off the star) for every sample,
+    # branch-free, in place, with a count of the samples that need the
+    # exact model (z_c <= z < 1 + k; z < 0 counts as off the star, as
+    # before). No per-sample classification, gather or scatter for the
+    # interior; the exact samples are collected in pass 2 from the blocks
+    # that hold any. The interpolant is built up front (building it lazily
+    # at the first on-star block made the whole pass ~0.25 us slower).
+    ic = _int_coeffs(k, u1, u2) if interior else np.zeros(INT_W)
     n_b = (n_z + BLOCK_N - 1) // BLOCK_N
     cnt = np.empty(n_b, dtype=np.int64)
     tot = 0
@@ -1301,8 +1533,8 @@ def _occult_hybrid_samples(zs, k, u1, u2, z_c, limb):
             for q in range(hi - lo):
                 fr[q] = 1.0
             c = 0
-        elif have_series:
-            c = _occult_series_select(zs, lo, hi, a, A0, A1, z_c, one_k, flux)
+        elif interior:
+            c = _occult_int_select(zs, lo, hi, ic, omk, one_k, flux)
         else:
             c = on
             for q in range(hi - lo):
