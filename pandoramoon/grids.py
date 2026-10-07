@@ -112,6 +112,85 @@ def _x_bary_window_t(
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def x_bary_runs_sorted(
+    time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance, ecc_bary,
+    w_bary, reach
+):
+    """The search of x_bary_window_sorted_t() without filling the window
+    arrays (P18): (ok, los, his, c_t, c_d, tdur, t0_shift_planet). Per
+    epoch k the window samples are the run time[los[k]:his[k]] (possibly
+    empty; runs are ascending and disjoint), and x_bary of a sample t in it
+    is (2 * (t - c_t[k])) / tdur - t0_shift_planet - c_d[k]. ok is False
+    if the search does not apply (see x_bary_window_sorted_t(); the caller
+    must then use the scan). time MUST be ascending."""
+    tdur = per_bary / pi * arcsin(1 / a_bary)
+    if ecc_bary > 0:
+        tdur /= 1 / sqrt(1 - ecc_bary ** 2) * (1 + ecc_bary * cos((w_bary - 90) / 180 * pi))
+    t0_shift_planet = t0_bary_offset / (tdur / 2)
+    n = len(time)
+    half = reach * tdur / 2  # [days]
+    empty_i = np.empty(0, dtype=np.int64)
+    empty_f = np.empty(0)
+    if n == 0:
+        return True, empty_i, empty_i, empty_f, empty_f, tdur, t0_shift_planet
+    # Margin covers round-off of t_mid and of x (|x| errors ~1e-12)
+    pad = 1e-6 * tdur + 1e-9 * (abs(time[0]) + abs(time[n - 1]))
+    if not (half + abs(t0_bary_offset) + pad < 0.45 * per_bary):
+        return False, empty_i, empty_i, empty_f, empty_f, tdur, t0_shift_planet
+    e_first = int(np.floor((time[0] - t0_bary) / per_bary + 0.5))
+    e_last = int(np.floor((time[n - 1] - t0_bary) / per_bary + 0.5))
+    n_ep = e_last - e_first + 1
+    if n_ep > n:  # more epochs than samples: scan instead
+        return False, empty_i, empty_i, empty_f, empty_f, tdur, t0_shift_planet
+    # Per epoch: exact run [lo, hi) of window samples (the windows are small)
+    los = np.empty(n_ep, dtype=np.int64)
+    his = np.empty(n_ep, dtype=np.int64)
+    c_ts = np.empty(n_ep)
+    c_ds = np.empty(n_ep)
+    for k in range(n_ep):
+        e = e_first + k
+        t_mid = t0_bary + per_bary * e + t0_bary_offset
+        lo = np.searchsorted(time, t_mid - half - pad, side="left")
+        hi = np.searchsorted(time, t_mid + half + pad, side="right")
+        c_t = t0_bary + epoch_distance * e
+        c_d = ((per_bary - epoch_distance) * e) / (tdur / 2)
+        while lo < hi and abs((2 * (time[lo] - c_t)) / tdur - t0_shift_planet - c_d) >= reach:
+            lo += 1
+        while hi > lo and abs((2 * (time[hi - 1] - c_t)) / tdur - t0_shift_planet - c_d) >= reach:
+            hi -= 1
+        los[k] = lo
+        his[k] = hi
+        c_ts[k] = c_t
+        c_ds[k] = c_d
+    return True, los, his, c_ts, c_ds, tdur, t0_shift_planet
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def runs_x_t(time, los, his, c_t, c_d, tdur, t0_shift_planet):
+    """Window arrays (idx, x_bary, time[idx]) of the runs of
+    x_bary_runs_sorted(), filled branch-free per run"""
+    total = 0
+    for k in range(len(los)):
+        total += his[k] - los[k]
+    idx = np.empty(total, dtype=np.int64)
+    x_win = np.empty(total)
+    t_win = np.empty(total)
+    m = 0
+    for k in range(len(los)):
+        ct = c_t[k]
+        cd = c_d[k]
+        lo = los[k]
+        cnt = his[k] - lo
+        for j in range(cnt):
+            t = time[lo + j]
+            idx[m + j] = lo + j
+            t_win[m + j] = t
+            x_win[m + j] = (2 * (t - ct)) / tdur - t0_shift_planet - cd
+        m += cnt
+    return idx, x_win, t_win
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def x_bary_window_sorted_t(
     time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance, ecc_bary,
     w_bary, reach
@@ -139,65 +218,18 @@ def x_bary_window_sorted_t(
     Falls back to x_bary_window() if the window is not well inside one
     epoch (huge moon orbits, very short periods) or for non-finite
     constants. time MUST be ascending (not checked here; Likelihood checks
-    it once)."""
-    tdur = per_bary / pi * arcsin(1 / a_bary)
-    if ecc_bary > 0:
-        tdur /= 1 / sqrt(1 - ecc_bary ** 2) * (1 + ecc_bary * cos((w_bary - 90) / 180 * pi))
-    t0_shift_planet = t0_bary_offset / (tdur / 2)
-    n = len(time)
-    half = reach * tdur / 2  # [days]
-    if n == 0:
-        return np.empty(0, dtype=np.int64), np.empty(0), np.empty(0)
-    # Margin covers round-off of t_mid and of x (|x| errors ~1e-12)
-    pad = 1e-6 * tdur + 1e-9 * (abs(time[0]) + abs(time[n - 1]))
-    if not (half + abs(t0_bary_offset) + pad < 0.45 * per_bary):
+    it once). P18: the search is x_bary_runs_sorted(), the fill
+    runs_x_t()."""
+    ok, los, his, c_t, c_d, tdur, t0_shift_planet = x_bary_runs_sorted(
+        time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
+        ecc_bary, w_bary, reach
+    )
+    if not ok:
         return _x_bary_window_t(
             time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
             ecc_bary, w_bary, reach
         )
-    e_first = int(np.floor((time[0] - t0_bary) / per_bary + 0.5))
-    e_last = int(np.floor((time[n - 1] - t0_bary) / per_bary + 0.5))
-    n_ep = e_last - e_first + 1
-    if n_ep > n:  # more epochs than samples: scan instead
-        return _x_bary_window_t(
-            time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
-            ecc_bary, w_bary, reach
-        )
-    # Per epoch: exact run [lo, hi) of window samples (the windows are small)
-    los = np.empty(n_ep, dtype=np.int64)
-    his = np.empty(n_ep, dtype=np.int64)
-    total = 0
-    for k in range(n_ep):
-        e = e_first + k
-        t_mid = t0_bary + per_bary * e + t0_bary_offset
-        lo = np.searchsorted(time, t_mid - half - pad, side="left")
-        hi = np.searchsorted(time, t_mid + half + pad, side="right")
-        c_t = t0_bary + epoch_distance * e
-        c_d = ((per_bary - epoch_distance) * e) / (tdur / 2)
-        while lo < hi and abs((2 * (time[lo] - c_t)) / tdur - t0_shift_planet - c_d) >= reach:
-            lo += 1
-        while hi > lo and abs((2 * (time[hi - 1] - c_t)) / tdur - t0_shift_planet - c_d) >= reach:
-            hi -= 1
-        los[k] = lo
-        his[k] = hi
-        total += hi - lo
-    idx = np.empty(total, dtype=np.int64)
-    x_win = np.empty(total)
-    t_win = np.empty(total)
-    m = 0
-    for k in range(n_ep):
-        e = e_first + k
-        c_t = t0_bary + epoch_distance * e
-        c_d = ((per_bary - epoch_distance) * e) / (tdur / 2)
-        lo = los[k]
-        cnt = his[k] - lo
-        for j in range(cnt):
-            t = time[lo + j]
-            idx[m + j] = lo + j
-            t_win[m + j] = t
-            x_win[m + j] = (2 * (t - c_t)) / tdur - t0_shift_planet - c_d
-        m += cnt
-    return idx, x_win, t_win
+    return runs_x_t(time, los, his, c_t, c_d, tdur, t0_shift_planet)
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)

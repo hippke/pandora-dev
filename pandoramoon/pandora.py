@@ -8,11 +8,12 @@ from os import path
 
 # Pandora
 from pandoramoon.eclipse import eclipse, eclipse_possible
-from pandoramoon.ellipse import ellipse, ellipse_ecc, ellipse_z, ellipse_ecc_z
+from pandoramoon.ellipse import ellipse, ellipse_ecc, ellipse_z, ellipse_ecc_z, ellipse_z_runs
 from pandoramoon.occult import occult, occult_small, occult_hybrid, create_occult_cache, read_occult_cache
 from pandoramoon.helpers import resample
 from pandoramoon.grids import (
-    timegrid, x_bary_grid, x_bary_window, x_bary_window_sorted, x_bary_window_sorted_t
+    timegrid, x_bary_grid, x_bary_window, x_bary_window_sorted, x_bary_window_sorted_t,
+    x_bary_runs_sorted, runs_x_t
 )
 
 
@@ -609,16 +610,18 @@ def pandora_loglike(
     full-length arrays: chi^2 = chi2_flat + sum over window cadences of
     [((f - data) inv_err)^2 - flat_terms], where flat_terms =
     ((1 - data) inv_err)^2 and chi2_flat = sum(flat_terms) (model = 1
-    everywhere) are precomputed per dataset. Use it via Likelihood."""
-    idx, flux_planet_w, flux_moon_w = _window_model(
+    everywhere) are precomputed per dataset. Use it via Likelihood.
+    P18: the window is kept as per-epoch sample runs (no idx/x/time window
+    arrays, see _window_model_runs) and the chi^2 is summed per run."""
+    los, his, flux_planet_w, flux_moon_w = _window_model_runs(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
         occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
         cache, eclipse_pixelmap, time_sorted
     )
-    chi2 = chi2_flat + _window_chi2(
-        len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor,
+    chi2 = chi2_flat + _window_chi2_runs(
+        len(time), los, his, flux_planet_w, flux_moon_w, supersampling_factor,
         data, inv_err, flat_terms
     )
     return -0.5 * chi2
@@ -911,6 +914,101 @@ def _window_model(
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _idx_runs(idx):
+    """Maximal contiguous runs of ascending indices: (los, his) with
+    idx = concatenation of arange(los[k], his[k])"""
+    m = len(idx)
+    los = np.empty(m, dtype=np.int64)
+    his = np.empty(m, dtype=np.int64)
+    r = 0
+    j = 0
+    while j < m:
+        lo = idx[j]
+        j += 1
+        while j < m and idx[j] == idx[j - 1] + 1:
+            j += 1
+        los[r] = lo
+        his[r] = idx[j - 1] + 1
+        r += 1
+    return los[:r], his[:r]
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _window_model_runs(
+    u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+    t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
+    i_moon, ecc_moon, w_moon, M_moon, epoch_distance, occult_small_threshold,
+    hill_sphere_threshold, numerical_grid, time, cache, eclipse_pixelmap,
+    time_sorted
+):
+    """_window_model() with the window as sample runs (P18): (los, his,
+    planet flux, moon flux), where the window samples are
+    time[los[k]:his[k]] for all k in this order (ascending, disjoint) and
+    the fluxes are given there. For sorted time and a circular physical
+    moon, the runs come from the binary search and the fused orbit loop
+    computes x_bary inline (ellipse_z_runs): no idx, x_bary or time window
+    arrays. Otherwise the window arrays are built as in _window_model()
+    and converted to runs. Same fluxes as _window_model()."""
+    R_star = float(R_star)
+    per_bary = float(per_bary)
+    a_bary = float(a_bary)
+    r_planet = float(r_planet)
+    b_bary = float(b_bary)
+    t0_bary = float(t0_bary)
+    t0_bary_offset = float(t0_bary_offset)
+    M_planet = float(M_planet)
+    r_moon = float(r_moon)
+    per_moon = float(per_moon)
+    tau_moon = float(tau_moon)
+    Omega_moon = float(Omega_moon)
+    i_moon = float(i_moon)
+    M_moon = float(M_moon)
+
+    a_moon, unphysical = _moon_setup(
+        R_star, per_bary, a_bary, M_planet, M_moon, per_moon, ecc_moon,
+        r_planet, r_moon, hill_sphere_threshold
+    )
+    reach = _cull_reach(a_moon, ecc_moon, r_planet, r_moon, unphysical, cache)
+    if time_sorted:
+        ok, los, his, c_t, c_d, tdur, t0_shift = x_bary_runs_sorted(
+            time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
+            ecc_bary, w_bary, reach
+        )
+    else:
+        ok = False
+        los = np.empty(0, dtype=np.int64)
+        his = los
+        c_t = np.empty(0)
+        c_d = c_t
+        tdur = 0.0
+        t0_shift = 0.0
+    if ok and not unphysical and ecc_moon == 0:
+        xm, ym, xp, yp, zm, zp = ellipse_z_runs(
+            a_moon, per_moon, tau_moon, Omega_moon, i_moon, time, los, his,
+            c_t, c_d, tdur, t0_shift, M_moon / M_planet, b_bary
+        )
+    else:
+        if ok:
+            _, x_bary, time_w = runs_x_t(time, los, his, c_t, c_d, tdur, t0_shift)
+        else:
+            idx, x_bary = x_bary_window(
+                time, a_bary, per_bary, t0_bary, t0_bary_offset, epoch_distance,
+                ecc_bary, w_bary, reach
+            )
+            time_w = time[idx]
+            los, his = _idx_runs(idx)
+        xm, ym, xp, yp, zm, zp = _orbit_z(
+            time_w, x_bary, unphysical, a_moon, per_moon, tau_moon,
+            Omega_moon, w_moon, i_moon, ecc_moon, M_moon / M_planet, b_bary
+        )
+    flux_planet_w, flux_moon_w = _window_fluxes_z(
+        xp, yp, xm, ym, zp, zm, unphysical, r_planet, r_moon, u1, u2,
+        occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+    )
+    return los, his, flux_planet_w, flux_moon_w
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _n_out(n, supersampling_factor):
     """Number of output cadences for n samples (as resample())"""
     if supersampling_factor <= 1:
@@ -967,59 +1065,88 @@ def _window_cadences(n, idx, flux_planet_w, flux_moon_w, supersampling_factor):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _window_chi2(n, idx, flux_planet_w, flux_moon_w, supersampling_factor,
-                 data, inv_err, flat_terms):
+def _window_chi2_runs(n, los, his, flux_planet_w, flux_moon_w,
+                      supersampling_factor, data, inv_err, flat_terms):
     """chi^2 part of the window cadences, sum of ((f - data) inv_err)^2 -
     flat_terms over them (see pandora_loglike), for the total flux f of the
-    output cadences touched by the ascending window indices idx: the same
-    cadences and block means as _window_cadences(), to ~2e-16 (the
-    per-sample total deficit (1 - f_planet) + (1 - f_moon) is summed per
-    block, not planet and moon separately). P13: no cadence arrays (fused
-    with the chi^2), and fixed-length sums over contiguous runs. Since P11
-    the window is one contiguous sample run per epoch, so after a run's
-    first (partial) block the following blocks are full: one comparison,
-    idx[j + factor - 1] == end + factor - 1 (end: the end of the previous
-    block; idx is strictly ascending), proves the next block full, which
-    then needs no integer division and no per-sample end test. The
-    general path takes the first and last block of a run and any other
-    index pattern (unsorted-time scan, gaps)."""
-    m = len(idx)
+    output cadences touched by the window samples, given as ascending,
+    disjoint runs [los[k], his[k]) (fluxes in run order): the same cadences
+    and block means as _window_cadences() on the concatenated indices, to
+    ~2e-16 (the per-sample total deficit (1 - f_planet) + (1 - f_moon) is
+    summed per block, not planet and moon separately).
+
+    P13: no cadence arrays (fused with the chi^2), and full blocks of a run
+    as fixed-length sums without integer division or per-sample end tests.
+    P18: the run boundaries are given (no idx array, no contiguity tests).
+    Per run: a partial first block (or the continuation of a block left
+    open by the previous run, if the runs touch), full blocks, a partial
+    last block that stays open for the next run. Without supersampling the
+    loop runs over data[lo:hi] directly."""
     chi2 = 0.0
+    m = 0
+    nr = len(los)
     if supersampling_factor <= 1:
-        for j in range(m):
-            i = idx[j]
-            r = (flux_moon_w[j] + flux_planet_w[j] - 1 - data[i]) * inv_err[i]
-            chi2 += r * r - flat_terms[i]
+        for k in range(nr):
+            lo = los[k]
+            cnt = his[k] - lo
+            # slices: no wraparound selects for data[lo + j] (cf. ellipse_z_runs)
+            dr = data[lo:lo + cnt]
+            wr = inv_err[lo:lo + cnt]
+            fr = flat_terms[lo:lo + cnt]
+            fpr = flux_planet_w[m:m + cnt]
+            fmr = flux_moon_w[m:m + cnt]
+            for j in range(cnt):
+                r = (fmr[j] + fpr[j] - 1 - dr[j]) * wr[j]
+                chi2 += r * r - fr[j]
+            m += cnt
         return chi2
 
     factor = supersampling_factor
-    j = 0
-    while j < m:
-        # General block (first block of a run, partial blocks, gaps)
-        out = idx[j] // factor
-        start = out * factor
-        end = start + factor
-        if end > n:
-            end = n
-        s = 0.0
-        while j < m and idx[j] < end:
-            s += (1.0 - flux_planet_w[j]) + (1.0 - flux_moon_w[j])
-            j += 1
-        r = (1.0 - s / (end - start) - data[out]) * inv_err[out]
-        chi2 += r * r - flat_terms[out]
-        # Full blocks continuing the run. Here idx[j] >= end (all samples
-        # below end are consumed), so idx[j + factor - 1] == end + factor - 1
-        # alone proves idx[j:j + factor] == end, ..., end + factor - 1 (and
-        # end + factor <= n, since idx < n)
-        while j + factor <= m and idx[j + factor - 1] == end + factor - 1:
+    out = -1     # open (not yet added) block: output cadence, end, deficit sum
+    end = 0
+    s = 0.0
+    for k in range(nr):
+        p = los[k]
+        hi = his[k]
+        while p < hi:
+            if out >= 0:
+                if p < end:  # the run continues the open block
+                    q = min(hi, end)
+                    for j in range(m, m + q - p):
+                        s += (1.0 - flux_planet_w[j]) + (1.0 - flux_moon_w[j])
+                    m += q - p
+                    p = q
+                    continue
+                r = (1.0 - s / (end - out * factor) - data[out]) * inv_err[out]
+                chi2 += r * r - flat_terms[out]
+                out = -1
+            o = p // factor
+            start = o * factor
+            if p == start:
+                # full blocks inside the run (start + factor <= hi <= n)
+                nb = (hi - p) // factor
+                for b in range(nb):
+                    s = 0.0
+                    for j in range(m, m + factor):
+                        s += (1.0 - flux_planet_w[j]) + (1.0 - flux_moon_w[j])
+                    r = (1.0 - s / factor - data[o + b]) * inv_err[o + b]
+                    chi2 += r * r - flat_terms[o + b]
+                    m += factor
+                p += nb * factor
+                if nb > 0:
+                    continue
+            # partial block: open it
+            out = o
+            end = min(start + factor, n)
             s = 0.0
-            for i in range(j, j + factor):
-                s += (1.0 - flux_planet_w[i]) + (1.0 - flux_moon_w[i])
-            out += 1
-            r = (1.0 - s / factor - data[out]) * inv_err[out]
-            chi2 += r * r - flat_terms[out]
-            j += factor
-            end += factor
+            q = min(hi, end)
+            for j in range(m, m + q - p):
+                s += (1.0 - flux_planet_w[j]) + (1.0 - flux_moon_w[j])
+            m += q - p
+            p = q
+    if out >= 0:
+        r = (1.0 - s / (end - out * factor) - data[out]) * inv_err[out]
+        chi2 += r * r - flat_terms[out]
     return chi2
 
 

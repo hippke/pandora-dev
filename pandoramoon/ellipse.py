@@ -111,6 +111,69 @@ def ellipse_z(a, per, tau, Omega, i, time, x_bary, mass_ratio, b_bary):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def ellipse_z_runs(
+    a, per, tau, Omega, i, time, los, his, c_t, c_d, tdur, t0_shift_planet,
+    mass_ratio, b_bary
+):
+    """ellipse_z() on the window runs of grids.x_bary_runs_sorted() (P18):
+    the samples are time[los[k]:his[k]] for all k, in this order, and
+    x_bary is computed inline with the expression of grids.runs_x_t(), so
+    no window arrays (idx, x_bary, time) are filled and read back. Same
+    output as ellipse_z() on the materialised window."""
+    O = Omega / 180 * pi
+    inc = i / 180 * pi
+    cos_O = cos(O)
+    sin_O = sin(O)
+    cos_i = cos(inc)
+    a_planet = (a * mass_ratio) / (1 + mass_ratio)
+    a_moon = a - a_planet
+    n = 0
+    for k in range(len(los)):
+        n += his[k] - los[k]
+    xm = np.empty(n)
+    ym = np.empty(n)
+    xp = np.empty(n)
+    yp = np.empty(n)
+    zm = np.empty(n)
+    zp = np.empty(n)
+    t_ref = tau * per
+    m = 0
+    for k in range(len(los)):
+        ct = c_t[k]
+        cd = c_d[k]
+        lo = los[k]
+        cnt = his[k] - lo
+        # slices: indices from range() are known non-negative, so numba
+        # emits no wraparound selects and the loop vectorises (time[lo + j]
+        # does not)
+        tr = time[lo:lo + cnt]
+        xmr = xm[m:m + cnt]
+        ymr = ym[m:m + cnt]
+        xpr = xp[m:m + cnt]
+        ypr = yp[m:m + cnt]
+        zmr = zm[m:m + cnt]
+        zpr = zp[m:m + cnt]
+        for j in range(cnt):
+            t = tr[j]
+            x_bary = (2 * (t - ct)) / tdur - t0_shift_planet - cd
+            sin_Q, cos_Q = sincos_turns((t - t_ref) / per)
+            vector_x = cos_O * cos_Q - sin_O * sin_Q * cos_i
+            vector_y = sin_O * cos_Q + cos_O * sin_Q * cos_i
+            xmj = vector_x * a_moon + x_bary
+            ymj = vector_y * a_moon + b_bary
+            xpj = -vector_x * a_planet + x_bary
+            ypj = -vector_y * a_planet + b_bary
+            xmr[j] = xmj
+            ymr[j] = ymj
+            xpr[j] = xpj
+            ypr[j] = ypj
+            zmr[j] = sqrt(xmj ** 2 + ymj ** 2)
+            zpr[j] = sqrt(xpj ** 2 + ypj ** 2)
+        m += cnt
+    return xm, ym, xp, yp, zm, zp
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary):
     """ellipse_ecc() fused into one loop that also returns the distances from
     the stellar centre: (xm, ym, xp, yp, zm, zp). Same formulas per sample,
