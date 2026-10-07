@@ -1,6 +1,20 @@
 import numpy as np
+from numba import float64
 
 from pandoramoon.pandora import pandora_loglike
+
+
+def _compiled_loglike(tail):
+    """P8: the compiled pandora_loglike for 20 float64 model parameters and
+    this dataset's fixed arguments (tail), i.e. its entry point. Calling it
+    skips numba's per-call type dispatch over all 33 arguments (~0.4 us per
+    call); the parameters are converted to float like float(x). Falls back
+    to the dispatcher if the entry point cannot be obtained."""
+    try:
+        sig = (float64,) * 20 + tuple(pandora_loglike.typeof_pyval(x) for x in tail)
+        return pandora_loglike.compile(sig)
+    except Exception:  # pragma: no cover - e.g. a numba without compile()
+        return pandora_loglike
 
 
 class Likelihood(object):
@@ -19,6 +33,9 @@ class Likelihood(object):
 
     For plots and videos use pandora_flux() (fluxes) or pandora()
     (fluxes and coordinates).
+
+    The 20 model parameters are taken as float64 (any value that float()
+    accepts); the call goes straight to the compiled model (P8).
     """
 
     def __init__(
@@ -68,20 +85,24 @@ class Likelihood(object):
         self.numerical_grid = int(numerical_grid)
         self.cache = cache
         self.eclipse_pixelmap = eclipse_method == "pixelmap"
+        # P8: fixed trailing arguments and the compiled entry point
+        self._tail = (
+            self.epoch_distance, self.supersampling_factor, self.occult_small_threshold,
+            self.hill_sphere_threshold, self.numerical_grid, self.time, self.data,
+            self.inv_err, self.flat_terms, self.chi2_flat, self.cache,
+            self.eclipse_pixelmap, self.time_sorted,
+        )
+        self._loglike = _compiled_loglike(self._tail)
 
     def __call__(
         self, u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
         i_moon, ecc_moon, w_moon, M_moon
     ):
-        return pandora_loglike(
+        return self._loglike(
             u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
             t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
-            Omega_moon, i_moon, ecc_moon, w_moon, M_moon, self.epoch_distance,
-            self.supersampling_factor, self.occult_small_threshold,
-            self.hill_sphere_threshold, self.numerical_grid, self.time, self.data,
-            self.inv_err, self.flat_terms, self.chi2_flat, self.cache,
-            self.eclipse_pixelmap, self.time_sorted,
+            Omega_moon, i_moon, ecc_moon, w_moon, M_moon, *self._tail
         )
 
     loglike = __call__
