@@ -788,6 +788,76 @@ def _ecc_anomaly(time, lo, cnt, t_ref, inv_per, e, ce, se, m):
             sr[j] = s if f >= 0 else -s
 
 
+# P7d: on the runs (ascending time) the eccentric anomaly comes from block
+# anchors, as P24d does for the circular phase: E_a solved at the block's
+# middle sample (_orbit_cs), per sample E = E_a + d with Kepler's equation
+# in the difference form g(d) = d - e (sin E_a (cos d - 1) + cos E_a sin d)
+# - omega (t - t_a) = 0 (no cancellation of E against M), started at
+# d = omega (t - t_a) / (1 - e cos E_a) and two Halley steps, sin / cos of d
+# from trig.sincos_small (|d| <= SMALL_PHI_MAX) and the angle addition.
+# Blocks are sized for omega / (1 - e) (dE/dM <= 1 / (1 - e): |d| <= the
+# polynomial's range everywhere), or, if those would be shorter than
+# ANCHOR_BMIN, for omega / sqrt(1 - e). Each block is checked: a pre-check
+# at the anchor (half span omega / (1 - e cos E_a) <= SMALL_PHI_MAX) and,
+# per sample, every iterate |d| <= SMALL_PHI_MAX and |g| <= ECC_BLOCK_TOL
+# (1 - e) before the last step (the cubic step then leaves ~1e-15); a block
+# that fails is redone per sample (_ecc_anomaly), as are runs with blocks
+# below ANCHOR_BMIN. ~3.5-6.5 instead of ~10.5 ns per sample at 1-min
+# cadence (scratch_p7d/proto*.py), as accurate as the per-sample solver.
+ECC_BLOCK_TOL = 1e-5
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
+def _ecc_anomaly_blocks(time, lo, cnt, t_ref, inv_per, e, ce, se, m):
+    """_ecc_anomaly() for an ascending run time[lo:lo + cnt] from block
+    anchors (P7d, see above); same outputs"""
+    tr = time[lo:lo + cnt]
+    omega = TWO_PI * abs(inv_per)
+    bl = _anchor_block(tr, cnt, omega / (1 - e))
+    if bl == cnt and cnt >= 2 * ANCHOR_BMIN:
+        bl = _anchor_block(tr, cnt, omega / sqrt(1 - e))
+    tol = ECC_BLOCK_TOL * (1 - e)
+    for b0 in range(0, cnt, bl):
+        b1 = min(b0 + bl, cnt)
+        nb = b1 - b0
+        ta = tr[b0 + (nb >> 1)]
+        span = max(ta - tr[b0], tr[b1 - 1] - ta) * omega
+        ok = nb >= ANCHOR_BMIN and span <= SMALL_PHI_MAX
+        if ok:
+            c_a, s_a = _orbit_cs((ta - t_ref) * inv_per, e)
+            ec = e * c_a
+            es = e * s_a
+            inv0 = 1 / (1 - ec)
+            ok = span * inv0 <= SMALL_PHI_MAX
+        if ok:
+            trb = tr[b0:b1]
+            cr = ce[m + b0:m + b1]
+            sr = se[m + b0:m + b1]
+            bad = 0
+            for j in range(nb):
+                dM = (trb[j] - ta) * omega
+                d = dM * inv0
+                big = abs(d)
+                sd, cd = sincos_small(d)
+                g = d - (es * (cd - 1) + ec * sd) - dM
+                gp = 1 - (ec * cd - es * sd)
+                gpp = es * cd + ec * sd
+                d = d - 2 * g * gp / (2 * gp * gp - g * gpp)
+                big = max(big, abs(d))
+                sd, cd = sincos_small(d)
+                g = d - (es * (cd - 1) + ec * sd) - dM
+                gp = 1 - (ec * cd - es * sd)
+                gpp = es * cd + ec * sd
+                bad += 1 if (abs(g) > tol) | (big > SMALL_PHI_MAX) else 0
+                d = d - 2 * g * gp / (2 * gp * gp - g * gpp)
+                sd, cd = sincos_small(d)
+                cr[j] = c_a * cd - s_a * sd
+                sr[j] = s_a * cd + c_a * sd
+            ok = bad == 0
+        if not ok:
+            _ecc_anomaly(time, lo + b0, nb, t_ref, inv_per, e, ce, se, m + b0)
+
+
 @jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
 def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary):
     """Eccentric moon orbit: (xm, ym, xp, yp, zm2, zp2), z2 = x^2 + y^2
@@ -831,7 +901,8 @@ def ellipse_ecc_z_runs(
     """ellipse_ecc_z() on the window runs (P7c, as ellipse_z_runs() for the
     circular moon, P18): samples time[los[k]:his[k]] in this order, x_bary
     inline with the expression of grids.runs_x_t(), no window arrays. Same
-    values as ellipse_ecc_z() on the materialised window."""
+    values as ellipse_ecc_z() on the materialised window up to the solver's
+    rounding (P7d: E from block anchors, _ecc_anomaly_blocks)."""
     _, ax, bx, ay, by, sq = _orbit_axes(Omega, w, i, e)
     a_planet = (a * mass_ratio) / (1 + mass_ratio)
     a_moon = a - a_planet
@@ -846,10 +917,18 @@ def ellipse_ecc_z_runs(
     zp2 = np.empty(n)
     t_ref = tau * per
     inv_per = 1 / per
+    omega_s = TWO_PI * abs(inv_per) / sqrt(1 - e)
     m = 0
     for k in range(len(los)):
         cnt = his[k] - los[k]
-        _ecc_anomaly(time, los[k], cnt, t_ref, inv_per, e, zm2, zp2, m)
+        lo = los[k]
+        # P7d: block anchors only where blocks of ANCHOR_BMIN samples fit
+        # (decided here: the block function's code cost ~5 % at coarse cadence)
+        step = (time[lo + cnt - 1] - time[lo]) / (cnt - 1) if cnt > 1 else 0.0
+        if step * omega_s * ANCHOR_BMIN <= 2 * SMALL_PHI_MAX:
+            _ecc_anomaly_blocks(time, lo, cnt, t_ref, inv_per, e, zm2, zp2, m)
+        else:
+            _ecc_anomaly(time, lo, cnt, t_ref, inv_per, e, zm2, zp2, m)
         m += cnt
     m = 0
     for k in range(len(los)):
