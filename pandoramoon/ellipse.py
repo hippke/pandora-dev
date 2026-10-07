@@ -173,6 +173,201 @@ def ellipse_z_runs(
     return xm, ym, xp, yp, zm, zp
 
 
+# P10: per-body windows inside the epoch runs. Moon cells span about
+# sqrt(8 SUBRUN_SLACK / (a_m omega^2)) days (curvature slack SUBRUN_SLACK
+# [R_star]), at most SUBRUN_DT_MAX days and SUBRUN_H_MAX samples. Runs whose
+# cells would hold fewer than SUBRUN_H_MIN samples are kept whole: a cell
+# point costs ~10 ns, about what the orbit loop saves on ~4-5 samples
+# (Kepler long cadence without supersampling).
+SUBRUN_SLACK = 0.01
+SUBRUN_DT_MAX = 0.1
+SUBRUN_H_MIN = 8
+SUBRUN_H_MAX = 4096
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _emit_interval(s, e, cur_s, cur_e, los2, his2, n_out):
+    """Append [s, e) to the merged interval list (starts non-decreasing)"""
+    if cur_s < 0:
+        return s, e, n_out
+    if s <= cur_e:
+        return cur_s, max(cur_e, e), n_out
+    los2[n_out] = cur_s
+    his2[n_out] = cur_e
+    return s, e, n_out + 1
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _cell_samples(time, lo, hi, cell_dt):
+    """Moon cell length [samples] in the run time[lo:hi] for cells of
+    ~cell_dt days; 0 (keep the run whole) if that is below SUBRUN_H_MIN
+    samples or the run is shorter than that"""
+    cnt = hi - lo
+    if cnt < SUBRUN_H_MIN:
+        return 0
+    dt = (time[hi - 1] - time[lo]) / (cnt - 1)
+    if not dt > 0:
+        return SUBRUN_H_MAX
+    hf = cell_dt / dt
+    return 0 if hf < SUBRUN_H_MIN else (SUBRUN_H_MAX if not hf < SUBRUN_H_MAX else int(hf))
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def subrun_cell_dt(a, per, mass_ratio):
+    """Moon cell length [days] of ellipse_subruns() and its curvature
+    coefficient: (cell_dt, curv), curv (t_b - t_a)^2 = bound on the
+    deviation of the moon's sky track from its chord over a cell"""
+    a_moon = a - (a * mass_ratio) / (1 + mass_ratio)
+    omega = 2 * pi / per
+    curv = a_moon * omega * omega * (1 + 1e-9) / 8
+    cell_dt = min(sqrt(SUBRUN_SLACK / curv), SUBRUN_DT_MAX) if curv > 0 else SUBRUN_DT_MAX
+    return cell_dt, curv
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def subruns_pay(time, los, his, cell_dt):
+    """True if any run has moon cells of >= SUBRUN_H_MIN samples, i.e.
+    ellipse_subruns() can split it (otherwise it would return the runs
+    unchanged; the caller skips it)"""
+    for k in range(len(los)):
+        if _cell_samples(time, los[k], his[k], cell_dt) > 0:
+            return True
+    return False
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def ellipse_subruns(
+    a, per, tau, Omega, i, time, los, his, c_t, c_d, tdur, t0_shift_planet,
+    mass_ratio, b_bary, r_planet, r_moon
+):
+    """P10: the parts of the window runs (grids.x_bary_runs_sorted) where
+    the planet or the circular moon can be on the star: (los2, his2, c_t2,
+    c_d2), sub-runs in the same form, ascending and disjoint. All other
+    window samples have planet and moon flux exactly 1 (no occultation, and
+    eclipse() only changes a moon flux < 1), so they need no orbit,
+    occultation or chi^2 work. Conservative by construction:
+
+    - Planet: offset a_p = a q / (1 + q) from the barycentre (circular), so
+      |x_p| >= |x_bary| - a_p and |y_p| >= |b| - a_p; on the star
+      (z_p < 1 + r_p) only if |x_bary| < a_p + sqrt((1 + r_p)^2 -
+      max(|b| - a_p, 0)^2). x_bary is linear in t within a run: one
+      interval, found by binary search (padded: extra samples are harmless).
+    - Moon: the sky position P(t) = (x_bary(t) + a_m v_x, b + a_m v_y) at
+      every h-th sample of a run (and the last one), with the orbit loop's
+      formulas (a_m = a / (1 + q)). x_bary is linear in t and |d^2 v /
+      dt^2| = omega^2 |v| <= omega^2, so on a cell [t_a, t_b] P deviates
+      from the chord P_a P_b by at most a_m omega^2 (t_b - t_a)^2 / 8: the
+      cell is kept if the distance of the star centre from the chord minus
+      that is < 1 + r_moon. h gives cells of ~sqrt(8 SUBRUN_SLACK /
+      (a_m omega^2)) days, at most SUBRUN_DT_MAX (shorter cells keep fewer
+      samples, but cost a point evaluation each, ~10 ns); runs with cells
+      of fewer than SUBRUN_H_MIN samples are returned whole.
+    - Margins 1e-6 (R_star) on both bounds cover round-off."""
+    a_planet = (a * mass_ratio) / (1 + mass_ratio)
+    a_moon = a - a_planet
+    cell_dt, curv = subrun_cell_dt(a, per, mass_ratio)
+    n_runs = len(los)
+    # Output capacity: at most one sub-run per moon cell plus one per run
+    cap = 1
+    for k in range(n_runs):
+        h = _cell_samples(time, los[k], his[k], cell_dt)
+        cnt = his[k] - los[k]
+        cap += (cnt + h - 1) // h + 1 if h > 0 else 1
+    O = Omega / 180 * pi
+    inc = i / 180 * pi
+    cos_O = cos(O)
+    sin_O = sin(O)
+    cos_i = cos(inc)
+    t_ref = tau * per
+    z_lim_m = 1 + r_moon + 1e-6
+    yp_min = max(abs(b_bary) - a_planet, 0.0)
+    rp_lim = 1 + r_planet + 1e-6
+    has_p = rp_lim > yp_min
+    x_lim_p = a_planet + sqrt(max(rp_lim * rp_lim - yp_min * yp_min, 0.0)) + 1e-6
+    half = tdur / 2
+    los2 = np.empty(cap, dtype=np.int64)
+    his2 = np.empty(cap, dtype=np.int64)
+    c_t2 = np.empty(cap)
+    c_d2 = np.empty(cap)
+    n_out = 0
+    for k in range(n_runs):
+        lo = los[k]
+        hi = his[k]
+        cnt = hi - lo
+        if cnt == 0:
+            continue
+        ct = c_t[k]
+        cd = c_d[k]
+        tr = time[lo:hi]
+        h = _cell_samples(time, lo, hi, cell_dt)
+        if h == 0:  # cells too short to pay: whole run
+            los2[n_out] = lo
+            his2[n_out] = hi
+            c_t2[n_out] = ct
+            c_d2[n_out] = cd
+            n_out += 1
+            continue
+        # planet interval [plo, phi)
+        plo = hi
+        phi = hi
+        if has_p:
+            t_a = ct + (-x_lim_p + t0_shift_planet + cd) * half
+            t_b = ct + (x_lim_p + t0_shift_planet + cd) * half
+            pad = 1e-6 * tdur + 1e-12 * (abs(t_a) + abs(t_b))
+            plo = lo + np.searchsorted(tr, t_a - pad, side="left")
+            phi = lo + np.searchsorted(tr, t_b + pad, side="right")
+        pending = plo < phi
+        start = n_out
+        cur_s = -1
+        cur_e = -1
+        # moon cells between the samples 0, h, 2h, ..., cnt - 1 of the run
+        ja = 0
+        ta = tr[0]
+        sin_Q, cos_Q = sincos_turns((ta - t_ref) / per)
+        xa = (cos_O * cos_Q - sin_O * sin_Q * cos_i) * a_moon + ((2 * (ta - ct)) / tdur - t0_shift_planet - cd)
+        ya = (sin_O * cos_Q + cos_O * sin_Q * cos_i) * a_moon + b_bary
+        if cnt == 1 and sqrt(xa * xa + ya * ya) < z_lim_m:
+            if pending and plo <= lo:
+                cur_s, cur_e, n_out = _emit_interval(plo, phi, cur_s, cur_e, los2, his2, n_out)
+                pending = False
+            cur_s, cur_e, n_out = _emit_interval(lo, lo + 1, cur_s, cur_e, los2, his2, n_out)
+        while ja < cnt - 1:
+            jb = min(ja + h, cnt - 1)
+            tb = tr[jb]
+            sin_Q, cos_Q = sincos_turns((tb - t_ref) / per)
+            xb = (cos_O * cos_Q - sin_O * sin_Q * cos_i) * a_moon + ((2 * (tb - ct)) / tdur - t0_shift_planet - cd)
+            yb = (sin_O * cos_Q + cos_O * sin_Q * cos_i) * a_moon + b_bary
+            # distance of the star centre from the chord P_a P_b, minus the
+            # curvature bound of the arc
+            dx = xb - xa
+            dy = yb - ya
+            dd = dx * dx + dy * dy
+            u = -(xa * dx + ya * dy) / dd if dd > 0 else 0.0
+            u = min(max(u, 0.0), 1.0)
+            cx = xa + u * dx
+            cy = ya + u * dy
+            dtc = tb - ta
+            if sqrt(cx * cx + cy * cy) - curv * dtc * dtc < z_lim_m:
+                if pending and plo <= lo + ja:
+                    cur_s, cur_e, n_out = _emit_interval(plo, phi, cur_s, cur_e, los2, his2, n_out)
+                    pending = False
+                cur_s, cur_e, n_out = _emit_interval(lo + ja, lo + jb + 1, cur_s, cur_e, los2, his2, n_out)
+            ja = jb
+            ta = tb
+            xa = xb
+            ya = yb
+        if pending:
+            cur_s, cur_e, n_out = _emit_interval(plo, phi, cur_s, cur_e, los2, his2, n_out)
+        if cur_s >= 0:
+            los2[n_out] = cur_s
+            his2[n_out] = cur_e
+            n_out += 1
+        for r in range(start, n_out):
+            c_t2[r] = ct
+            c_d2[r] = cd
+    return los2[:n_out], his2[:n_out], c_t2[:n_out], c_d2[:n_out]
+
+
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary):
     """ellipse_ecc() fused into one loop that also returns the distances from

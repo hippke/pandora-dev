@@ -8,7 +8,10 @@ from os import path
 
 # Pandora
 from pandoramoon.eclipse import eclipse, eclipse_possible
-from pandoramoon.ellipse import ellipse, ellipse_ecc, ellipse_z, ellipse_ecc_z, ellipse_z_runs
+from pandoramoon.ellipse import (
+    ellipse, ellipse_ecc, ellipse_z, ellipse_ecc_z, ellipse_z_runs, ellipse_subruns,
+    subrun_cell_dt, subruns_pay
+)
 from pandoramoon.occult import occult, occult_small, occult_hybrid, create_occult_cache, read_occult_cache
 from pandoramoon.helpers import resample
 from pandoramoon.grids import (
@@ -948,7 +951,11 @@ def _window_model_runs(
     moon, the runs come from the binary search and the fused orbit loop
     computes x_bary inline (ellipse_z_runs): no idx, x_bary or time window
     arrays. Otherwise the window arrays are built as in _window_model()
-    and converted to runs. Same fluxes as _window_model()."""
+    and converted to runs. Same fluxes as _window_model().
+    P10: for a circular physical moon without occultation cache the runs are
+    then narrowed to the sub-runs where a body can be on the star
+    (ellipse_subruns); the other window samples have flux exactly 1 and are
+    not part of the returned runs."""
     R_star = float(R_star)
     per_bary = float(per_bary)
     a_bary = float(a_bary)
@@ -983,6 +990,17 @@ def _window_model_runs(
         tdur = 0.0
         t0_shift = 0.0
     if ok and not unphysical and ecc_moon == 0:
+        # P10: only the parts of the runs where a body can be on the star
+        # (the occultation cache's flux reaches past 1 + r, so not with it;
+        # and only where the moon cells are long enough to pay)
+        if cache is None and subruns_pay(
+            time, los, his, subrun_cell_dt(a_moon, per_moon, M_moon / M_planet)[0]
+        ):
+            los, his, c_t, c_d = ellipse_subruns(
+                a_moon, per_moon, tau_moon, Omega_moon, i_moon, time, los, his,
+                c_t, c_d, tdur, t0_shift, M_moon / M_planet, b_bary, r_planet,
+                r_moon
+            )
         xm, ym, xp, yp, zm, zp = ellipse_z_runs(
             a_moon, per_moon, tau_moon, Omega_moon, i_moon, time, los, his,
             c_t, c_d, tdur, t0_shift, M_moon / M_planet, b_bary
