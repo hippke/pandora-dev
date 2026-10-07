@@ -771,8 +771,202 @@ def occult_exact(zs, k, u1, u2):
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _occult_hybrid(zs, k, u1, u2, series_tol):
-    """Evaluates the exact transit model (Mandel & Agol 2002, quadratic limb
-    darkening) for an array of normalized distances, for any k.
+    """Exact Mandel & Agol transit model (quadratic limb darkening) for an
+    array of normalized distances, for any k, with the P14 interior series
+    for z < z_c (series_tol = 0: exact everywhere). See
+    _occult_hybrid_samples() for the model; P12: _occult_hybrid_stretches()
+    for inputs whose classes come in long stretches (e.g. the window samples
+    of a time-sorted light curve, _long_stretches()), else (and for z == k
+    or full occultations) the per-sample version.
+
+    Parameters
+    ----------
+    z: 1D array
+        Normalized distances
+    k: float
+        Planet-star radius ratio
+    u1, u2: float
+        Limb darkening coefficients
+    Returns
+    -------
+    Transit model evaluated at `z`.
+    """
+    z_c = _hybrid_zcut(k, u1, u2, series_tol)
+    if len(zs) >= STRETCH_MIN_N and _long_stretches(zs, k, z_c):
+        ok, flux = _occult_hybrid_stretches(zs, k, u1, u2, z_c)
+        if ok:
+            return flux
+    return _occult_hybrid_samples(zs, k, u1, u2, z_c)
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _hybrid_zcut(k, u1, u2, series_tol):
+    """P14 series cut z_c for (k, LD) at flux tolerance series_tol (0: no
+    series)"""
+    omega = 1 / (1 - u1 / 3 - u2 / 6)
+    den = k * k * abs((u1 + 2 * u2) * omega)  # |d flux / d <mu>|
+    return _series_zcut(k, series_tol / den if den > 1e-300 else 1e300) if series_tol > 0 else 0.0
+
+
+# P12: stretch scan. Samples of one class (off the star, interior series,
+# exact) come in long contiguous stretches when z varies smoothly. A
+# stretch is extended by blocks of STRETCH_BLOCK samples with a vectorised
+# count of the class condition (0.08 ns per sample; blocks of <= 32 compile
+# to a slow unrolled form), then sample by sample.
+STRETCH_BLOCK = 64
+STRETCH_MIN_AVG = 64    # stretch path only if stretches are this long on average
+STRETCH_STRIDE = 8      # _long_stretches() looks at every 8th sample
+STRETCH_MIN_N = 2048    # shorter inputs: per-sample path. The stretch pass
+                        # gains ~1 ns per sample on PLATO windows (~5400
+                        # samples); on ~1200-sample windows (Kepler, 5x
+                        # supersampled) it was 1-2 % slower end to end
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _long_stretches(zs, k, z_c):
+    """True if the class (off star / series / exact) of every
+    STRETCH_STRIDE-th sample changes rarely enough that the stretches
+    average >= STRETCH_MIN_AVG samples (cheap estimate; a wrong guess only
+    costs speed)"""
+    n_z = len(zs)
+    one_k = 1 + k
+    changes = 0
+    prev = -1
+    for i in range(0, n_z, STRETCH_STRIDE):
+        z = zs[i]
+        c = 0 if (z >= one_k or z < 0) else (1 if z < z_c else 2)
+        changes += 1 if c != prev else 0
+        prev = c
+    return changes * STRETCH_MIN_AVG <= n_z
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _end_off(zs, j, n_z, one_k):
+    """First index >= j of a sample with 0 <= z < one_k (end of an
+    off-star stretch)"""
+    while j + STRETCH_BLOCK <= n_z:
+        blk = zs[j:j + STRETCH_BLOCK]
+        c = 0
+        for q in range(STRETCH_BLOCK):
+            c += 1 if (blk[q] >= 0) & (blk[q] < one_k) else 0
+        if c:
+            break
+        j += STRETCH_BLOCK
+    while j < n_z and (zs[j] >= one_k or zs[j] < 0):
+        j += 1
+    return j
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _end_series(zs, j, n_z, z_c, k):
+    """First index >= j of a sample that is not an interior-series sample
+    (0 <= z < z_c, z != k)"""
+    while j + STRETCH_BLOCK <= n_z:
+        blk = zs[j:j + STRETCH_BLOCK]
+        c = 0
+        for q in range(STRETCH_BLOCK):
+            c += 1 if (blk[q] >= 0) & (blk[q] < z_c) & (abs(blk[q] - k) >= Z_K_MIN) else 0
+        if c < STRETCH_BLOCK:
+            break
+        j += STRETCH_BLOCK
+    while j < n_z and zs[j] < z_c and zs[j] >= 0 and abs(zs[j] - k) >= Z_K_MIN:
+        j += 1
+    return j
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _end_exact(zs, j, n_z, z_c, one_k, k, full, km1):
+    """First index >= j of a sample that is not an exact-model sample
+    (z_c <= z < 1 + k, z != k, not fully occulted)"""
+    while j + STRETCH_BLOCK <= n_z:
+        blk = zs[j:j + STRETCH_BLOCK]
+        c = 0
+        for q in range(STRETCH_BLOCK):
+            c += 1 if (blk[q] >= z_c) & (blk[q] < one_k) & (abs(blk[q] - k) >= Z_K_MIN) & ((not full) | (blk[q] > km1)) else 0
+        if c < STRETCH_BLOCK:
+            break
+        j += STRETCH_BLOCK
+    while j < n_z and zs[j] >= z_c and zs[j] < one_k and abs(zs[j] - k) >= Z_K_MIN and not (full and zs[j] <= km1):
+        j += 1
+    return j
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _occult_hybrid_stretches(zs, k, u1, u2, z_c):
+    """_occult_hybrid_samples() by stretches (P12): (ok, flux). Off-star
+    stretches are filled with 1 and interior-series stretches (z < z_c)
+    evaluated in place (no gather, no index scatter); exact-model stretches
+    are copied into one buffer for the vectorised batch, as before. ok =
+    False (the caller then uses the per-sample version) at a sample with
+    z == k (one-ulp nudge) or a fully occulted one (k >= 1). Same values as
+    the per-sample version up to rounding of the series (in place vs
+    gathered: <= 2.2e-16)."""
+    k2 = k**2
+    n_z = len(zs)
+    flux = np.empty(n_z)
+    omega = 1 / (1 - u1 / 3 - u2 / 6)
+    c1 = 1 - u1 - 2 * u2
+    c2 = u1 + 2 * u2
+    kk = k2 * omega
+    one_k = 1 + k
+    full = k >= 1
+    km1 = k - 1
+    idx = np.empty(n_z, dtype=np.int64)
+    zb = np.empty(n_z)
+    m = 0
+    have_a = False
+    a = np.empty(0)
+    A0 = 0.0
+    A1 = -kk * u2
+    i = 0
+    while i < n_z:
+        z = zs[i]
+        j = i + 1
+        if z >= one_k or z < 0:                    # off the star: flux 1
+            j = _end_off(zs, j, n_z, one_k)
+            fr = flux[i:j]
+            for q in range(j - i):
+                fr[q] = 1.0
+        elif abs(z - k) < Z_K_MIN or (full and z <= km1):
+            return False, flux
+        elif z < z_c:                              # interior series, in place
+            j = _end_series(zs, j, n_z, z_c, k)
+            if not have_a:
+                a = _series_coeffs(k, kk * c2)
+                A0 = 1 - kk * ((1 - u1 - u2) - u2 * (1 - k2 / 2))
+                have_a = True
+            _occult_series_batch(zs[i:j], j - i, a, A0, A1, flux[i:j])
+        else:                                      # exact (incl. limb): gather
+            j = _end_exact(zs, j, n_z, z_c, one_k, k, full, km1)
+            cnt = j - i
+            zr = zs[i:j]
+            zbr = zb[m:m + cnt]
+            ir = idx[m:m + cnt]
+            for q in range(cnt):
+                zbr[q] = zr[q]
+                ir[q] = i + q
+            m += cnt
+        i = j
+    if m > 0:
+        fb = np.empty(m)
+        dev = np.empty(m)
+        _occult_exact_batch(zb, m, k, c1, c2, u2, omega, fb, dev)
+        # non-converged lanes (scalar), clamp, scatter
+        for j in range(m):
+            f = fb[j]
+            if not dev[j] <= 0:
+                f = _occult_point(zb[j], k, u1, u2)
+            if f > 1:
+                f = 1
+            flux[idx[j]] = f
+    return True, flux
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _occult_hybrid_samples(zs, k, u1, u2, z_c):
+    """_occult_hybrid() with a per-sample pass 1 (before P12 this was
+    _occult_hybrid; still used for inputs without long stretches, e.g.
+    unsorted time); z_c from _hybrid_zcut(). The model:
 
     Until P3 this switched to a "linear interpolation" correction of the
     small-body approximation for k <= 0.05 (z <= 0.65 ... 0.98); that zone
@@ -798,18 +992,6 @@ def _occult_hybrid(zs, k, u1, u2, series_tol):
     exact flux, by a rigorous tail bound (see the comment block above
     SERIES_M); series_tol = 0 (occult_exact) disables it. All other on-star
     samples take the exact path above.
-
-    Parameters
-    ----------
-    z: 1D array
-        Normalized distances
-    k: float
-        Planet-star radius ratio
-    u1, u2: float
-        Limb darkening coefficients
-    Returns
-    -------
-    Transit model evaluated at `z`.
     """
     # k is used as given: the old snap k -> 0.5 for |k - 0.5| < 1e-4 was up
     # to 150 ppm off (bug #30); the closed-form operands (P15) are exact at
@@ -824,8 +1006,6 @@ def _occult_hybrid(zs, k, u1, u2, series_tol):
     # Pass 1: classify; collect the on-star samples: interior series
     # (z < z_c, P14) from the front of zb / idx, exact model from the back
     kk = k2 * omega
-    den = k2 * abs(c2 * omega)  # |d flux / d <mu>|
-    z_c = _series_zcut(k, series_tol / den if den > 1e-300 else 1e300) if series_tol > 0 else 0.0
     idx = np.empty(n_z, dtype=np.int64)
     zb = np.empty(n_z)
     ms = 0
