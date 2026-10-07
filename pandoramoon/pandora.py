@@ -11,7 +11,7 @@ from pandoramoon.eclipse import eclipse, eclipse_possible, eclipse_impossible_ci
 from pandoramoon.ellipse import (
     ellipse, ellipse_ecc, ellipse_z, ellipse_ecc_z, ellipse_z_runs, ellipse_z_only_runs,
     ellipse_subruns,
-    subrun_cell_dt, subruns_pay
+    subrun_cell_dt, subruns_pay, ellipse_ecc_z_runs
 )
 from pandoramoon.occult import occult, occult_small, occult_hybrid, occult_hybrid_z2, create_occult_cache, read_occult_cache
 from pandoramoon.helpers import resample
@@ -954,16 +954,17 @@ def _window_model_runs(
     """_window_model() with the window as sample runs (P18): (los, his,
     planet flux, moon flux), where the window samples are
     time[los[k]:his[k]] for all k in this order (ascending, disjoint) and
-    the fluxes are given there. For sorted time and a circular physical
-    moon, the runs come from the binary search and the fused orbit loop
-    computes x_bary inline (ellipse_z_runs): no idx, x_bary or time window
+    the fluxes are given there. For sorted time and a physical moon
+    (circular, or since P7c eccentric with 0 < e < 1), the runs come from
+    the binary search and the fused orbit loop computes x_bary inline
+    (ellipse_z_runs / ellipse_ecc_z_runs): no idx, x_bary or time window
     arrays. Otherwise the window arrays are built as in _window_model()
     and converted to runs. Same fluxes as _window_model().
-    P10: for a circular physical moon without occultation cache the runs are
+    P10: for a physical moon (P7c: also eccentric) without occultation cache the runs are
     then narrowed to the sub-runs where a body can be on the star
     (ellipse_subruns); the other window samples have flux exactly 1 and are
     not part of the returned runs.
-    P24b: on that path, when the orbit's geometry rules out a planet-moon
+    P24b: on that path, when the circular orbit's geometry rules out a planet-moon
     eclipse (eclipse_impossible_circular), only z is computed
     (ellipse_z_only_runs) and eclipse() is skipped (same fluxes)."""
     R_star = float(R_star)
@@ -999,23 +1000,30 @@ def _window_model_runs(
         c_d = c_t
         tdur = 0.0
         t0_shift = 0.0
-    if ok and not unphysical and ecc_moon == 0:
+    if ok and not unphysical and ecc_moon >= 0 and ecc_moon < 1:
         # P10: only the parts of the runs where a body can be on the star
         # (the occultation cache's flux reaches past 1 + r, so not with it;
-        # and only where the moon cells are long enough to pay)
+        # and only where the moon cells are long enough to pay); P7c: also
+        # for eccentric moons
         if cache is None and subruns_pay(
-            time, los, his, subrun_cell_dt(a_moon, per_moon, M_moon / M_planet)[0]
+            time, los, his, subrun_cell_dt(a_moon, per_moon, M_moon / M_planet, ecc_moon)[0]
         ):
             los, his, c_t, c_d = ellipse_subruns(
                 a_moon, per_moon, tau_moon, Omega_moon, i_moon, time, los, his,
                 c_t, c_d, tdur, t0_shift, M_moon / M_planet, b_bary, r_planet,
-                r_moon
+                r_moon, ecc_moon, w_moon
             )
         # P24b: if the orbit's geometry rules out a planet-moon eclipse
         # (~90 % of the draws), only z is needed: no positions, no
-        # eclipse_possible() pass
-        no_eclipse = eclipse_impossible_circular(a_moon, i_moon, r_planet, r_moon)
-        if no_eclipse:
+        # eclipse_possible() pass (circular moons only)
+        no_eclipse = ecc_moon == 0 and eclipse_impossible_circular(a_moon, i_moon, r_planet, r_moon)
+        if ecc_moon != 0:
+            # P7c: eccentric moon on the runs (x_bary inline)
+            xm, ym, xp, yp, zm2, zp2 = ellipse_ecc_z_runs(
+                a_moon, per_moon, ecc_moon, tau_moon, Omega_moon, w_moon, i_moon,
+                time, los, his, c_t, c_d, tdur, t0_shift, M_moon / M_planet, b_bary
+            )
+        elif no_eclipse:
             zm2, zp2 = ellipse_z_only_runs(
                 a_moon, per_moon, tau_moon, Omega_moon, i_moon, time, los, his,
                 c_t, c_d, tdur, t0_shift, M_moon / M_planet, b_bary

@@ -330,13 +330,18 @@ def _cell_samples(time, lo, hi, cell_dt):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def subrun_cell_dt(a, per, mass_ratio):
+def subrun_cell_dt(a, per, mass_ratio, ecc):
     """Moon cell length [days] of ellipse_subruns() and its curvature
     coefficient: (cell_dt, curv), curv (t_b - t_a)^2 = bound on the
-    deviation of the moon's sky track from its chord over a cell"""
+    deviation of the moon's sky track from its chord over a cell. The
+    moon's acceleration is a_m omega^2 (circular), at most a_m omega^2 /
+    (1 - e)^2 at periapsis for an eccentric orbit (G M / r^2, r >= a (1 - e),
+    G M = omega^2 a^3; P7c)"""
     a_moon = a - (a * mass_ratio) / (1 + mass_ratio)
     omega = 2 * pi / per
     curv = a_moon * omega * omega * (1 + 1e-9) / 8
+    if ecc != 0:
+        curv /= (1 - ecc) * (1 - ecc)
     cell_dt = min(sqrt(SUBRUN_SLACK / curv), SUBRUN_DT_MAX) if curv > 0 else SUBRUN_DT_MAX
     return cell_dt, curv
 
@@ -441,12 +446,65 @@ def _moon_cells(
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _moon_cells_ecc(
+    tr, s, e, h, lo, t_ref, inv_per, axes, a_moon, ct, two_tdur,
+    sh, b_bary, z_lim_m, curv, cur_s, cur_e, los2, his2, n_out
+):
+    """_moon_cells() for an eccentric moon (P7c): the cell points from
+    _orbit_cs() and the axes (e, ax, bx, ay, by, sq) of _orbit_axes(). A
+    separate function: the never-executed eccentric branch inside
+    _moon_cells made circular calls ~35 % slower (scratch_p7b/subruns_var*.py).
+    Moon cells [ja, jb] (samples s, s + h, ..., e of the run tr, e
+    included; e > s) whose arc can come closer to the star centre than
+    z_lim_m, appended (as lo + ja .. lo + jb + 1) to the merged interval list.
+    Kept if the distance of the centre from the chord P_a P_b, minus the
+    curvature bound curv (t_b - t_a)^2, is < z_lim_m; tested without
+    division or sqrt: with lim = z_lim_m + curv dt^2 and s_ = -P_a.(P_b -
+    P_a), the closest chord point is P_a (s_ <= 0), P_b (s_ >= |P_b -
+    P_a|^2) or the foot of the perpendicular (distance |P_a x (P_b - P_a)| /
+    |P_b - P_a|)."""
+    ecc, ax, bx, ay, by, sq = axes
+    ja = s
+    ta = tr[ja]
+    c, sn = _orbit_cs((ta - t_ref) * inv_per, ecc)
+    xa = (ax * (c - ecc) + bx * sq * sn) * a_moon + ((ta - ct) * two_tdur - sh)
+    ya = (ay * (c - ecc) + by * sq * sn) * a_moon + b_bary
+    while ja < e:
+        jb = min(ja + h, e)
+        tb = tr[jb]
+        c, sn = _orbit_cs((tb - t_ref) * inv_per, ecc)
+        xb = (ax * (c - ecc) + bx * sq * sn) * a_moon + ((tb - ct) * two_tdur - sh)
+        yb = (ay * (c - ecc) + by * sq * sn) * a_moon + b_bary
+        dx = xb - xa
+        dy = yb - ya
+        dtc = tb - ta
+        lim = z_lim_m + curv * dtc * dtc
+        lim2 = lim * lim
+        s_ = -(xa * dx + ya * dy)
+        dd = dx * dx + dy * dy
+        if s_ <= 0:
+            keep = xa * xa + ya * ya < lim2
+        elif s_ >= dd:
+            keep = xb * xb + yb * yb < lim2
+        else:
+            cr = xa * dy - ya * dx
+            keep = cr * cr < lim2 * dd
+        if keep:
+            cur_s, cur_e, n_out = _emit_interval(lo + ja, lo + jb + 1, cur_s, cur_e, los2, his2, n_out)
+        ja = jb
+        ta = tb
+        xa = xb
+        ya = yb
+    return cur_s, cur_e, n_out
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def ellipse_subruns(
     a, per, tau, Omega, i, time, los, his, c_t, c_d, tdur, t0_shift_planet,
-    mass_ratio, b_bary, r_planet, r_moon
+    mass_ratio, b_bary, r_planet, r_moon, ecc, w
 ):
     """P10: the parts of the window runs (grids.x_bary_runs_sorted) where
-    the planet or the circular moon can be on the star: (los2, his2, c_t2,
+    the planet or the moon can be on the star: (los2, his2, c_t2,
     c_d2), sub-runs in the same form, ascending and disjoint. All other
     window samples have planet and moon flux exactly 1 (no occultation, and
     eclipse() only changes a moon flux < 1), so they need no orbit,
@@ -477,10 +535,18 @@ def ellipse_subruns(
       point evaluation each, ~7 ns); runs with cells of fewer than
       SUBRUN_H_MIN samples are returned whole.
     - Margins 1e-6 (R_star) on all bounds cover round-off (the cell points
-      use reciprocals, not the orbit loop's divisions: ~1e-12 R_star)."""
+      use reciprocals, not the orbit loop's divisions: ~1e-12 R_star).
+    - P7c, eccentric moon (e = ecc, periapsis argument w): the body offsets
+      from the barycentre are a_p r and a_m r with r <= 1 + e, so the
+      planet bound takes a_p (1 + e); the moon's sky offset a_m (ax X + bx Y,
+      ay X + by Y) (X = cos E - e, Y = sqrt(1 - e^2) sin E, _orbit_axes) has
+      |x| <= A_x = a_m (|ax| e + sqrt(ax^2 + bx^2 (1 - e^2))) (and A_y
+      alike), the circular A_x / A_y for e = 0; the curvature bound uses the
+      periapsis acceleration (subrun_cell_dt), the cell points the orbit
+      loop's solver (_orbit_cs)."""
     a_planet = (a * mass_ratio) / (1 + mass_ratio)
     a_moon = a - a_planet
-    cell_dt, curv = subrun_cell_dt(a, per, mass_ratio)
+    cell_dt, curv = subrun_cell_dt(a, per, mass_ratio, ecc)
     n_runs = len(los)
     # Output capacity: per run at most one sub-run per moon cell (cells on
     # both sides of the planet interval: one partial cell more) plus the
@@ -499,12 +565,20 @@ def ellipse_subruns(
     inv_per = 1.0 / per
     two_tdur = 2.0 / tdur
     z_lim_m = 1 + r_moon + 1e-6
-    yp_min = max(abs(b_bary) - a_planet, 0.0)
+    a_p_max = a_planet * (1 + ecc)
+    yp_min = max(abs(b_bary) - a_p_max, 0.0)
     rp_lim = 1 + r_planet + 1e-6
     has_p = rp_lim > yp_min
-    x_lim_p = a_planet + sqrt(max(rp_lim * rp_lim - yp_min * yp_min, 0.0)) + 1e-6
-    A_x = a_moon * sqrt(cos_O * cos_O + sin_O * sin_O * cos_i * cos_i) * (1 + 1e-9)
-    A_y = a_moon * sqrt(sin_O * sin_O + cos_O * cos_O * cos_i * cos_i) * (1 + 1e-9)
+    x_lim_p = a_p_max + sqrt(max(rp_lim * rp_lim - yp_min * yp_min, 0.0)) + 1e-6
+    if ecc == 0:
+        axes = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)   # (unused: circular cells)
+        A_x = a_moon * sqrt(cos_O * cos_O + sin_O * sin_O * cos_i * cos_i) * (1 + 1e-9)
+        A_y = a_moon * sqrt(sin_O * sin_O + cos_O * cos_O * cos_i * cos_i) * (1 + 1e-9)
+    else:
+        axes = _orbit_axes(Omega, w, i, ecc)
+        _, ax, bx, ay, by, sq = axes
+        A_x = a_moon * (abs(ax) * ecc + sqrt(ax * ax + bx * bx * sq * sq)) * (1 + 1e-9)
+        A_y = a_moon * (abs(ay) * ecc + sqrt(ay * ay + by * by * sq * sq)) * (1 + 1e-9)
     has_m = abs(b_bary) - A_y < z_lim_m
     x_lim_m = z_lim_m + A_x + 1e-6
     half = tdur / 2
@@ -564,16 +638,26 @@ def ellipse_subruns(
         s = ml
         if pl < ph:
             e = min(pl, mh - 1)
-            if e > ml:
+            if e > ml and ecc == 0:
                 cur_s, cur_e, n_out = _moon_cells(
                     tr, ml, e, h, lo, t_ref, inv_per, cos_O, sin_O, cos_i, a_moon, ct,
                     two_tdur, sh, b_bary, z_lim_m, curv, cur_s, cur_e, los2, his2, n_out
                 )
+            elif e > ml:
+                cur_s, cur_e, n_out = _moon_cells_ecc(
+                    tr, ml, e, h, lo, t_ref, inv_per, axes, a_moon, ct,
+                    two_tdur, sh, b_bary, z_lim_m, curv, cur_s, cur_e, los2, his2, n_out
+                )
             cur_s, cur_e, n_out = _emit_interval(lo + pl, lo + ph, cur_s, cur_e, los2, his2, n_out)
             s = max(ph - 1, ml)
-        if mh - 1 > s:
+        if mh - 1 > s and ecc == 0:
             cur_s, cur_e, n_out = _moon_cells(
                 tr, s, mh - 1, h, lo, t_ref, inv_per, cos_O, sin_O, cos_i, a_moon, ct,
+                two_tdur, sh, b_bary, z_lim_m, curv, cur_s, cur_e, los2, his2, n_out
+            )
+        elif mh - 1 > s:
+            cur_s, cur_e, n_out = _moon_cells_ecc(
+                tr, s, mh - 1, h, lo, t_ref, inv_per, axes, a_moon, ct,
                 two_tdur, sh, b_bary, z_lim_m, curv, cur_s, cur_e, los2, his2, n_out
             )
         if cur_s >= 0:
@@ -645,11 +729,13 @@ def _kepler_cs_markley(M, e):
     return cos(k), sin(k)
 
 
-@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
-def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary):
-    """Eccentric moon orbit: (xm, ym, xp, yp, zm2, zp2), z2 = x^2 + y^2
-    (P26, as ellipse_z()). P7b: positions linear in cos E, sin E, M reduced
-    in turns, vectorised Kepler solver for e <= ECC_FAST_MAX (see above)."""
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _orbit_axes(Omega, w, i, e):
+    """(e, ax, bx, ay, by, sq): the moon's sky-plane direction is
+    (ax X + bx Y, ay X + by Y) with X = cos E - e, Y = sq sin E,
+    sq = sqrt(1 - e^2) (rotation by w in the orbit plane, then the
+    projection by Omega, i; P7b). For e = 0 with w = 0 this is the circular
+    orbit's (cos O cos Q - sin O cos i sin Q, ...)."""
     cos_i = cos(i / 180 * pi)
     O = Omega / 180 * pi
     w_rad = w / 180 * pi
@@ -657,17 +743,60 @@ def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary)
     sin_O = sin(O)
     cos_w = cos(w_rad)
     sin_w = sin(w_rad)
-    # sky-plane direction = (ax X + bx Y, ay X + by Y), X = cos E - e,
-    # Y = sqrt(1 - e^2) sin E (rotation by w in the orbit plane, then the
-    # projection by Omega, i)
     ax = cos_O * cos_w - sin_O * cos_i * sin_w
     bx = -cos_O * sin_w - sin_O * cos_i * cos_w
     ay = sin_O * cos_w + cos_O * cos_i * sin_w
     by = -sin_O * sin_w + cos_O * cos_i * cos_w
-    sq = sqrt((1 - e) * (1 + e))
+    return e, ax, bx, ay, by, sqrt((1 - e) * (1 + e))
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _orbit_cs(u, e):
+    """(cos E, sin E) of the eccentric anomaly at phase u [turns] from tau
+    (sin E signed by the half orbit, as _ecc_anomaly), 0 < e < 1. Scalar;
+    for the eccentric sub-run cell points (P7c)."""
+    f = u - np.floor(u + 0.5)
+    if e <= ECC_FAST_MAX:
+        c, s = _kepler_cs_fast(TWO_PI * abs(f), e)
+    else:
+        c, s = _kepler_cs_markley(TWO_PI * abs(f), e)
+    return c, (s if f >= 0 else -s)
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
+def _ecc_anomaly(time, lo, cnt, t_ref, inv_per, e, ce, se, m):
+    """cos E and sin E (signed by the half orbit) for time[lo:lo + cnt] into
+    ce[m:m + cnt], se[m:m + cnt] (P7b): one loop per solver (a branch
+    between them inside one loop made LLVM evaluate both per lane). The
+    arrays are sliced here, not by the caller (P23)."""
+    tr = time[lo:lo + cnt]
+    cr = ce[m:m + cnt]
+    sr = se[m:m + cnt]
+    if e <= ECC_FAST_MAX:
+        for j in range(cnt):
+            u = (tr[j] - t_ref) * inv_per
+            f = u - np.floor(u + 0.5)
+            c, s = _kepler_cs_fast(TWO_PI * abs(f), e)
+            cr[j] = c
+            sr[j] = s if f >= 0 else -s
+    else:
+        for j in range(cnt):
+            u = (tr[j] - t_ref) * inv_per
+            f = u - np.floor(u + 0.5)
+            c, s = _kepler_cs_markley(TWO_PI * abs(f), e)
+            cr[j] = c
+            sr[j] = s if f >= 0 else -s
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
+def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary):
+    """Eccentric moon orbit: (xm, ym, xp, yp, zm2, zp2), z2 = x^2 + y^2
+    (P26, as ellipse_z()). P7b: positions linear in cos E, sin E, M reduced
+    in turns, vectorised Kepler solver for e <= ECC_FAST_MAX (see above);
+    cos E / sin E are first written into zm2 / zp2 (_ecc_anomaly)."""
+    _, ax, bx, ay, by, sq = _orbit_axes(Omega, w, i, e)
     a_planet = (a * mass_ratio) / (1 + mass_ratio)
     a_moon = a - a_planet
-    fast = e <= ECC_FAST_MAX
     n = len(time)
     xm = np.empty(n)
     ym = np.empty(n)
@@ -675,25 +804,7 @@ def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary)
     yp = np.empty(n)
     zm2 = np.empty(n)
     zp2 = np.empty(n)
-    # cos E, sin E first, kept in zm2 / zp2 (two solver loops: a branch
-    # between the solvers inside one loop made LLVM evaluate both per lane),
-    # then the positions
-    t_ref = tau * per
-    inv_per = 1 / per
-    if fast:
-        for j in range(n):
-            u = (time[j] - t_ref) * inv_per
-            f = u - np.floor(u + 0.5)
-            c, s = _kepler_cs_fast(TWO_PI * abs(f), e)
-            zm2[j] = c
-            zp2[j] = s if f >= 0 else -s
-    else:
-        for j in range(n):
-            u = (time[j] - t_ref) * inv_per
-            f = u - np.floor(u + 0.5)
-            c, s = _kepler_cs_markley(TWO_PI * abs(f), e)
-            zm2[j] = c
-            zp2[j] = s if f >= 0 else -s
+    _ecc_anomaly(time, 0, n, tau * per, 1 / per, e, zm2, zp2, 0)
     for j in range(n):
         X = zm2[j] - e
         Y = sq * zp2[j]
@@ -709,4 +820,65 @@ def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary)
         yp[j] = ypj
         zm2[j] = xmj * xmj + ymj * ymj
         zp2[j] = xpj * xpj + ypj * ypj
+    return xm, ym, xp, yp, zm2, zp2
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
+def ellipse_ecc_z_runs(
+    a, per, e, tau, Omega, w, i, time, los, his, c_t, c_d, tdur, t0_shift_planet,
+    mass_ratio, b_bary
+):
+    """ellipse_ecc_z() on the window runs (P7c, as ellipse_z_runs() for the
+    circular moon, P18): samples time[los[k]:his[k]] in this order, x_bary
+    inline with the expression of grids.runs_x_t(), no window arrays. Same
+    values as ellipse_ecc_z() on the materialised window."""
+    _, ax, bx, ay, by, sq = _orbit_axes(Omega, w, i, e)
+    a_planet = (a * mass_ratio) / (1 + mass_ratio)
+    a_moon = a - a_planet
+    n = 0
+    for k in range(len(los)):
+        n += his[k] - los[k]
+    xm = np.empty(n)
+    ym = np.empty(n)
+    xp = np.empty(n)
+    yp = np.empty(n)
+    zm2 = np.empty(n)
+    zp2 = np.empty(n)
+    t_ref = tau * per
+    inv_per = 1 / per
+    m = 0
+    for k in range(len(los)):
+        cnt = his[k] - los[k]
+        _ecc_anomaly(time, los[k], cnt, t_ref, inv_per, e, zm2, zp2, m)
+        m += cnt
+    m = 0
+    for k in range(len(los)):
+        ct = c_t[k]
+        cd = c_d[k]
+        lo = los[k]
+        cnt = his[k] - lo
+        tr = time[lo:lo + cnt]
+        xmr = xm[m:m + cnt]
+        ymr = ym[m:m + cnt]
+        xpr = xp[m:m + cnt]
+        ypr = yp[m:m + cnt]
+        zmr = zm2[m:m + cnt]
+        zpr = zp2[m:m + cnt]
+        for j in range(cnt):
+            x_bary = (2 * (tr[j] - ct)) / tdur - t0_shift_planet - cd
+            X = zmr[j] - e
+            Y = sq * zpr[j]
+            vector_x = ax * X + bx * Y
+            vector_y = ay * X + by * Y
+            xmj = vector_x * a_moon + x_bary
+            ymj = vector_y * a_moon + b_bary
+            xpj = -vector_x * a_planet + x_bary
+            ypj = -vector_y * a_planet + b_bary
+            xmr[j] = xmj
+            ymr[j] = ymj
+            xpr[j] = xpj
+            ypr[j] = ypj
+            zmr[j] = xmj * xmj + ymj * ymj
+            zpr[j] = xpj * xpj + ypj * ypj
+        m += cnt
     return xm, ym, xp, yp, zm2, zp2
