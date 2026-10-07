@@ -617,14 +617,10 @@ def pandora_loglike(
         occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
         cache, eclipse_pixelmap, time_sorted
     )
-    out_idx, ft = _window_cadences_total(
-        len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
+    chi2 = chi2_flat + _window_chi2(
+        len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor,
+        data, inv_err, flat_terms
     )
-    chi2 = chi2_flat
-    for k in range(len(out_idx)):
-        i = out_idx[k]
-        r = (ft[k] - data[i]) * inv_err[i]
-        chi2 += r * r - flat_terms[i]
     return -0.5 * chi2
 
 
@@ -971,40 +967,60 @@ def _window_cadences(n, idx, flux_planet_w, flux_moon_w, supersampling_factor):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _window_cadences_total(n, idx, flux_planet_w, flux_moon_w, supersampling_factor):
-    """Total flux only, as (out_idx, flux_total) of _window_cadences()
-    (same values; for the likelihood, which needs no planet/moon outputs)."""
+def _window_chi2(n, idx, flux_planet_w, flux_moon_w, supersampling_factor,
+                 data, inv_err, flat_terms):
+    """chi^2 part of the window cadences, sum of ((f - data) inv_err)^2 -
+    flat_terms over them (see pandora_loglike), for the total flux f of the
+    output cadences touched by the ascending window indices idx: the same
+    cadences and block means as _window_cadences(), to ~2e-16 (the
+    per-sample total deficit (1 - f_planet) + (1 - f_moon) is summed per
+    block, not planet and moon separately). P13: no cadence arrays (fused
+    with the chi^2), and fixed-length sums over contiguous runs. Since P11
+    the window is one contiguous sample run per epoch, so after a run's
+    first (partial) block the following blocks are full: one comparison,
+    idx[j + factor - 1] == end + factor - 1 (end: the end of the previous
+    block; idx is strictly ascending), proves the next block full, which
+    then needs no integer division and no per-sample end test. The
+    general path takes the first and last block of a run and any other
+    index pattern (unsorted-time scan, gaps)."""
     m = len(idx)
+    chi2 = 0.0
     if supersampling_factor <= 1:
-        flux_total_w = np.empty(m)
         for j in range(m):
-            flux_total_w[j] = flux_moon_w[j] + flux_planet_w[j] - 1
-        return idx, flux_total_w
+            i = idx[j]
+            r = (flux_moon_w[j] + flux_planet_w[j] - 1 - data[i]) * inv_err[i]
+            chi2 += r * r - flat_terms[i]
+        return chi2
 
     factor = supersampling_factor
-    out_idx = np.empty(m, dtype=np.int64)
-    flux_total = np.empty(m)
     j = 0
-    k = 0
     while j < m:
+        # General block (first block of a run, partial blocks, gaps)
         out = idx[j] // factor
         start = out * factor
         end = start + factor
         if end > n:
             end = n
-        length = end - start
-        dp = 0.0
-        dm = 0.0
+        s = 0.0
         while j < m and idx[j] < end:
-            dp += 1.0 - flux_planet_w[j]
-            dm += 1.0 - flux_moon_w[j]
+            s += (1.0 - flux_planet_w[j]) + (1.0 - flux_moon_w[j])
             j += 1
-        dp /= length
-        dm /= length
-        out_idx[k] = out
-        flux_total[k] = 1.0 - (dp + dm)
-        k += 1
-    return out_idx[:k], flux_total[:k]
+        r = (1.0 - s / (end - start) - data[out]) * inv_err[out]
+        chi2 += r * r - flat_terms[out]
+        # Full blocks continuing the run. Here idx[j] >= end (all samples
+        # below end are consumed), so idx[j + factor - 1] == end + factor - 1
+        # alone proves idx[j:j + factor] == end, ..., end + factor - 1 (and
+        # end + factor <= n, since idx < n)
+        while j + factor <= m and idx[j + factor - 1] == end + factor - 1:
+            s = 0.0
+            for i in range(j, j + factor):
+                s += (1.0 - flux_planet_w[i]) + (1.0 - flux_moon_w[i])
+            out += 1
+            r = (1.0 - s / factor - data[out]) * inv_err[out]
+            chi2 += r * r - flat_terms[out]
+            j += factor
+            end += factor
+    return chi2
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
