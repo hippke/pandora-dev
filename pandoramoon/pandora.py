@@ -1015,8 +1015,10 @@ def _window_model_runs(
             )
         # P24b: if the orbit's geometry rules out a planet-moon eclipse
         # (~90 % of the draws), only z is needed: no positions, no
-        # eclipse_possible() pass (circular moons only)
-        no_eclipse = ecc_moon == 0 and eclipse_impossible_circular(a_moon, i_moon, r_planet, r_moon)
+        # eclipse_possible() pass. P7e: an eccentric orbit's separation is
+        # >= a (1 - e), so the same bound with a (1 - e) (positions are still
+        # computed, but the eclipse_possible() pass is skipped)
+        no_eclipse = eclipse_impossible_circular(a_moon * (1 - ecc_moon), i_moon, r_planet, r_moon)
         if ecc_moon != 0:
             # P7c: eccentric moon on the runs (x_bary inline)
             xm, ym, xp, yp, zm2, zp2 = ellipse_ecc_z_runs(

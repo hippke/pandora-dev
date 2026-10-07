@@ -131,7 +131,10 @@ def eclipse_impossible_circular(a, i, r_planet, r_moon):
     absolute 1e-12 R_star) cover the rounding of the positions (a few ulp of
     |x_bary| + a) and of sincos_turns (|v|^2 = 1 +- 1e-15); with them this
     never claims "impossible" where eclipse_possible() could count a sample.
-    NaN gives False."""
+    NaN gives False. P7e: for an eccentric moon pass a (1 - e): the
+    separation is a (1 - e cos E) >= a (1 - e) times the same projection
+    factor, and the solver's (cos E, sin E) are within ~1e-15 (inside the
+    margins)."""
     cos_i = cos(i / 180 * pi)
     return abs(a * cos_i) * (1 - 1e-9) - 1e-12 > r_planet + r_moon
 
