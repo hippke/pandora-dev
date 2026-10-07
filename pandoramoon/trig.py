@@ -49,14 +49,16 @@ def sincos_turns(u):
     z = r * r
     s = r + r * z * (S1 + z * (S2 + z * (S3 + z * (S4 + z * (S5 + z * S6)))))
     c = 1.0 - 0.5 * z + z * z * (C1 + z * (C2 + z * (C3 + z * (C4 + z * (C5 + z * C6)))))
-    k = np.int64(q) & 3
-    if (k & 1) == 1:
-        s, c = c, s
-    if k == 1 or k == 2:
-        c = -c
-    if k >= 2:
-        s = -s
-    return s, c
+    # quadrant select on the float q in {-2, ..., 2} (q mod 4 = 0, 1, 2, 3, 2
+    # for q = 0, 1, 2, -1, -2): no float -> int conversion, which AVX2 has
+    # no vector instruction for (P24: 4 scalar vcvttsd2si per vector)
+    aq = abs(q)
+    odd = aq == 1.0
+    s2 = c if odd else s
+    c2 = s if odd else c
+    c2 = -c2 if (q == 1.0) | (aq == 2.0) else c2
+    s2 = -s2 if (q == -1.0) | (aq == 2.0) else s2
+    return s2, c2
 
 
 # fdlibm e_asin / e_acos rational kernel R(z) ~ (asin(sqrt z) / sqrt z - 1) / z
