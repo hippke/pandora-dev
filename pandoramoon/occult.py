@@ -607,6 +607,60 @@ def _occult_series_batch(zb, m, a, A0, A1, flux):
 
 assert SERIES_M == 11 and SERIES_ALPHA.shape == (12, 12)  # _occult_series_batch is unrolled for 11
 
+# P23: block length of the per-sample path's pass 1 (vectorised counts and
+# series per block; blocks without exact samples are not scanned again)
+BLOCK_N = 32
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
+def _occult_series_select(zs, lo, hi, a, A0, A1, z_c, one_k, flux):
+    """P23: flux[i] = 1 off the star (z >= 1 + k or z < 0), else the P14
+    series at min(z, z_c) (the same arithmetic as _occult_series_batch for
+    z < z_c; the other samples are overwritten by the exact model), for
+    lo <= i < hi, branch-free (vectorised). Returns the number of samples
+    that need the exact model (z_c <= z < 1 + k). The arrays are sliced
+    here, not by the caller: views passed into it made the whole pass
+    ~1.5x slower (cf. PERFORMANCE_LOG.md §29.1)."""
+    zr = zs[lo:hi]
+    fr = flux[lo:hi]
+    a0 = a[0]
+    a1 = a[1]
+    a2 = a[2]
+    a3 = a[3]
+    a4 = a[4]
+    a5 = a[5]
+    a6 = a[6]
+    a7 = a[7]
+    a8 = a[8]
+    a9 = a[9]
+    a10 = a[10]
+    a11 = a[11]
+    c = 0
+    for j in range(hi - lo):
+        z = zr[j]
+        zz = min(max(z, 0.0), z_c)
+        z2 = zz * zz
+        w = 1 - z2
+        v = 1 / w
+        P = a11
+        P = P * v + a10
+        P = P * v + a9
+        P = P * v + a8
+        P = P * v + a7
+        P = P * v + a6
+        P = P * v + a5
+        P = P * v + a4
+        P = P * v + a3
+        P = P * v + a2
+        P = P * v + a1
+        P = P * v + a0
+        f = A0 + A1 * z2 - np.sqrt(w) * P
+        f = f if f < 1 else 1.0
+        off = (z >= one_k) | (z < 0)
+        fr[j] = 1.0 if off else f
+        c += 1 if (z >= z_c) & (z < one_k) else 0
+    return c
+
 
 # ---------------------------------------------------------------------------
 # P21b: per-call polynomial interpolant of the limb band 1 - k <= z < 1 + k
@@ -977,7 +1031,7 @@ def _hybrid_zcut(k, u1, u2, series_tol):
 # to a slow unrolled form), then sample by sample.
 STRETCH_BLOCK = 64
 STRETCH_MIN_AVG = 64    # stretch path only if stretches are this long on average
-STRETCH_STRIDE = 8      # _long_stretches() looks at every 8th sample
+STRETCH_PROBES = 128    # _long_stretches() looks at this many samples (P23)
 STRETCH_MIN_N = 2048    # shorter inputs: per-sample path. The stretch pass
                         # gains ~1 ns per sample on PLATO windows (~5400
                         # samples); on ~1200-sample windows (Kepler, 5x
@@ -986,20 +1040,29 @@ STRETCH_MIN_N = 2048    # shorter inputs: per-sample path. The stretch pass
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _long_stretches(zs, k, z_c):
-    """True if the class (off star / series / exact) of every
-    STRETCH_STRIDE-th sample changes rarely enough that the stretches
-    average >= STRETCH_MIN_AVG samples (cheap estimate; a wrong guess only
-    costs speed)"""
+    """True if the class (off star / series / exact) changes rarely enough
+    that the stretches average >= STRETCH_MIN_AVG samples: cheap estimate
+    from STRETCH_PROBES evenly spaced samples (P23; before: every 8th
+    sample, ~0.3 us per call on PLATO windows), branch-free classes. A
+    change between two probes is seen at most once, so smooth inputs are
+    estimated well; on shuffled input about half the probe pairs differ,
+    hence also changes <= STRETCH_PROBES / 4. A wrong guess only costs
+    speed."""
     n_z = len(zs)
+    n_p = min(STRETCH_PROBES, n_z)
+    if n_p < 2:
+        return False
     one_k = 1 + k
+    step = (n_z - 1) // (n_p - 1)
     changes = 0
     prev = -1
-    for i in range(0, n_z, STRETCH_STRIDE):
-        z = zs[i]
-        c = 0 if (z >= one_k or z < 0) else (1 if z < z_c else 2)
+    for p in range(n_p):
+        z = zs[p * step]
+        c = (1 if (z >= 0) & (z < one_k) else 0) * (2 if z >= z_c else 1)
         changes += 1 if c != prev else 0
         prev = c
-    return changes * STRETCH_MIN_AVG <= n_z
+    changes -= 1                       # the first probe is not a change
+    return changes * STRETCH_MIN_AVG <= n_z and changes * 4 <= n_p
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
@@ -1078,7 +1141,7 @@ def _occult_hybrid_stretches(zs, k, u1, u2, z_c, limb):
     full = k >= 1
     km1 = k - 1
     idx = np.empty(n_z, dtype=np.int64)
-    zb = np.empty(n_z)
+    zb = np.empty(n_z + 3)                 # + 3: padding of the exact batch (P25)
     # P21b: limb stretches 1 - k <= z < 1 + k, kept as ranges [rl[2r], rl[2r+1])
     one_mk = 1 - k if limb else one_k
     rl = np.empty(n_z + 2 if limb else 0, dtype=np.int64)
@@ -1143,9 +1206,14 @@ def _occult_hybrid_stretches(zs, k, u1, u2, z_c, limb):
                 ir[q] = lo + q
             m += cnt
     if m > 0:
-        fb = np.empty(m)
-        dev = np.empty(m)
-        _occult_exact_batch(zb, m, k, c1, c2, u2, omega, fb, dev)
+        # P25: pad to a multiple of 4 lanes when that replaces >= 2 scalar
+        # remainder lanes (~25 ns each)
+        mp = m + (4 - m % 4) % 4 if m % 4 >= 2 else m
+        for q in range(m, mp):
+            zb[q] = zb[m - 1]
+        fb = np.empty(mp)
+        dev = np.empty(mp)
+        _occult_exact_batch(zb, mp, k, c1, c2, u2, omega, fb, dev)
         # non-converged lanes (scalar), clamp, scatter
         for j in range(m):
             f = fb[j]
@@ -1159,11 +1227,15 @@ def _occult_hybrid_stretches(zs, k, u1, u2, z_c, limb):
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _occult_hybrid_samples(zs, k, u1, u2, z_c, limb):
-    """_occult_hybrid() with a per-sample pass 1 (before P12 this was
-    _occult_hybrid; still used for inputs without long stretches, e.g.
-    unsorted time); z_c from _hybrid_zcut(); limb: use the P21b limb
-    interpolant if >= LIMB_MIN_LANES samples lie on 1 - k <= z < 1 + k
-    (only for 0 < k <= LIMB_K_MAX). The model:
+    """_occult_hybrid() for inputs without long stretches (before P12 this
+    was _occult_hybrid; used for windows below STRETCH_MIN_N samples, e.g.
+    Kepler, and unsorted time); z_c from _hybrid_zcut(); limb: use the
+    P21b limb interpolant if >= LIMB_MIN_LANES samples lie on
+    1 - k <= z < 1 + k (only for 0 < k <= LIMB_K_MAX). Since P23 the
+    series is evaluated in place for every sample of a block with any
+    on-star sample (select instead of classify / gather / scatter), and
+    only the exact samples are collected, from the blocks that hold any;
+    same values as before (the series arithmetic is unchanged). The model:
 
     Until P3 this switched to a "linear interpolation" correction of the
     small-body approximation for k <= 0.05 (z <= 0.65 ... 0.98); that zone
@@ -1199,86 +1271,120 @@ def _occult_hybrid_samples(zs, k, u1, u2, z_c, limb):
     omega = 1 / (1 - u1 / 3 - u2 / 6)
     c1 = 1 - u1 - 2 * u2
     c2 = u1 + 2 * u2
-
-    # Pass 1: classify; collect the on-star samples: interior series
-    # (z < z_c, P14) from the front of zb / idx, exact model from the back;
-    # with limb (P21b) the band 1 - k <= z < 1 + k goes to zb[n_z:] (right
-    # after the exact ones, so that it can join their batch if it is short)
     kk = k2 * omega
-    one_mk = 1 - k if limb else 1 + k      # 1 + k: no sample is a limb sample
-    nb = 2 * n_z if limb else n_z
-    idx = np.empty(nb, dtype=np.int64)
-    zb = np.empty(nb)
-    ms = 0
-    me = n_z
-    ml = n_z
-    for i in range(n_z):
-        z = zs[i]
-        # The closed-form operands (P15) are exact down to |z - k| = 1 ulp;
-        # only z == k itself (C = 3 (z + k) / (z - k)) moves, by one ulp
-        # (k + k 2^-52 is at least the next float above k). Z_K_MIN keeps
-        # 1 / |z - k| finite for k < ~1e-134, where ulps are smaller.
-        if abs(z - k) < Z_K_MIN:
-            z = k + max(k * 2.220446049250313e-16, Z_K_MIN)
+    one_k = 1 + k
 
-        # Source is unocculted
-        if z >= 1 + k or z < 0:
-            flux[i] = 1
-            continue
-
-        # The source is completely occulted
-        elif k >= 1 and z <= k - 1:
-            flux[i] = 0
-            continue
-
-        if z < z_c:
-            zb[ms] = z
-            idx[ms] = i
-            ms += 1
-        elif z >= one_mk:
-            zb[ml] = z
-            idx[ml] = i
-            ml += 1
+    # Pass 1 (P23), per block of BLOCK_N samples: a vectorised count of the
+    # on-star samples; blocks without any are filled with 1, the others get
+    # the interior series (or 1 off the star) for every sample, branch-free,
+    # in place, with a count of the samples that need the exact model
+    # (z_c <= z < 1 + k; z < 0 counts as off the star, as before). No
+    # per-sample classification, gather or scatter
+    # for the series; the exact samples are collected in pass 2 from the
+    # blocks that hold any.
+    have_series = z_c > 0
+    a = _series_coeffs(k, kk * c2) if have_series else np.zeros(SERIES_M + 1)
+    A0 = 1 - kk * ((1 - u1 - u2) - u2 * (1 - k2 / 2))
+    A1 = -kk * u2
+    n_b = (n_z + BLOCK_N - 1) // BLOCK_N
+    cnt = np.empty(n_b, dtype=np.int64)
+    tot = 0
+    for b in range(n_b):
+        lo = b * BLOCK_N
+        hi = min(lo + BLOCK_N, n_z)
+        zr = zs[lo:hi]
+        fr = flux[lo:hi]
+        on = 0
+        for q in range(hi - lo):
+            on += 1 if (zr[q] >= 0) & (zr[q] < one_k) else 0
+        if on == 0:
+            for q in range(hi - lo):
+                fr[q] = 1.0
+            c = 0
+        elif have_series:
+            c = _occult_series_select(zs, lo, hi, a, A0, A1, z_c, one_k, flux)
         else:
-            me -= 1
-            zb[me] = z
-            idx[me] = i
-    n_l = ml - n_z
+            c = on
+            for q in range(hi - lo):
+                fr[q] = 1.0
+        cnt[b] = c
+        tot += c
+    if tot == 0:
+        return flux
+
+    # Pass 2: collect the exact samples of the blocks that hold any: band
+    # (z_c <= z < 1 - k) from the front of zb / idx, with limb (P21b) the
+    # limb band 1 - k <= z < 1 + k from zb[n_z + 4:] (if short, it joins
+    # the band's batch); fully occulted samples (k >= 1) get 0
+    one_mk = 1 - k if limb else one_k      # one_k: no sample is a limb sample
+    full = k >= 1
+    km1 = k - 1
+    # (buffers sized by n_z, not tot: safe even if a scalar comparison
+    # below disagreed with the vectorised count)
+    idx = np.empty(2 * n_z + 4, dtype=np.int64)
+    zb = np.empty(2 * n_z + 4)
+    m = 0
+    l0 = n_z + 4
+    ml = l0
+    for b in range(n_b):
+        if cnt[b] == 0:
+            continue
+        lo = b * BLOCK_N
+        hi = min(lo + BLOCK_N, n_z)
+        for i in range(lo, hi):
+            z = zs[i]
+            if not (z >= z_c and z < one_k):
+                continue
+            if full and z <= km1:          # the source is completely occulted
+                flux[i] = 0.0
+                continue
+            # The closed-form operands (P15) are exact down to |z - k| = 1 ulp;
+            # only z == k itself (C = 3 (z + k) / (z - k)) moves, by one ulp
+            # (k + k 2^-52 is at least the next float above k). Z_K_MIN keeps
+            # 1 / |z - k| finite for k < ~1e-134, where ulps are smaller.
+            if abs(z - k) < Z_K_MIN:
+                z = k + max(k * 2.220446049250313e-16, Z_K_MIN)
+            if z >= one_mk:
+                zb[ml] = z
+                idx[ml] = i
+                ml += 1
+            else:
+                zb[m] = z
+                idx[m] = i
+                m += 1
+    n_l = ml - l0
     use_limb = n_l >= LIMB_MIN_LANES
-    m = (n_z if use_limb else ml) - me
+    if not use_limb:
+        for q in range(n_l):
+            zb[m + q] = zb[l0 + q]
+            idx[m + q] = idx[l0 + q]
+        m += n_l
 
-    # Pass 2a: interior series (vectorised), written straight to flux
-    fb = np.empty(max(ms, m, n_l if use_limb else 0))
-    if ms > 0:
-        a = _series_coeffs(k, kk * c2)
-        A0 = 1 - kk * ((1 - u1 - u2) - u2 * (1 - k2 / 2))
-        _occult_series_batch(zb, ms, a, A0, -kk * u2, fb)
-        for j in range(ms):
-            flux[idx[j]] = fb[j]
-
-    # Pass 2b: exact flux of the other on-star samples (vectorised)
-    zx = zb[me:me + m]
-    ix = idx[me:me + m]
-    dev = np.empty(m)
-    _occult_exact_batch(zx, m, k, c1, c2, u2, omega, fb, dev)
-
-    # Pass 3: non-converged lanes (scalar), clamp, scatter. The limb's
-    # arccos terms are in the batch since P16.
-    for j in range(m):
-        f = fb[j]
-        if not dev[j] <= 0:
-            f = _occult_point(zx[j], k, u1, u2)
-        # Some combinations of (u1,u2) cause flux>1 which is unphysical
-        if f > 1:
-            f = 1
-        flux[ix[j]] = f
+    # Pass 3: exact flux (vectorised; P25: padded to a multiple of 4 lanes
+    # when that replaces >= 2 scalar remainder lanes, ~25 ns each), then
+    # non-converged lanes (scalar), clamp, scatter. The limb's arccos
+    # terms are in the batch since P16.
+    if m > 0:
+        mp = m + (4 - m % 4) % 4 if m % 4 >= 2 else m
+        for q in range(m, mp):
+            zb[q] = zb[m - 1]
+        fb = np.empty(mp)
+        dev = np.empty(mp)
+        _occult_exact_batch(zb, mp, k, c1, c2, u2, omega, fb, dev)
+        for j in range(m):
+            f = fb[j]
+            if not dev[j] <= 0:
+                f = _occult_point(zb[j], k, u1, u2)
+            # Some combinations of (u1,u2) cause flux>1 which is unphysical
+            if f > 1:
+                f = 1
+            flux[idx[j]] = f
 
     # Pass 4 (P21b): limb band by the per-call interpolant (clamped)
     if use_limb:
         coef = _limb_coeffs(k, u1, u2)
-        zl = zb[n_z:ml]
-        il = idx[n_z:ml]
-        _occult_limb_batch(zl, n_l, k, coef, fb)
+        fl = np.empty(n_l)
+        _occult_limb_batch(zb[l0:ml], n_l, k, coef, fl)
         for j in range(n_l):
-            flux[il[j]] = fb[j]
+            flux[idx[l0 + j]] = fl[j]
     return flux
