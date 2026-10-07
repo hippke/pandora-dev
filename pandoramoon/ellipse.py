@@ -71,8 +71,9 @@ def ellipse_ecc(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary):
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def ellipse_z(a, per, tau, Omega, i, time, x_bary, mass_ratio, b_bary):
-    """ellipse() fused into one loop that also returns the distances from the
-    stellar centre: (xm, ym, xp, yp, zm, zp). No full-length temporaries
+    """ellipse() fused into one loop that also returns the squared distances
+    from the stellar centre: (xm, ym, xp, yp, zm2, zp2), z2 = x^2 + y^2 (P26:
+    the occultations take z^2, so no sqrt here). No full-length temporaries
     (used by the culled likelihood path). The phase is reduced in turns and
     sin/cos come from trig.sincos_turns() (P7), so the loop vectorises; it
     agrees with ellipse() to the ulp of ellipse()'s phase argument 2 pi
@@ -89,8 +90,8 @@ def ellipse_z(a, per, tau, Omega, i, time, x_bary, mass_ratio, b_bary):
     ym = np.empty(n)
     xp = np.empty(n)
     yp = np.empty(n)
-    zm = np.empty(n)
-    zp = np.empty(n)
+    zm2 = np.empty(n)
+    zp2 = np.empty(n)
     t_ref = tau * per
     for j in range(n):
         # moon phase in turns; vectorisable sincos (P7) instead of libm
@@ -105,9 +106,9 @@ def ellipse_z(a, per, tau, Omega, i, time, x_bary, mass_ratio, b_bary):
         ym[j] = ymj
         xp[j] = xpj
         yp[j] = ypj
-        zm[j] = sqrt(xmj ** 2 + ymj ** 2)
-        zp[j] = sqrt(xpj ** 2 + ypj ** 2)
-    return xm, ym, xp, yp, zm, zp
+        zm2[j] = xmj * xmj + ymj * ymj
+        zp2[j] = xpj * xpj + ypj * ypj
+    return xm, ym, xp, yp, zm2, zp2
 
 
 # P24d: the orbit loops on the runs evaluate the moon's phase in blocks of
@@ -153,7 +154,8 @@ def ellipse_z_runs(
     and read back. Same output as ellipse_z() on the materialised window,
     to the ulp of the phase (t - tau per) / per: the phase comes from block
     anchors plus a small-angle polynomial of t - t_anchor (P24d, see
-    ANCHOR_BMIN)."""
+    ANCHOR_BMIN). Returns (xm, ym, xp, yp, zm2, zp2) with the squared
+    distances z2 = x^2 + y^2 (P26: no sqrt per sample)."""
     O = Omega / 180 * pi
     inc = i / 180 * pi
     cos_O = cos(O)
@@ -170,8 +172,8 @@ def ellipse_z_runs(
     ym = np.empty(n)
     xp = np.empty(n)
     yp = np.empty(n)
-    zm = np.empty(n)
-    zp = np.empty(n)
+    zm2 = np.empty(n)
+    zp2 = np.empty(n)
     t_ref = tau * per
     omega = abs(TWO_PI / per)
     m = 0
@@ -194,8 +196,8 @@ def ellipse_z_runs(
             ymr = ym[m + b0:m + b1]
             xpr = xp[m + b0:m + b1]
             ypr = yp[m + b0:m + b1]
-            zmr = zm[m + b0:m + b1]
-            zpr = zp[m + b0:m + b1]
+            zmr = zm2[m + b0:m + b1]
+            zpr = zp2[m + b0:m + b1]
             if max(ta - trb[0], trb[nb - 1] - ta) * omega <= SMALL_PHI_MAX:
                 # Q = Q_a + phi: (cos Q, sin Q) = R(phi) (cos Q_a, sin Q_a),
                 # folded into the projection
@@ -218,8 +220,8 @@ def ellipse_z_runs(
                     ymr[j] = ymj
                     xpr[j] = xpj
                     ypr[j] = ypj
-                    zmr[j] = sqrt(xmj ** 2 + ymj ** 2)
-                    zpr[j] = sqrt(xpj ** 2 + ypj ** 2)
+                    zmr[j] = xmj * xmj + ymj * ymj
+                    zpr[j] = xpj * xpj + ypj * ypj
             else:
                 for j in range(nb):
                     t = trb[j]
@@ -235,10 +237,10 @@ def ellipse_z_runs(
                     ymr[j] = ymj
                     xpr[j] = xpj
                     ypr[j] = ypj
-                    zmr[j] = sqrt(xmj ** 2 + ymj ** 2)
-                    zpr[j] = sqrt(xpj ** 2 + ypj ** 2)
+                    zmr[j] = xmj * xmj + ymj * ymj
+                    zpr[j] = xpj * xpj + ypj * ypj
         m += cnt
-    return xm, ym, xp, yp, zm, zp
+    return xm, ym, xp, yp, zm2, zp2
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
@@ -246,7 +248,7 @@ def ellipse_z_only_runs(
     a, per, tau, Omega, i, time, los, his, c_t, c_d, tdur, t0_shift_planet,
     mass_ratio, b_bary
 ):
-    """ellipse_z_runs() without the positions: (zm, zp) only (P24b). For
+    """ellipse_z_runs() without the positions: (zm2, zp2) only (P24b). For
     draws where no planet-moon eclipse is possible
     (eclipse.eclipse_impossible_circular), the positions are not needed;
     two output arrays instead of six (fewer stores and allocations), same
@@ -264,8 +266,8 @@ def ellipse_z_only_runs(
     n = 0
     for k in range(len(los)):
         n += his[k] - los[k]
-    zm = np.empty(n)
-    zp = np.empty(n)
+    zm2 = np.empty(n)
+    zp2 = np.empty(n)
     t_ref = tau * per
     omega = abs(TWO_PI / per)
     m = 0
@@ -281,8 +283,8 @@ def ellipse_z_only_runs(
             nb = b1 - b0
             ta = tr[b0 + (nb >> 1)]
             trb = tr[b0:b1]
-            zmr = zm[m + b0:m + b1]
-            zpr = zp[m + b0:m + b1]
+            zmr = zm2[m + b0:m + b1]
+            zpr = zp2[m + b0:m + b1]
             if max(ta - trb[0], trb[nb - 1] - ta) * omega <= SMALL_PHI_MAX:
                 s_a, c_a = sincos_turns((ta - t_ref) / per)
                 vxc = cos_O * c_a - sc * s_a
@@ -299,8 +301,8 @@ def ellipse_z_only_runs(
                     ymj = vector_y * a_moon + b_bary
                     xpj = -vector_x * a_planet + x_bary
                     ypj = -vector_y * a_planet + b_bary
-                    zmr[j] = sqrt(xmj ** 2 + ymj ** 2)
-                    zpr[j] = sqrt(xpj ** 2 + ypj ** 2)
+                    zmr[j] = xmj * xmj + ymj * ymj
+                    zpr[j] = xpj * xpj + ypj * ypj
             else:
                 for j in range(nb):
                     t = trb[j]
@@ -312,10 +314,10 @@ def ellipse_z_only_runs(
                     ymj = vector_y * a_moon + b_bary
                     xpj = -vector_x * a_planet + x_bary
                     ypj = -vector_y * a_planet + b_bary
-                    zmr[j] = sqrt(xmj ** 2 + ymj ** 2)
-                    zpr[j] = sqrt(xpj ** 2 + ypj ** 2)
+                    zmr[j] = xmj * xmj + ymj * ymj
+                    zpr[j] = xpj * xpj + ypj * ypj
         m += cnt
-    return zm, zp
+    return zm2, zp2
 
 
 # P10: per-body windows inside the epoch runs. Moon cells span about
@@ -616,8 +618,9 @@ def ellipse_subruns(
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary):
-    """ellipse_ecc() fused into one loop that also returns the distances from
-    the stellar centre: (xm, ym, xp, yp, zm, zp). Same formulas per sample,
+    """ellipse_ecc() fused into one loop that also returns the squared
+    distances from the stellar centre: (xm, ym, xp, yp, zm2, zp2) (P26, as
+    ellipse_z()). Same formulas per sample,
     including the per-sample reflection M > pi (bug #2)."""
     w_rad = w / 180 * pi
     cos_i = cos(i / 180 * pi)
@@ -632,8 +635,8 @@ def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary)
     ym = np.empty(n)
     xp = np.empty(n)
     yp = np.empty(n)
-    zm = np.empty(n)
-    zp = np.empty(n)
+    zm2 = np.empty(n)
+    zp2 = np.empty(n)
     for j in range(n):
         M = (2 * pi / per) * (time[j] - (tau * per))
         M = M - (np.floor(M / (2 * pi)) * 2 * pi)
@@ -668,6 +671,6 @@ def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary)
         ym[j] = ymj
         xp[j] = xpj
         yp[j] = ypj
-        zm[j] = sqrt(xmj ** 2 + ymj ** 2)
-        zp[j] = sqrt(xpj ** 2 + ypj ** 2)
-    return xm, ym, xp, yp, zm, zp
+        zm2[j] = xmj * xmj + ymj * ymj
+        zp2[j] = xpj * xpj + ypj * ypj
+    return xm, ym, xp, yp, zm2, zp2

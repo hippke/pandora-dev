@@ -13,7 +13,7 @@ from pandoramoon.ellipse import (
     ellipse_subruns,
     subrun_cell_dt, subruns_pay
 )
-from pandoramoon.occult import occult, occult_small, occult_hybrid, create_occult_cache, read_occult_cache
+from pandoramoon.occult import occult, occult_small, occult_hybrid, occult_hybrid_z2, create_occult_cache, read_occult_cache
 from pandoramoon.helpers import resample
 from pandoramoon.grids import (
     timegrid, x_bary_grid, x_bary_window, x_bary_window_sorted, x_bary_window_sorted_t,
@@ -714,20 +714,21 @@ def _orbit_z(
     time, x_bary, unphysical, a_moon, per_moon, tau_moon, Omega_moon, w_moon,
     i_moon, ecc_moon, mass_ratio, b_bary
 ):
-    """_orbit() plus the distances from the stellar centre, in one fused
-    loop per sample: (xm, ym, xp, yp, zm, zp). For the culled path
-    (_window_model); pandora() keeps _orbit() and _window_fluxes()."""
+    """_orbit() plus the squared distances from the stellar centre, in one
+    fused loop per sample: (xm, ym, xp, yp, zm2, zp2) (P26: z^2, the
+    occultations take it). For the culled path (_window_model); pandora()
+    keeps _orbit() and _window_fluxes()."""
     if unphysical:
         n = len(x_bary)
         xp = x_bary
         yp = np.full(n, b_bary)
         xm = np.full(n, 1e8)
         ym = xm.copy()
-        zp = np.empty(n)
+        zp2 = np.empty(n)
         for j in range(n):
-            zp[j] = sqrt(xp[j] ** 2 + b_bary ** 2)
-        zm = xm.copy()
-        return xm, ym, xp, yp, zm, zp
+            zp2[j] = xp[j] * xp[j] + b_bary * b_bary
+        zm2 = np.full(n, 1e16)
+        return xm, ym, xp, yp, zm2, zp2
     if ecc_moon == 0:
         return ellipse_z(
             a_moon, per_moon, tau_moon, Omega_moon, i_moon, time, x_bary,
@@ -780,55 +781,56 @@ def _window_fluxes(
     occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
 ):
     """Planet and moon flux (incl. mutual eclipses) for the given samples"""
-    # Distances of planet and moon from (0,0) = center of star
-    # Not sufficient to only calculate z in ellipse func: 
-    # We also need full coordinates to determine mutual eclipses below
-    z_planet = sqrt(xp ** 2 + yp ** 2)
+    # Squared distances of planet and moon from (0,0) = center of star (P26:
+    # the occultations take z^2). Not sufficient to only calculate z in
+    # ellipse func: we also need full coordinates for mutual eclipses below
+    z2_planet = xp * xp + yp * yp
     if unphysical:
-        z_moon = xm.copy()
+        z2_moon = xm * xm      # moon far off the star (1e8)
     else:
-        z_moon = sqrt(xm ** 2 + ym ** 2)
+        z2_moon = xm * xm + ym * ym
     return _window_fluxes_z(
-        xp, yp, xm, ym, z_planet, z_moon, unphysical, r_planet, r_moon, u1, u2,
+        xp, yp, xm, ym, z2_planet, z2_moon, unphysical, r_planet, r_moon, u1, u2,
         occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
     )
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _window_fluxes_z(
-    xp, yp, xm, ym, z_planet, z_moon, unphysical, r_planet, r_moon, u1, u2,
+    xp, yp, xm, ym, z2_planet, z2_moon, unphysical, r_planet, r_moon, u1, u2,
     occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
 ):
-    """_window_fluxes() with precomputed distances z_planet, z_moon.
-    unphysical=True also means "no eclipse()": the positions xp, yp, xm, ym
-    are then not read (P24b passes empty arrays)."""
+    """_window_fluxes() with precomputed squared distances z2_planet,
+    z2_moon (P26: occult_hybrid_z2 takes z^2; only the cache and
+    occult_small take z = sqrt(z^2)). unphysical=True also means "no
+    eclipse()": the positions xp, yp, xm, ym are then not read (P24b passes
+    empty arrays)."""
     # Cached Mandel-Agol occultation model for planet < 0.1, else hybrid
     if cache is not None and r_planet < 0.1:
         if r_planet < cache[1][0]:
             # k below the cache grid: use exact small-body approximation
-            flux_planet = occult_small(zs=z_planet, k=r_planet, u1=u1, u2=u2)
+            flux_planet = occult_small(zs=sqrt(z2_planet), k=r_planet, u1=u1, u2=u2)
         else:
             flux_planet = read_occult_cache(
-                zs_target=z_planet, 
-                k=r_planet, 
+                zs_target=sqrt(z2_planet),
+                k=r_planet,
                 cache=cache
             )
     else:
-        flux_planet = occult_hybrid(zs=z_planet, u1=u1, u2=u2, k=r_planet)
-        #flux_planet = occult(zs=z_planet, u1=u1, u2=u2, k=r_planet)
-    
+        flux_planet = occult_hybrid_z2(z2_planet, r_planet, u1, u2)
+
     # For moon transit: small-body approximation only if the user sets
     # occult_small_threshold > 0 (default 0: exact, bug #9)
     if r_moon < occult_small_threshold:
-        flux_moon = occult_small(zs=z_moon, k=r_moon, u1=u1, u2=u2)
+        flux_moon = occult_small(zs=sqrt(z2_moon), k=r_moon, u1=u1, u2=u2)
     elif cache is not None and r_moon < 0.1:
         if r_moon < cache[1][0]:
             # k below the cache grid: use exact small-body approximation
-            flux_moon = occult_small(zs=z_moon, k=r_moon, u1=u1, u2=u2)
+            flux_moon = occult_small(zs=sqrt(z2_moon), k=r_moon, u1=u1, u2=u2)
         else:
-            flux_moon = read_occult_cache(zs_target=z_moon, k=r_moon, cache=cache)
+            flux_moon = read_occult_cache(zs_target=sqrt(z2_moon), k=r_moon, cache=cache)
     else:
-        flux_moon = occult_hybrid(zs=z_moon, k=r_moon, u1=u1, u2=u2)
+        flux_moon = occult_hybrid_z2(z2_moon, r_moon, u1, u2)
 
     # Mutual planet-moon occultations; skipped when no sample can overlap
     # (P5: one vectorised min-distance pass instead of eclipse()'s per-sample
@@ -908,12 +910,12 @@ def _window_model(
             ecc_bary, w_bary, reach
         )
         time_w = time[idx]
-    xm, ym, xp, yp, zm, zp = _orbit_z(
+    xm, ym, xp, yp, zm2, zp2 = _orbit_z(
         time_w, x_bary, unphysical, a_moon, per_moon, tau_moon,
         Omega_moon, w_moon, i_moon, ecc_moon, M_moon / M_planet, b_bary
     )
     flux_planet_w, flux_moon_w = _window_fluxes_z(
-        xp, yp, xm, ym, zp, zm, unphysical, r_planet, r_moon, u1, u2,
+        xp, yp, xm, ym, zp2, zm2, unphysical, r_planet, r_moon, u1, u2,
         occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
     )
     return idx, flux_planet_w, flux_moon_w
@@ -1012,7 +1014,7 @@ def _window_model_runs(
         # eclipse_possible() pass
         no_eclipse = eclipse_impossible_circular(a_moon, i_moon, r_planet, r_moon)
         if no_eclipse:
-            zm, zp = ellipse_z_only_runs(
+            zm2, zp2 = ellipse_z_only_runs(
                 a_moon, per_moon, tau_moon, Omega_moon, i_moon, time, los, his,
                 c_t, c_d, tdur, t0_shift, M_moon / M_planet, b_bary
             )
@@ -1021,7 +1023,7 @@ def _window_model_runs(
             xp = xm
             yp = xm
         else:
-            xm, ym, xp, yp, zm, zp = ellipse_z_runs(
+            xm, ym, xp, yp, zm2, zp2 = ellipse_z_runs(
                 a_moon, per_moon, tau_moon, Omega_moon, i_moon, time, los, his,
                 c_t, c_d, tdur, t0_shift, M_moon / M_planet, b_bary
             )
@@ -1036,12 +1038,12 @@ def _window_model_runs(
             )
             time_w = time[idx]
             los, his = _idx_runs(idx)
-        xm, ym, xp, yp, zm, zp = _orbit_z(
+        xm, ym, xp, yp, zm2, zp2 = _orbit_z(
             time_w, x_bary, unphysical, a_moon, per_moon, tau_moon,
             Omega_moon, w_moon, i_moon, ecc_moon, M_moon / M_planet, b_bary
         )
     flux_planet_w, flux_moon_w = _window_fluxes_z(
-        xp, yp, xm, ym, zp, zm, no_eclipse, r_planet, r_moon, u1, u2,
+        xp, yp, xm, ym, zp2, zm2, no_eclipse, r_planet, r_moon, u1, u2,
         occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
     )
     return los, his, flux_planet_w, flux_moon_w

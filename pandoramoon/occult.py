@@ -739,8 +739,9 @@ def _limb_coeffs(k, u1, u2):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
-def _occult_limb_batch(zl, m, k, coef, flux):
-    """P21b limb interpolant for zl[:m] (all 1 - k <= z < 1 + k): flux =
+def _occult_limb_batch(zl2, m, k, coef, flux):
+    """P21b limb interpolant for the squared distances zl2[:m] (all
+    1 - k <= z < 1 + k; P26: z = sqrt(z^2) here, vectorised): flux =
     1 - D(z), clamped at 1; coef from _limb_coeffs(). Unrolled Horner with
     the half selected per lane, so that LLVM vectorises the loop."""
     inv_k = 1 / k
@@ -751,7 +752,7 @@ def _occult_limb_batch(zl, m, k, coef, flux):
     i5 = coef[21]; i6 = coef[22]; i7 = coef[23]; i8 = coef[24]; i9 = coef[25]
     i10 = coef[26]; i11 = coef[27]; i12 = coef[28]
     for j in range(m):
-        t = zl[j] - 1
+        t = np.sqrt(zl2[j]) - 1
         out = t >= 0
         r = ((k - t) if out else (k + t)) * inv_k
         x = 2 * np.sqrt(max(r, 0.0)) - 1
@@ -976,21 +977,22 @@ def _int_coeffs_exact(k, u1, u2):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
-def _occult_int_batch(zs, lo, hi, coef, omk, flux):
-    """P21c interior interpolant for zs[lo:hi] (all 0 <= z < 1 - k = omk):
-    flux = 1 - D(z), clamped at 1; coef from _int_coeffs(). Unrolled Horner
+def _occult_int_batch(z2s, lo, hi, coef, omk, flux):
+    """P21c interior interpolant for the squared distances z2s[lo:hi] (all
+    0 <= z < 1 - k = omk; P26: s^2 = omk^2 - z^2 needs no z): flux =
+    1 - D(z), clamped at 1; coef from _int_coeffs(). Unrolled Horner
     (vectorised); the arrays are sliced here, not by the caller: views
     passed into a jitted callee made P23's per-block kernel ~1.5x slower
     (PERFORMANCE_LOG.md §32.2)."""
-    zr = zs[lo:hi]
+    zr = z2s[lo:hi]
     fr = flux[lo:hi]
     inv_h = 2 / omk
+    omk2 = omk * omk
     c0 = coef[0]; c1 = coef[1]; c2 = coef[2]; c3 = coef[3]; c4 = coef[4]
     c5 = coef[5]; c6 = coef[6]; c7 = coef[7]; c8 = coef[8]; c9 = coef[9]
     c10 = coef[10]; c11 = coef[11]; c12 = coef[12]; c13 = coef[13]; c14 = coef[14]
     for j in range(hi - lo):
-        z = zr[j]
-        x = np.sqrt(max((omk - z) * (omk + z), 0.0)) * inv_h - 1
+        x = np.sqrt(max(omk2 - zr[j], 0.0)) * inv_h - 1
         P = c14
         P = P * x + c13
         P = P * x + c12
@@ -1011,22 +1013,25 @@ def _occult_int_batch(zs, lo, hi, coef, omk, flux):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
-def _occult_int_select(zs, lo, hi, coef, omk, one_k, flux):
-    """P21c in the per-sample path (replaces P23's _occult_series_select):
-    flux[i] = 1 off the star (z >= 1 + k or z < 0), else the interior
-    interpolant at min(z, 1 - k) (s clamped at 0; samples with z >= 1 - k
-    are overwritten by the limb pass), for lo <= i < hi, branch-free.
-    Returns the number of limb samples (1 - k <= z < 1 + k)."""
-    zr = zs[lo:hi]
+def _occult_int_select(z2s, lo, hi, coef, omk, one_k, flux):
+    """P21c in the per-sample path (replaces P23's _occult_series_select),
+    on squared distances z2s (P26): flux[i] = 1 off the star (z >= 1 + k or
+    z^2 < 0), else the interior interpolant at min(z, 1 - k) (s clamped at
+    0; samples with z >= 1 - k are overwritten by the limb pass), for
+    lo <= i < hi, branch-free. Returns the number of limb samples
+    (1 - k <= z < 1 + k)."""
+    zr = z2s[lo:hi]
     fr = flux[lo:hi]
     inv_h = 2 / omk
+    omk2 = omk * omk
+    one_k2 = one_k * one_k
     c0 = coef[0]; c1 = coef[1]; c2 = coef[2]; c3 = coef[3]; c4 = coef[4]
     c5 = coef[5]; c6 = coef[6]; c7 = coef[7]; c8 = coef[8]; c9 = coef[9]
     c10 = coef[10]; c11 = coef[11]; c12 = coef[12]; c13 = coef[13]; c14 = coef[14]
     c = 0
     for j in range(hi - lo):
-        z = zr[j]
-        x = np.sqrt(max((omk - z) * (omk + z), 0.0)) * inv_h - 1
+        z2 = zr[j]
+        x = np.sqrt(max(omk2 - z2, 0.0)) * inv_h - 1
         P = c14
         P = P * x + c13
         P = P * x + c12
@@ -1044,9 +1049,9 @@ def _occult_int_select(zs, lo, hi, coef, omk, one_k, flux):
         P = P * x + c0
         f = 1 - P
         f = f if f < 1 else 1.0
-        off = (z >= one_k) | (z < 0)
+        off = (z2 >= one_k2) | (z2 < 0)
         fr[j] = 1.0 if off else f
-        c += 1 if (z >= omk) & (z < one_k) else 0
+        c += 1 if (z2 >= omk2) & (z2 < one_k2) else 0
     return c
 
 
@@ -1210,15 +1215,47 @@ def occult_hybrid(zs, k, u1, u2):
     exact Mandel & Agol model (see _occult_hybrid), with per-call
     interpolants of the interior (P21c, z < 1 - k) and of the limb band
     (P21b) that are within SERIES_TOL = 1e-8 (0.01 ppm) of it (measured
-    <= ~4e-9 for physical limb darkening)."""
-    return _occult_hybrid(zs, k, u1, u2, SERIES_TOL)
+    <= ~4e-9 for physical limb darkening). occult_hybrid_z2() takes z^2."""
+    return _occult_hybrid(_squared(zs), k, u1, u2, SERIES_TOL)
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def occult_hybrid_z2(z2s, k, u1, u2):
+    """occult_hybrid() for the squared distances z2s = z^2 (P26): the model
+    needs z itself only on the limb band, so the orbit loops skip the sqrt
+    per sample. A negative z2 counts as off the star (as z < 0)."""
+    return _occult_hybrid(z2s, k, u1, u2, SERIES_TOL)
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def occult_exact(zs, k, u1, u2):
     """occult_hybrid() without the interior / limb interpolants: the exact
     model for every sample (~10.5 instead of ~0.8 ns per interior sample)."""
-    return _occult_hybrid(zs, k, u1, u2, 0.0)
+    return _occult_hybrid(_squared(zs), k, u1, u2, 0.0)
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _squared(zs):
+    """z |z| per sample: z^2 with the sign kept (z < 0 stays off the star)"""
+    z2s = np.empty(len(zs))
+    for j in range(len(zs)):
+        z2s[j] = zs[j] * abs(zs[j])
+    return z2s
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
+def _sqrt_lanes(zb, lo, hi, k):
+    """zb[lo:hi] = sqrt(zb[lo:hi]) in place (squared distances of the exact
+    lanes -> z, P26; vectorised), with z == k moved by one ulp: the
+    closed-form operands (P15) are exact down to |z - k| = 1 ulp; only
+    z == k itself (C = 3 (z + k) / (z - k)) moves (k + k 2^-52 is at least
+    the next float above k). Z_K_MIN keeps 1 / |z - k| finite for
+    k < ~1e-134, where ulps are smaller."""
+    zr = zb[lo:hi]
+    zk = k + max(k * 2.220446049250313e-16, Z_K_MIN)
+    for q in range(hi - lo):
+        z = np.sqrt(zr[q])
+        zr[q] = zk if abs(z - k) < Z_K_MIN else z
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
@@ -1234,8 +1271,8 @@ def _occult_hybrid(zs, k, u1, u2, series_tol):
 
     Parameters
     ----------
-    z: 1D array
-        Normalized distances
+    zs: 1D array
+        Squared normalized distances z^2 (P26; z^2 < 0: off the star)
     k: float
         Planet-star radius ratio
     u1, u2: float
@@ -1248,7 +1285,7 @@ def _occult_hybrid(zs, k, u1, u2, series_tol):
     # series_tol > 0 only (occult_exact stays exact)
     interior = _use_interior(k, series_tol)
     limb = series_tol > 0 and k > 0 and k <= LIMB_K_MAX and len(zs) * k >= LIMB_MIN_LANES * LIMB_FILL
-    if len(zs) >= STRETCH_MIN_N and _long_stretches(zs, k, 1 - k if interior else 0.0):
+    if len(zs) >= STRETCH_MIN_N and _long_stretches(zs, k, (1 - k) ** 2 if interior else 0.0):
         ok, flux = _occult_hybrid_stretches(zs, k, u1, u2, interior, limb)
         if ok:
             return flux
@@ -1280,8 +1317,9 @@ STRETCH_MIN_N = 2048    # shorter inputs: per-sample path. The stretch pass
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _long_stretches(zs, k, z_c):
-    """True if the class (off star / series / exact) changes rarely enough
+def _long_stretches(zs, k, z2_c):
+    """True if, on the squared distances zs (P26; z2_c = z_c^2), the class
+    (off star / interior / exact) changes rarely enough
     that the stretches average >= STRETCH_MIN_AVG samples: cheap estimate
     from STRETCH_PROBES evenly spaced samples (P23; before: every 8th
     sample, ~0.3 us per call on PLATO windows), branch-free classes. A
@@ -1293,13 +1331,13 @@ def _long_stretches(zs, k, z_c):
     n_p = min(STRETCH_PROBES, n_z)
     if n_p < 2:
         return False
-    one_k = 1 + k
+    one_k2 = (1 + k) ** 2
     step = (n_z - 1) // (n_p - 1)
     changes = 0
     prev = -1
     for p in range(n_p):
-        z = zs[p * step]
-        c = (1 if (z >= 0) & (z < one_k) else 0) * (2 if z >= z_c else 1)
+        z2 = zs[p * step]
+        c = (1 if (z2 >= 0) & (z2 < one_k2) else 0) * (2 if z2 >= z2_c else 1)
         changes += 1 if c != prev else 0
         prev = c
     changes -= 1                       # the first probe is not a change
@@ -1309,7 +1347,7 @@ def _long_stretches(zs, k, z_c):
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _end_off(zs, j, n_z, one_k):
     """First index >= j of a sample with 0 <= z < one_k (end of an
-    off-star stretch)"""
+    off-star stretch); since P26 called with z^2 and one_k^2"""
     while j + STRETCH_BLOCK <= n_z:
         blk = zs[j:j + STRETCH_BLOCK]
         c = 0
@@ -1326,7 +1364,8 @@ def _end_off(zs, j, n_z, one_k):
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _end_interior(zs, j, n_z, z_c):
     """First index >= j of a sample that is not an interior sample
-    (0 <= z < z_c; P21c: z_c = 1 - k, z == k needs no care there)"""
+    (0 <= z < z_c; P21c: z_c = 1 - k, z == k needs no care there); since
+    P26 called with z^2 and z_c^2"""
     while j + STRETCH_BLOCK <= n_z:
         blk = zs[j:j + STRETCH_BLOCK]
         c = 0
@@ -1341,19 +1380,20 @@ def _end_interior(zs, j, n_z, z_c):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _end_exact(zs, j, n_z, z_c, one_k, k, full, km1):
+def _end_exact(zs, j, n_z, z_c, one_k, full, km1):
     """First index >= j of a sample that is not an exact-model sample
-    (z_c <= z < one_k, z != k, not fully occulted); with z_c = 1 - k,
-    one_k = 1 + k: of the limb band (P21b)"""
+    (z_c <= z < one_k, not fully occulted: z > km1 if full); with
+    z_c = 1 - k, one_k = 1 + k: of the limb band (P21b). Since P26 called
+    with z^2 and squared bounds (z == k is moved by _sqrt_lanes)."""
     while j + STRETCH_BLOCK <= n_z:
         blk = zs[j:j + STRETCH_BLOCK]
         c = 0
         for q in range(STRETCH_BLOCK):
-            c += 1 if (blk[q] >= z_c) & (blk[q] < one_k) & (abs(blk[q] - k) >= Z_K_MIN) & ((not full) | (blk[q] > km1)) else 0
+            c += 1 if (blk[q] >= z_c) & (blk[q] < one_k) & ((not full) | (blk[q] > km1)) else 0
         if c < STRETCH_BLOCK:
             break
         j += STRETCH_BLOCK
-    while j < n_z and zs[j] >= z_c and zs[j] < one_k and abs(zs[j] - k) >= Z_K_MIN and not (full and zs[j] <= km1):
+    while j < n_z and zs[j] >= z_c and zs[j] < one_k and not (full and zs[j] <= km1):
         j += 1
     return j
 
@@ -1366,11 +1406,12 @@ def _occult_hybrid_stretches(zs, k, u1, u2, interior, limb):
     gather, no index scatter); exact-model stretches are copied into one
     buffer for the vectorised batch, as before; with limb (P21b) limb-band
     stretches are evaluated in place by the interpolant if they hold
-    >= LIMB_MIN_LANES samples together (else they join the batch). ok =
-    False (the caller then uses the per-sample version) at an exact-model
-    sample with z == k (one-ulp nudge) or a fully occulted one (k >= 1).
-    Same values as the per-sample version up to rounding (in place vs
-    per block)."""
+    >= LIMB_MIN_LANES samples together (else they join the batch). zs are
+    squared distances (P26), compared with squared bounds; the batch takes
+    z = sqrt(z^2) (_sqrt_lanes, also the z == k nudge). ok = False (the
+    caller then uses the per-sample version) at a fully occulted sample
+    (k >= 1). Same values as the per-sample version up to rounding (in
+    place vs per block)."""
     n_z = len(zs)
     flux = np.empty(n_z)
     omega = 1 / (1 - u1 / 3 - u2 / 6)
@@ -1378,13 +1419,14 @@ def _occult_hybrid_stretches(zs, k, u1, u2, interior, limb):
     c2 = u1 + 2 * u2
     one_k = 1 + k
     omk = 1 - k
-    z_c = omk if interior else 0.0
+    one_k2 = one_k * one_k
+    z2_c = omk * omk if interior else 0.0
     full = k >= 1
-    km1 = k - 1
+    km1_2 = (k - 1) ** 2 if full else 0.0
     idx = np.empty(n_z, dtype=np.int64)
     zb = np.empty(n_z + 3)                 # + 3: padding of the exact batch (P25)
     # P21b: limb stretches 1 - k <= z < 1 + k, kept as ranges [rl[2r], rl[2r+1])
-    one_mk = 1 - k if limb else one_k
+    one_mk2 = omk * omk if limb else one_k2
     rl = np.empty(n_z + 2 if limb else 0, dtype=np.int64)
     n_r = 0
     n_l = 0
@@ -1392,26 +1434,26 @@ def _occult_hybrid_stretches(zs, k, u1, u2, interior, limb):
     ic = _int_coeffs(k, u1, u2) if interior else np.zeros(INT_W)
     i = 0
     while i < n_z:
-        z = zs[i]
+        z2 = zs[i]
         j = i + 1
-        if z >= one_k or z < 0:                    # off the star: flux 1
-            j = _end_off(zs, j, n_z, one_k)
+        if z2 >= one_k2 or z2 < 0:                 # off the star: flux 1
+            j = _end_off(zs, j, n_z, one_k2)
             fr = flux[i:j]
             for q in range(j - i):
                 fr[q] = 1.0
-        elif z < z_c:                              # interior (P21c), in place
-            j = _end_interior(zs, j, n_z, z_c)
+        elif z2 < z2_c:                            # interior (P21c), in place
+            j = _end_interior(zs, j, n_z, z2_c)
             _occult_int_batch(zs, i, j, ic, omk, flux)
-        elif abs(z - k) < Z_K_MIN or (full and z <= km1):
+        elif full and z2 <= km1_2:
             return False, flux
-        elif z >= one_mk:                          # limb band (P21b): range
-            j = _end_exact(zs, j, n_z, one_mk, one_k, k, full, km1)
+        elif z2 >= one_mk2:                        # limb band (P21b): range
+            j = _end_exact(zs, j, n_z, one_mk2, one_k2, full, km1_2)
             rl[2 * n_r] = i
             rl[2 * n_r + 1] = j
             n_r += 1
             n_l += j - i
         else:                                      # exact (z_c <= z < one_mk): gather
-            j = _end_exact(zs, j, n_z, z_c, one_mk, k, full, km1)
+            j = _end_exact(zs, j, n_z, z2_c, one_mk2, full, km1_2)
             cnt = j - i
             zr = zs[i:j]
             zbr = zb[m:m + cnt]
@@ -1445,6 +1487,7 @@ def _occult_hybrid_stretches(zs, k, u1, u2, interior, limb):
         mp = m + (4 - m % 4) % 4 if m % 4 >= 2 else m
         for q in range(m, mp):
             zb[q] = zb[m - 1]
+        _sqrt_lanes(zb, 0, mp, k)                  # P26: z^2 -> z
         fb = np.empty(mp)
         dev = np.empty(mp)
         _occult_exact_batch(zb, mp, k, c1, c2, u2, omega, fb, dev)
@@ -1499,6 +1542,9 @@ def _occult_hybrid_samples(zs, k, u1, u2, interior, limb):
     # k is used as given: the old snap k -> 0.5 for |k - 0.5| < 1e-4 was up
     # to 150 ppm off (bug #30); the closed-form operands (P15) are exact at
     # k = 0.5 and z -> k (non-converged lanes take the scalar fallback)
+    # P26: zs are squared distances z^2, compared with squared bounds; z
+    # itself only for the exact lanes (_sqrt_lanes) and the limb lanes
+    # (_occult_limb_batch)
     n_z = len(zs)
     flux = np.empty(n_z)
     omega = 1 / (1 - u1 / 3 - u2 / 6)
@@ -1506,7 +1552,8 @@ def _occult_hybrid_samples(zs, k, u1, u2, interior, limb):
     c2 = u1 + 2 * u2
     one_k = 1 + k
     omk = 1 - k
-    z_c = omk if interior else 0.0         # exact model from z_c on
+    one_k2 = one_k * one_k
+    z2_c = omk * omk if interior else 0.0  # exact model from z_c on
 
     # Pass 1 (P23), per block of BLOCK_N samples: a vectorised count of the
     # on-star samples; blocks without any are filled with 1, the others get
@@ -1528,7 +1575,7 @@ def _occult_hybrid_samples(zs, k, u1, u2, interior, limb):
         fr = flux[lo:hi]
         on = 0
         for q in range(hi - lo):
-            on += 1 if (zr[q] >= 0) & (zr[q] < one_k) else 0
+            on += 1 if (zr[q] >= 0) & (zr[q] < one_k2) else 0
         if on == 0:
             for q in range(hi - lo):
                 fr[q] = 1.0
@@ -1548,9 +1595,9 @@ def _occult_hybrid_samples(zs, k, u1, u2, interior, limb):
     # (z_c <= z < 1 - k) from the front of zb / idx, with limb (P21b) the
     # limb band 1 - k <= z < 1 + k from zb[n_z + 4:] (if short, it joins
     # the band's batch); fully occulted samples (k >= 1) get 0
-    one_mk = 1 - k if limb else one_k      # one_k: no sample is a limb sample
+    one_mk2 = omk * omk if limb else one_k2   # one_k2: no sample is a limb sample
     full = k >= 1
-    km1 = k - 1
+    km1_2 = (k - 1) ** 2 if full else 0.0
     # (buffers sized by n_z, not tot: safe even if a scalar comparison
     # below disagreed with the vectorised count)
     idx = np.empty(2 * n_z + 4, dtype=np.int64)
@@ -1564,24 +1611,19 @@ def _occult_hybrid_samples(zs, k, u1, u2, interior, limb):
         lo = b * BLOCK_N
         hi = min(lo + BLOCK_N, n_z)
         for i in range(lo, hi):
-            z = zs[i]
-            if not (z >= z_c and z < one_k):
+            z2 = zs[i]
+            if not (z2 >= z2_c and z2 < one_k2):
                 continue
-            if full and z <= km1:          # the source is completely occulted
+            if full and z2 <= km1_2:       # the source is completely occulted
                 flux[i] = 0.0
                 continue
-            # The closed-form operands (P15) are exact down to |z - k| = 1 ulp;
-            # only z == k itself (C = 3 (z + k) / (z - k)) moves, by one ulp
-            # (k + k 2^-52 is at least the next float above k). Z_K_MIN keeps
-            # 1 / |z - k| finite for k < ~1e-134, where ulps are smaller.
-            if abs(z - k) < Z_K_MIN:
-                z = k + max(k * 2.220446049250313e-16, Z_K_MIN)
-            if z >= one_mk:
-                zb[ml] = z
+            # (z == k: one-ulp nudge in _sqrt_lanes)
+            if z2 >= one_mk2:
+                zb[ml] = z2
                 idx[ml] = i
                 ml += 1
             else:
-                zb[m] = z
+                zb[m] = z2
                 idx[m] = i
                 m += 1
     n_l = ml - l0
@@ -1600,6 +1642,7 @@ def _occult_hybrid_samples(zs, k, u1, u2, interior, limb):
         mp = m + (4 - m % 4) % 4 if m % 4 >= 2 else m
         for q in range(m, mp):
             zb[q] = zb[m - 1]
+        _sqrt_lanes(zb, 0, mp, k)          # P26: z^2 -> z
         fb = np.empty(mp)
         dev = np.empty(mp)
         _occult_exact_batch(zb, mp, k, c1, c2, u2, omega, fb, dev)
