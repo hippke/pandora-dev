@@ -1,5 +1,5 @@
 import numpy as np
-from numpy import sqrt, pi, sin, cos, abs, tan, arctan
+from numpy import sqrt, pi, sin, cos, abs
 from numba import jit
 
 from pandoramoon.trig import sincos_turns, sincos_small, SMALL_PHI_MAX, TWO_PI
@@ -33,39 +33,9 @@ def ellipse(
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def ellipse_ecc(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary):
-    """2D x-y Kepler solver WITH eccentricity"""
-
-    M = (2 * pi / per) * (time - (tau * per))
-    M = M - (np.floor(M / (2 * pi)) * 2 * pi)
-    flip = M > pi
-    M = np.where(flip, 2 * pi - M, M)
-    alpha = (3 * pi ** 2 + 1.6 * pi * (pi - abs(M)) / (1 + e)) / (pi ** 2 - 6)
-    d = 3 * (1 - e) + alpha * e
-    r1 = 3 * alpha * d * (d - 1 + e) * M + M ** 3
-    q = 2 * alpha * d * (1 - e) - M ** 2
-    w1 = (abs(r1) + sqrt(q ** 3 + r1 ** 2)) ** (2 / 3)
-    n = (2 * r1 * w1 / (w1 ** 2 + w1 * q + q ** 2) + M) / d
-    f0 = n - e * sin(n) - M
-    f1 = 1 - e * cos(n)
-    f2 = e * sin(n)
-    g = -f0 / (f1 - 0.5 * f0 * f2 / f1)
-    h = -f0 / (f1 + 0.5 * g * f2 + (g ** 2) * (1 - f1) / 6)
-    k = n - f0 / (f1 + 0.5 * h * f2 + h ** 2 * (1 - f1) / 6 + h ** 3 * (-f2) / 24)
-    k = np.where(flip, 2 * pi - k, k)
-    r = (1 - e * cos(k))
-
-    wf = (w / 180 * pi) + (arctan(sqrt((1 + e) / (1 - e)) * tan(k / 2)) * 2)
-    v = sin(wf) * cos((i / 180 * pi))
-    O = Omega / 180 * pi
-    vector_x = (cos(O) * cos(wf) - sin(O) * v) * r
-    vector_y = (sin(O) * cos(wf) + cos(O) * v) * r
-
-    a_planet = (a * mass_ratio) / (1 + mass_ratio)
-    a_moon = a - a_planet
-    xm = +vector_x * a_moon + x_bary
-    ym = +vector_y * a_moon + b_bary
-    xp = -vector_x * a_planet + x_bary
-    yp = -vector_y * a_planet + b_bary
+    """2D x-y Kepler solver WITH eccentricity: (xm, ym, xp, yp). Since P7b
+    the positions of ellipse_ecc_z() (vectorised solver, no true anomaly)."""
+    xm, ym, xp, yp, _, _ = ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary)
     return xm, ym, xp, yp
 
 
@@ -616,20 +586,88 @@ def ellipse_subruns(
     return los2[:n_out], his2[:n_out], c_t2[:n_out], c_d2[:n_out]
 
 
+# P7b: eccentric moon orbit. Positions are linear in cos E, sin E
+# (r cos nu = cos E - e, r sin nu = sqrt(1 - e^2) sin E; NbodyGradient /
+# gefera form), so no true anomaly, tan or arctan is needed. The mean
+# anomaly is reduced in turns (as P7): f = u - round(u) in [-1/2, 1/2),
+# M = 2 pi |f| in [0, pi], and E(-M) = -E(M) replaces bug #2's reflection
+# M > pi -> 2 pi - M (sin E changes sign). For e <= ECC_FAST_MAX Kepler's
+# equation is solved branch-free, so the loop vectorises: Danby's start
+# E = M + 0.85 e, four Halley steps d = 2 g g' / (2 g'^2 - g g'') (one
+# division), sin / cos from trig.sincos_turns() for the first two and by
+# rotation with trig.sincos_small(d) after that (|d| <= 0.27 there) and for
+# the final E. Max |delta (cos E, sin E)| <= 2.4e-15 vs a long-double
+# solution for 0 <= e <= 0.95, M in [1e-16, pi] (scratch_p7b/solver.py,
+# proto2.py); ~12 instead of ~115 ns per sample. Above ECC_FAST_MAX the
+# previous Markley (1995) starter plus a fourth-order correction (libm,
+# scalar) is used.
+ECC_FAST_MAX = 0.95
+INV_TWO_PI = 1 / TWO_PI
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy", inline="always")
+def _kepler_cs_fast(M, e):
+    """(cos E, sin E) of the eccentric anomaly for 0 <= M <= pi and
+    0 <= e <= ECC_FAST_MAX, branch-free (P7b)"""
+    E = M + 0.85 * e
+    s, c = sincos_turns(E * INV_TWO_PI)
+    d = 0.0
+    for it in range(4):
+        if it == 1:
+            s, c = sincos_turns(E * INV_TWO_PI)
+        elif it > 1:
+            ds, dc = sincos_small(d)
+            s, c = s * dc - c * ds, c * dc + s * ds
+        g = E - e * s - M
+        fp = 1 - e * c
+        d = 2 * g * fp / (2 * fp * fp - g * e * s)
+        E = E - d
+    ds, dc = sincos_small(d)
+    return c * dc + s * ds, s * dc - c * ds
+
+
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _kepler_cs_markley(M, e):
+    """(cos E, sin E) for 0 <= M <= pi, any 0 <= e < 1: Markley's starter
+    and a fourth-order correction (the solver before P7b, libm per call)"""
+    alpha = (3 * pi ** 2 + 1.6 * pi * (pi - abs(M)) / (1 + e)) / (pi ** 2 - 6)
+    d = 3 * (1 - e) + alpha * e
+    r1 = 3 * alpha * d * (d - 1 + e) * M + M ** 3
+    q = 2 * alpha * d * (1 - e) - M ** 2
+    w1 = (abs(r1) + sqrt(q ** 3 + r1 ** 2)) ** (2 / 3)
+    nn = (2 * r1 * w1 / (w1 ** 2 + w1 * q + q ** 2) + M) / d
+    f0 = nn - e * sin(nn) - M
+    f1 = 1 - e * cos(nn)
+    f2 = e * sin(nn)
+    g = -f0 / (f1 - 0.5 * f0 * f2 / f1)
+    h = -f0 / (f1 + 0.5 * g * f2 + (g ** 2) * (1 - f1) / 6)
+    k = nn - f0 / (f1 + 0.5 * h * f2 + h ** 2 * (1 - f1) / 6 + h ** 3 * (-f2) / 24)
+    return cos(k), sin(k)
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
 def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary):
-    """ellipse_ecc() fused into one loop that also returns the squared
-    distances from the stellar centre: (xm, ym, xp, yp, zm2, zp2) (P26, as
-    ellipse_z()). Same formulas per sample,
-    including the per-sample reflection M > pi (bug #2)."""
-    w_rad = w / 180 * pi
+    """Eccentric moon orbit: (xm, ym, xp, yp, zm2, zp2), z2 = x^2 + y^2
+    (P26, as ellipse_z()). P7b: positions linear in cos E, sin E, M reduced
+    in turns, vectorised Kepler solver for e <= ECC_FAST_MAX (see above)."""
     cos_i = cos(i / 180 * pi)
     O = Omega / 180 * pi
+    w_rad = w / 180 * pi
     cos_O = cos(O)
     sin_O = sin(O)
-    ecc_factor = sqrt((1 + e) / (1 - e))
+    cos_w = cos(w_rad)
+    sin_w = sin(w_rad)
+    # sky-plane direction = (ax X + bx Y, ay X + by Y), X = cos E - e,
+    # Y = sqrt(1 - e^2) sin E (rotation by w in the orbit plane, then the
+    # projection by Omega, i)
+    ax = cos_O * cos_w - sin_O * cos_i * sin_w
+    bx = -cos_O * sin_w - sin_O * cos_i * cos_w
+    ay = sin_O * cos_w + cos_O * cos_i * sin_w
+    by = -sin_O * sin_w + cos_O * cos_i * cos_w
+    sq = sqrt((1 - e) * (1 + e))
     a_planet = (a * mass_ratio) / (1 + mass_ratio)
     a_moon = a - a_planet
+    fast = e <= ECC_FAST_MAX
     n = len(time)
     xm = np.empty(n)
     ym = np.empty(n)
@@ -637,32 +675,30 @@ def ellipse_ecc_z(a, per, e, tau, Omega, w, i, time, mass_ratio, x_bary, b_bary)
     yp = np.empty(n)
     zm2 = np.empty(n)
     zp2 = np.empty(n)
+    # cos E, sin E first, kept in zm2 / zp2 (two solver loops: a branch
+    # between the solvers inside one loop made LLVM evaluate both per lane),
+    # then the positions
+    t_ref = tau * per
+    inv_per = 1 / per
+    if fast:
+        for j in range(n):
+            u = (time[j] - t_ref) * inv_per
+            f = u - np.floor(u + 0.5)
+            c, s = _kepler_cs_fast(TWO_PI * abs(f), e)
+            zm2[j] = c
+            zp2[j] = s if f >= 0 else -s
+    else:
+        for j in range(n):
+            u = (time[j] - t_ref) * inv_per
+            f = u - np.floor(u + 0.5)
+            c, s = _kepler_cs_markley(TWO_PI * abs(f), e)
+            zm2[j] = c
+            zp2[j] = s if f >= 0 else -s
     for j in range(n):
-        M = (2 * pi / per) * (time[j] - (tau * per))
-        M = M - (np.floor(M / (2 * pi)) * 2 * pi)
-        flip = M > pi
-        if flip:
-            M = 2 * pi - M
-        alpha = (3 * pi ** 2 + 1.6 * pi * (pi - abs(M)) / (1 + e)) / (pi ** 2 - 6)
-        d = 3 * (1 - e) + alpha * e
-        r1 = 3 * alpha * d * (d - 1 + e) * M + M ** 3
-        q = 2 * alpha * d * (1 - e) - M ** 2
-        w1 = (abs(r1) + sqrt(q ** 3 + r1 ** 2)) ** (2 / 3)
-        nn = (2 * r1 * w1 / (w1 ** 2 + w1 * q + q ** 2) + M) / d
-        f0 = nn - e * sin(nn) - M
-        f1 = 1 - e * cos(nn)
-        f2 = e * sin(nn)
-        g = -f0 / (f1 - 0.5 * f0 * f2 / f1)
-        h = -f0 / (f1 + 0.5 * g * f2 + (g ** 2) * (1 - f1) / 6)
-        k = nn - f0 / (f1 + 0.5 * h * f2 + h ** 2 * (1 - f1) / 6 + h ** 3 * (-f2) / 24)
-        if flip:
-            k = 2 * pi - k
-        r = (1 - e * cos(k))
-        wf = w_rad + (arctan(ecc_factor * tan(k / 2)) * 2)
-        v = sin(wf) * cos_i
-        cos_wf = cos(wf)
-        vector_x = (cos_O * cos_wf - sin_O * v) * r
-        vector_y = (sin_O * cos_wf + cos_O * v) * r
+        X = zm2[j] - e
+        Y = sq * zp2[j]
+        vector_x = ax * X + bx * Y
+        vector_y = ay * X + by * Y
         xmj = vector_x * a_moon + x_bary[j]
         ymj = vector_y * a_moon + b_bary
         xpj = -vector_x * a_planet + x_bary[j]
