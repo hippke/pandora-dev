@@ -21,6 +21,91 @@ from pandoramoon.grids import (
 )
 
 
+# Physical parameter ranges (checked before any computation). The model
+# functions raise ValueError(PARAMS_ERROR) outside them, pandora_loglike /
+# Likelihood return NEG_INF; check_params() names the offending values.
+PARAMS_ERROR = (
+    "Pandora parameter outside its physical range; "
+    "pandoramoon.check_params(...) names it"
+)
+NEG_INF = -np.inf
+
+
+@jit(cache=True, nopython=True, fastmath=False, parallel=False)
+def params_valid(
+    u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+    t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
+    i_moon, ecc_moon, w_moon, M_moon, epoch_distance, supersampling_factor,
+    numerical_grid
+):
+    """True if all parameters are within their physical ranges:
+
+    - every value finite (no NaN / inf);
+    - R_star, per_bary, a_bary, M_planet, per_moon, epoch_distance > 0
+      (a retrograde moon is i_moon in (90, 180] deg, not per_moon < 0);
+    - r_planet, r_moon, M_moon >= 0;
+    - 0 <= ecc_bary < 1, 0 <= ecc_moon < 1;
+    - quadratic limb darkening physical (Kipping 2013: intensity positive
+      and decreasing towards the limb): u1 >= 0, u1 + u2 <= 1, u1 + 2 u2 >= 0
+      (the sums with 1e-12 slack for round-off of converted q1, q2);
+    - supersampling_factor >= 1, numerical_grid >= 1.
+
+    Compiled without fastmath, so that the NaN / inf tests are kept (x - x
+    == 0 is False for NaN and +-inf). Physical plausibility of the moon orbit
+    (Hill sphere, contact) is not part of it: such moons keep the planet-only
+    model (_moon_setup)."""
+    finite = (
+        u1 - u1 == 0.0 and u2 - u2 == 0.0 and R_star - R_star == 0.0
+        and per_bary - per_bary == 0.0 and a_bary - a_bary == 0.0
+        and r_planet - r_planet == 0.0 and b_bary - b_bary == 0.0
+        and w_bary - w_bary == 0.0 and ecc_bary - ecc_bary == 0.0
+        and t0_bary - t0_bary == 0.0 and t0_bary_offset - t0_bary_offset == 0.0
+        and M_planet - M_planet == 0.0 and r_moon - r_moon == 0.0
+        and per_moon - per_moon == 0.0 and tau_moon - tau_moon == 0.0
+        and Omega_moon - Omega_moon == 0.0 and i_moon - i_moon == 0.0
+        and ecc_moon - ecc_moon == 0.0 and w_moon - w_moon == 0.0
+        and M_moon - M_moon == 0.0 and epoch_distance - epoch_distance == 0.0
+    )
+    return (
+        finite
+        and R_star > 0 and per_bary > 0 and a_bary > 0 and M_planet > 0
+        and per_moon > 0 and epoch_distance > 0
+        and r_planet >= 0 and r_moon >= 0 and M_moon >= 0
+        and ecc_bary >= 0 and ecc_bary < 1 and ecc_moon >= 0 and ecc_moon < 1
+        and u1 >= 0 and u1 + u2 <= 1 + 1e-12 and u1 + 2 * u2 >= -1e-12
+        and supersampling_factor >= 1 and numerical_grid >= 1
+    )
+
+
+def check_params(
+    u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+    t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
+    i_moon, ecc_moon, w_moon, M_moon, epoch_distance=1.0, supersampling_factor=1,
+    numerical_grid=25
+):
+    """Python: the list of violated physical ranges of params_valid()
+    (empty if all parameters are valid), e.g. ['per_moon > 0']."""
+    v = dict(u1=u1, u2=u2, R_star=R_star, per_bary=per_bary, a_bary=a_bary,
+             r_planet=r_planet, b_bary=b_bary, w_bary=w_bary, ecc_bary=ecc_bary,
+             t0_bary=t0_bary, t0_bary_offset=t0_bary_offset, M_planet=M_planet,
+             r_moon=r_moon, per_moon=per_moon, tau_moon=tau_moon, Omega_moon=Omega_moon,
+             i_moon=i_moon, ecc_moon=ecc_moon, w_moon=w_moon, M_moon=M_moon,
+             epoch_distance=epoch_distance)
+    bad = [f"{k} finite" for k, x in v.items() if not np.isfinite(float(x))]
+    rules = [
+        ("R_star > 0", R_star > 0), ("per_bary > 0", per_bary > 0),
+        ("a_bary > 0", a_bary > 0), ("M_planet > 0", M_planet > 0),
+        ("per_moon > 0", per_moon > 0), ("epoch_distance > 0", epoch_distance > 0),
+        ("r_planet >= 0", r_planet >= 0), ("r_moon >= 0", r_moon >= 0),
+        ("M_moon >= 0", M_moon >= 0), ("0 <= ecc_bary < 1", 0 <= ecc_bary < 1),
+        ("0 <= ecc_moon < 1", 0 <= ecc_moon < 1), ("u1 >= 0", u1 >= 0),
+        ("u1 + u2 <= 1", u1 + u2 <= 1 + 1e-12), ("u1 + 2 u2 >= 0", u1 + 2 * u2 >= -1e-12),
+        ("supersampling_factor >= 1", supersampling_factor >= 1),
+        ("numerical_grid >= 1", numerical_grid >= 1),
+    ]
+    return bad + [name for name, ok in rules if not ok]
+
+
 class model_params(object):
     def __init__(self):
 
@@ -371,6 +456,13 @@ def pandora(
 ):
     # eclipse_pixelmap=False: limb mutual eclipses via the exact analytic
     # three-circle overlap (default); True: legacy pixelart() raster.
+    if not params_valid(
+        u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+        t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
+        Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
+        supersampling_factor, numerical_grid
+    ):
+        raise ValueError(PARAMS_ERROR)
 
     # Make sure to work with floats. Large values as ints would overflow.
     R_star = float(R_star)
@@ -468,6 +560,13 @@ def pandora_flux(
     samples that can be in transit. float64, full length (output cadence).
     For likelihoods, Likelihood (no full-length arrays) or pandora_deficit()
     (float32) are faster."""
+    if not params_valid(
+        u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+        t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
+        Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
+        supersampling_factor, numerical_grid
+    ):
+        raise ValueError(PARAMS_ERROR)
     idx, flux_planet_w, flux_moon_w = _window_model(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
@@ -529,6 +628,13 @@ def pandora_deficit(
     itself, i.e. ~1e-9 absolute for a 1 % transit); float32 flux would be
     quantised to 6e-8 absolute near 1. All computations are float64; only
     the stored result is rounded. In a chi^2 use (1 - data) - deficit."""
+    if not params_valid(
+        u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+        t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
+        Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
+        supersampling_factor, numerical_grid
+    ):
+        raise ValueError(PARAMS_ERROR)
     idx, flux_planet_w, flux_moon_w = _window_model(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
@@ -590,6 +696,13 @@ def pandora_window(
     time_sorted=True: time is ascending (not checked); the window is then
     found by binary search per epoch (same result, no pass over all
     samples). Wrong results if time is not sorted."""
+    if not params_valid(
+        u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+        t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
+        Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
+        supersampling_factor, numerical_grid
+    ):
+        raise ValueError(PARAMS_ERROR)
     idx, flux_planet_w, flux_moon_w = _window_model(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
@@ -618,7 +731,16 @@ def pandora_loglike(
     inv_err)^2) (model = 1 everywhere) are precomputed per dataset. Use it
     via Likelihood.
     P18: the window is kept as per-epoch sample runs (no idx/x/time window
-    arrays, see _window_model_runs) and the chi^2 is summed per run."""
+    arrays, see _window_model_runs) and the chi^2 is summed per run.
+    Parameters outside their physical range (params_valid) give -inf, the
+    usual "outside the prior" value for samplers."""
+    if not params_valid(
+        u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+        t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
+        Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
+        supersampling_factor, numerical_grid
+    ):
+        return NEG_INF
     los, his, flux_planet_w, flux_moon_w = _window_model_runs(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,

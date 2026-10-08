@@ -815,8 +815,54 @@ draw has k near 0.5: outputs there are bit-identical, speed unchanged.
 Pinned by `test_no_k_snap_near_one_half` (embedded mpmath fluxes at
 k = 0.5 -+ 9e-5, -+ 1e-6 and 0.5; fails on the old code by 103 ppm).
 
+## 31. Parameters outside their physical range were not rejected (per_moon < 0: Likelihood 175 ppm off) - FIXED
+
+Severity: low (only for out-of-range input; sampler priors in the
+examples and the benchmark stay inside), but silently wrong results
+Location: `pandoramoon/pandora.py`, the public model functions and
+`pandora_loglike`
+Fixed in: "Reject parameters outside their physical range (bug #31)"
+
+No entry point checked its parameters. Found in R6 (2026-10-08): for
+per_moon < 0 the block anchors of the run-based orbit loops (P24d,
+`ellipse_z_runs` / `ellipse_z_only_runs`) advance the phase by
+abs(2 pi / per) while the phase itself is (t - tau per) / per, so the
+anchored positions run the wrong way (0.5 R_star off `ellipse_z`), and
+`Likelihood` differed from `pandora_flux()` by up to 175 ppm (40 Kepler
+draws with per_moon negated; positive periods: 2.3e-14). A negative period
+has no meaning in Pandora (the orbit size uses per^2; a retrograde moon is
+i_moon in (90, 180] deg). Other unchecked inputs gave silent nonsense too,
+e.g. tau_moon = NaN returned a finite log-likelihood.
+
+Fix: `params_valid()` (jitted, compiled without fastmath so the NaN / inf
+tests survive) runs before any computation in `pandora()`,
+`pandora_flux()`, `pandora_deficit()`, `pandora_window()` (raise
+ValueError) and `pandora_loglike()` / `Likelihood` (return -inf, the usual
+"outside the prior" value for samplers). Ranges: all parameters finite;
+R_star, per_bary, a_bary, M_planet, per_moon, epoch_distance > 0;
+r_planet, r_moon, M_moon >= 0; 0 <= ecc_bary, ecc_moon < 1; physical
+quadratic LD (Kipping 2013) u1 >= 0, u1 + u2 <= 1, u1 + 2 u2 >= 0 (1e-12
+slack for converted q1, q2: `ld_convert` stays inside on 1.2 M (q1, q2)
+pairs incl. the edges); supersampling_factor, numerical_grid >= 1.
+`pandoramoon.check_params(...)` lists the violated rules. Moon orbits that
+are physically implausible (Hill sphere, contact) keep the planet-only
+model as before. No output change for valid parameters (regression suite,
+logL bit-identical); speed unchanged (same-process A/B 0.998x / 1.000x).
+Pinned by `test_params_valid` (every rule just inside and just outside its
+boundary, NaN / +-inf in every parameter, all five entry points; the
+jitted check equals `check_params` on 3000 random draws; mutations caught:
+a dropped rule, fastmath on the check, a dropped finiteness test).
+
 ## Known limitations (documented, not bugs)
 
+- `eclipse()` jumps by T4's gradient term at er -> 1 on the stellar limb:
+  the term is skipped only for er == 1 exactly, and a limb moon almost
+  fully behind the planet gets `er_fast` = 1 - O(1e-15) or exactly 1, so
+  positions that differ by an ulp can change the moon flux by the term
+  (1.4e-7 in one of 3000 random test draws, R6c in PERFORMANCE_LOG.md
+  section 45). Near planet-moon tangency the lens area also has ~1e-13
+  rounding noise. Both are far below the 1 ppm rule and the T4 accuracy
+  (<= 0.6 ppm on the limb).
 - Mutual eclipses are independent of which body is in front: this is
   correct, not a limitation. (An earlier version of this list said the
   overlap was double-counted when the moon is in front. That was wrong.)
