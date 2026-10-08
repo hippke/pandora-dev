@@ -232,31 +232,33 @@ def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, use_pix
     # Case 2: Occultation, both bodies on star or off star --> 2-circle intersect
     # Case 3: Occultation, any body on limb --> analytic 3-circle overlap
     #         (default) or numerical pixel raster (use_pixelmap=True)
+    # R6a: reject by the squared separation first (no sqrt for the samples
+    # without overlap, most of them); the margin 1e-9 keeps every sample the
+    # sqrt test below accepts (as eclipse_possible)
+    r_sum2 = (r_planet + r_moon) * (r_planet + r_moon) * (1 + 1e-9)
     for idx in range(len(xp)):
-        planet_moon_occultation = False
-        on_limb = False
+        dx = xm[idx] - xp[idx]
+        dy = ym[idx] - yp[idx]
+        # Case 1: No occultation
+        if not (dx * dx + dy * dy < r_sum2):
+            continue
+        distance_p_m = sqrt(dx ** 2 + dy ** 2)
+        if not (abs(distance_p_m) < (r_planet + r_moon)):
+            continue
 
         # Check if moon or planet are on stellar limb
+        on_limb = False
         if abs(1 - (sqrt(xm[idx] ** 2 + ym[idx] ** 2))) < (r_moon):
             on_limb = True
         if abs(1 - (sqrt(xp[idx] ** 2 + yp[idx] ** 2))) < (r_planet):
             on_limb = True
 
-        # Check if planet-moon occultation
-        distance_p_m = sqrt((xm[idx] - xp[idx]) ** 2 + (ym[idx] - yp[idx]) ** 2)
-        if abs(distance_p_m) < (r_planet + r_moon):
-            planet_moon_occultation = True
-
-        # Case 1: No occultation
-        else:
-            continue
-
         # Case 2: Occultation, both bodies on star or off star --> 2 circle intersect
-        if planet_moon_occultation and not on_limb:
+        if not on_limb:
             er = eclipse_ratio(distance_p_m, r_planet, r_moon)
 
         # Case 3: Occultation, any body on limb
-        if planet_moon_occultation and on_limb:
+        else:
             if use_pixelmap:
                 er = pixelart(
                     xp[idx],
