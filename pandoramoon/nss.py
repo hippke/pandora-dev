@@ -484,7 +484,8 @@ def make_sampler(ll_u, parallel):
         return m
 
     @njit
-    def chain(U, j, L0, nb, Lmin, nsteps, scale, wrapped, x, xn, alive, pjump, chol, dmode, paxis, sdv, nbr, kpair):
+    def chain(U, j, L0, nb, Lmin, nsteps, scale, wrapped, x, xn, alive, pjump, chol, dmode, paxis, sdv, nbr, kpair,
+              pglob):
         """slice chain at fixed Lmin from U[j] (logL L0); directions =
         differences of members of nb; with probability pjump per step an
         additional differential-evolution jump x + (U_a - U_b) (a, b random
@@ -525,13 +526,27 @@ def make_sampler(ll_u, parallel):
             if b >= a:
                 b += 1
             vv = 0.0
-            if paxis > 0.0 and np.random.uniform(0.0, 1.0) < paxis:
+            ur = np.random.uniform(0.0, 1.0) if (paxis > 0.0 or pglob > 0.0) else 2.0
+            if ur < paxis:
                 # coordinate-axis slice (Gibbs-like), length ~ the live points' spread in that axis
                 for i in range(ndim):
                     v[i] = 0.0
                 ka = np.random.randint(ndim)
                 v[ka] = 1.4142135623730951 * sdv[ka]
                 vv = v[ka] * v[ka]
+            elif ur < paxis + pglob:
+                # global pair difference (two random live points): large moves along the global shape
+                while True:
+                    pa = np.random.randint(n)
+                    if alive[pa]:
+                        break
+                while True:
+                    pb = np.random.randint(n)
+                    if alive[pb] and pb != pa:
+                        break
+                for i in range(ndim):
+                    v[i] = U[pa, i] - U[pb, i]
+                    vv += v[i] * v[i]
             elif dmode == 2:
                 # local pair difference: a random alive point and one of its kpair nearest neighbours
                 # (neighbour lists from the last reclustering; independent of the chain's position)
@@ -619,7 +634,7 @@ def make_sampler(ll_u, parallel):
 
     @njit(parallel=parallel, nogil=True)
     def ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed, scale0, pjump, M, dirmode, recluster, R,
-           paxis, kpair, stop):
+           paxis, kpair, stop, pglob):
         n, ndim = U.shape
         # seeds (per thread in parallel mode: numba seeds each thread's state)
         np.random.seed(seed)
@@ -739,7 +754,7 @@ def make_sampler(ll_u, parallel):
                 else:
                     Lc, nc, ne, nj = chain(U, starts[c], L[starts[c]], mem, Lmin, nsteps, scale, wrapped, xs[c],
                                            xns[c], alive, pjump, chol, 1 if dirmode == 2 else (2 if dirmode == 4 else 0),
-                                           paxis, sd, nbr, kpair)
+                                           paxis, sd, nbr, kpair, pglob)
                 njs[c] = nj
                 newL[c] = Lc
                 ncs[c] = nc
@@ -852,7 +867,7 @@ def insertion_test(ranks, m, nlive, seed=0):
 
 def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_remain=0.01,
         max_iter=10_000_000, seed=1, scale0=1.0, threads=None, pjump=0.0, nbsub=2000, dirs="cluster",
-        recluster=0.25, R=200, paxis=0.0, kpair=4, stop=None):
+        recluster=0.25, R=200, paxis=0.0, kpair=4, stop=None, pglob=0.0):
     """returns dict(logz, logzerr, ncall, niter, wall, samples_u (equal weight), dead_u, dead_L, logw)"""
     import numba
     parallel = k > 1
@@ -870,7 +885,7 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     (dU, dL, dlogw, ncall, it, scale, exp_rate, njump, nclus, nclus_max, nrecl,
      nfallback, ins, mix) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0, pjump, nbsub,
                           {"knn": 0, "cluster": 1, "localcov": 2, "knnmh": 3, "pairs": 4}[dirs], recluster, R,
-                          paxis, kpair, stop if stop is not None else np.zeros(1, dtype=np.int64))
+                          paxis, kpair, stop if stop is not None else np.zeros(1, dtype=np.int64), pglob)
     t2 = time.perf_counter()
     lw = dlogw + dL
     logz = float(np.logaddexp.reduce(lw))
@@ -887,7 +902,8 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     pos = (rng.uniform() + np.arange(nsamp)) / nsamp
     samples = dU[np.searchsorted(cw, pos)]
     insd = insertion_test(ins, nlive - k, nlive, seed)
-    return dict(nlive=int(nlive), mix=mix, insertion=insd, logz=logz, logzerr=math.sqrt(max(H, 0.0) / nlive), H=H, ncall=int(ncall) + nlive, niter=int(it),
+    return dict(nlive=int(nlive), ins_u=((ins + np.random.default_rng(seed + 11).uniform(size=len(ins))) / (nlive - k + 1)
+                                       ).astype(np.float32), mix=mix, insertion=insd, logz=logz, logzerr=math.sqrt(max(H, 0.0) / nlive), H=H, ncall=int(ncall) + nlive, niter=int(it),
                 wall=t2 - t0, wall_init=t1 - t0, samples_u=samples, ess=ess, dead_u=dU, dead_L=dL, logw=dlogw,
                 maxL=float(dL.max()), final_scale=scale, expand_rate=exp_rate, njump_acc=int(njump),
                 nclusters=int(nclus), nclusters_max=int(nclus_max), nrecluster=int(nrecl),
@@ -946,7 +962,6 @@ def merge(rs, nsamp=None, seed=0, method="run"):
     method="zmean" (Round 6b/7): each run's normalised posterior x Z_i / sum Z, logZ = log mean Z_i;
     biased high by ~ var(lnZ_i) / 2 (Jensen; +0.1..+0.4 nats in the tests, +1.2 on C0 at nsteps 16).
     Returns (logZ, equal-weight samples_u, ESS)."""
-    U = np.vstack([r["dead_u"] for r in rs])
     if method == "run":
         lzm, lw = merge_weights(rs)
     else:
@@ -960,7 +975,16 @@ def merge(rs, nsamp=None, seed=0, method="run"):
     cw = np.cumsum(w)
     cw /= cw[-1]
     pos = (rng.uniform() + np.arange(n)) / n
-    return float(lzm), U[np.searchsorted(cw, pos)], ess
+    idx = np.searchsorted(cw, pos)
+    # gather the selected points from the runs without stacking all of them (a full vstack copied
+    # ~0.4 GB per merge at ~50 runs; fit() merges 5x per check)
+    off = np.cumsum([0] + [len(r["dead_L"]) for r in rs])
+    ir = np.searchsorted(off, idx, side="right") - 1
+    out = np.empty((n, rs[0]["dead_u"].shape[1]))
+    for q in np.unique(ir):
+        m = ir == q
+        out[m] = rs[q]["dead_u"][idx[m] - off[q]]
+    return float(lzm), out, ess
 
 
 def split_half_ks(rs, sub=40_000, seed=0, post_map=None):
@@ -1014,6 +1038,25 @@ def _ks_sets(ra, rb, post_map, sub=40_000, seed=0):
     return float(d[j]), j
 
 
+def pooled_insertion(rs):
+    """insertion-index test pooled over runs: KS of all jittered insertion ranks (uniform for exact NS) and
+    the Fisher combination of the per-run p-values. Returns (D, p_pooled, p_fisher)."""
+    u = np.concatenate([r["ins_u"] for r in rs if "ins_u" in r]).astype(np.float64)
+    if len(u) == 0:
+        return np.nan, np.nan, np.nan
+    u.sort()
+    n = len(u)
+    i = np.arange(1, n + 1)
+    D = float(max(np.max(i / n - u), np.max(u - (i - 1) / n)))
+    ps = np.array([max(r["insertion"]["p"], 1e-300) for r in rs])
+    chi2 = -2.0 * np.sum(np.log(ps))
+    # chi2 with 2M dof: Wilson-Hilferty normal approximation of the upper tail
+    k = 2 * len(ps)
+    z = ((chi2 / k) ** (1 / 3) - (1 - 2 / (9 * k))) / math.sqrt(2 / (9 * k))
+    p_f = float(0.5 * math.erfc(z / math.sqrt(2)))
+    return D, _ks_p(D, n), p_f
+
+
 def bootstrap_logz(rs, B=40, seed=0):
     """sd of the merged logZ over bootstrap resamples of the runs (Higson et al. 2018)"""
     rng = np.random.default_rng(seed)
@@ -1023,7 +1066,7 @@ def bootstrap_logz(rs, B=40, seed=0):
 
 def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=None, min_runs=None,
         max_runs=96, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True, log=None,
-        post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None):
+        post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25):
     """Nested sampling with built-in convergence checks (SAMPLING.md Rounds 6b, 8).
 
     Independent serial nss runs (n_live = nlive each) run in parallel threads; they are merged as one
@@ -1067,6 +1110,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                  logz=lzR, logz_meanlnz=sR["mean"], logz_err=sR["err"], logz_sd=sR["sd"], logz_mad_sd=sR["mad_sd"],
                  quoted=float(np.mean([r["logzerr"] for r in R]) / math.sqrt(sR["M"])), ks_split=ks, ks_param=j,
                  insertion_p_min=min(r["insertion"]["p"] for r in R), final=final,
+                 **dict(zip(("ins_pooled_D", "ins_pooled_p", "ins_fisher_p"), pooled_insertion(Rg))),
                  ncall=int(ncall_tot[0]), ncall_result=int(sum(r["ncall"] for r in R)))
         ok_bias, escalate = True, False
         if check:
@@ -1090,7 +1134,8 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
             if check:
                 s += (f" | check nsteps {Nc}: {h['check_runs']} runs, dlnZ {h['dlnz']:+.3f} +- {h['dlnz_err']:.3f}, "
                       f"KS arms {h['ks_arms']:.3f} (p{h['ks_arms_param']})")
-            print(s + f", insertion p min {h['insertion_p_min']:.2g}, {h['wall']:.1f} s" + (" [final]" if final else ""),
+            print(s + f", insertion p min {h['insertion_p_min']:.2g} (pooled D {h['ins_pooled_D']:.4f} p {h['ins_pooled_p']:.2g}, "
+                  f"Fisher p {h['ins_fisher_p']:.2g}), {h['wall']:.1f} s" + (" [final]" if final else ""),
                   flush=True)
         if log:
             log(h)
@@ -1113,6 +1158,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     passed = False
     stopflag = np.zeros(1, dtype=np.int64)
     n_aborted = [0]
+    t_eval = [0.0]                               # wall time of the Python checks (main thread)
     with ThreadPoolExecutor(max_workers=threads) as ex:
         def top_up():
             nonlocal nxt
@@ -1124,7 +1170,8 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 sd = seed + 1000 * nxt
                 nxt += 1
                 inflight[ex.submit(run, ll_u, ndim, wrapped=wrapped, nlive=nlive, nsteps=ns, k=1, seed=sd, dirs=dirs,
-                                   frac_remain=frac_remain, paxis=paxis, kpair=kpair, stop=stopflag)] = ns
+                                   frac_remain=frac_remain, paxis=paxis, kpair=kpair, stop=stopflag, pglob=pglob,
+                                   recluster=recluster)] = ns
 
         top_up()
         ndone = 0
@@ -1141,7 +1188,9 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
             top_up()                             # refill before the (slow, Python) evaluation
             if len(arms.get(N, [])) >= 2 and ndone >= threads:
                 ndone = 0
+                te = time.perf_counter()
                 passed, escalate, M = evaluate(N)
+                t_eval[0] += time.perf_counter() - te
                 if passed or M >= max_runs:
                     break
                 if escalate:
@@ -1168,7 +1217,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     lzb = float(np.std(zg[_rng.integers(0, len(zg), (1000, len(zg)))].mean(axis=1), ddof=1)) if len(zg) > 1 else np.nan
     mixm = np.mean([r["mix"] for r in R], axis=0)
     return dict(mix=mixm, logz=lzm, logzerr=hist[-1]["logz_err"], logzerr_boot=lzb, samples_u=samples, ess=ess,
-                runs=R, n_failed=len(bad), n_aborted=n_aborted[0], runs_check=arms.get(max(1, N // 2), []) if check else [], history=hist, passed=passed,
+                runs=R, n_failed=len(bad), n_aborted=n_aborted[0], t_eval=t_eval[0], runs_check=arms.get(max(1, N // 2), []) if check else [], history=hist, passed=passed,
                 wall=time.perf_counter() - t0, ncall=hist[-1]["ncall"], nlive=nlive, nsteps=N, nsteps0=nsteps,
                 n_escalations=nesc, dlnz_check=hist[-1].get("dlnz"), dlnz_check_err=hist[-1].get("dlnz_err"),
                 ks_arms=hist[-1].get("ks_arms"), maxL=float(max(r["maxL"] for r in R)))
