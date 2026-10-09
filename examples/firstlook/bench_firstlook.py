@@ -66,6 +66,7 @@ def main():
     ap.add_argument("--bench", action="store_true", help="speed benchmark: default first look on the labelled set")
     ap.add_argument("--labels", default="", help="jsonl with the reference rows (for --bench recall)")
     ap.add_argument("--start", type=int, default=0)
+    ap.add_argument("--preset", type=float, default=0.95, help="--bench: recall preset of firstlook.run")
     args = ap.parse_args()
     if args.summary:
         summarize(args.summary)
@@ -73,7 +74,7 @@ def main():
     import firstlook
     import injections
     if args.bench:
-        args.configs = "bench:{nlive_planet}:{nsteps_planet}:{nlive_moon}:{nsteps_moon}".format(**firstlook.DEFAULT_SETTINGS)
+        args.configs = "bench:0:0:0:0"            # firstlook.run(recall=args.preset)
     cfgs = []
     for c in args.configs.split(","):
         n, a, b, cc, d = c.split(":")
@@ -95,7 +96,10 @@ def main():
         t, f, e = injections.simulate(s)
         fl = firstlook.FirstLook(t, f, e, t0_bary=s["t0_bary"], per_bary=s["priors"]["per_bary"],
                                  a_bary=s["priors"]["a_bary"], epoch_distance=s["epoch_distance"])
-        r = fl.run(nlive_planet=a, nsteps_planet=b, nlive_moon=c, nsteps_moon=d, seed=1 + s["index"])
+        if name == "bench":
+            r = fl.run(recall=args.preset, seed=1 + s["index"])
+        else:
+            r = fl.run(recall=None, nlive_planet=a, nsteps_planet=b, nlive_moon=c, nsteps_moon=d, seed=1 + s["index"])
         row = dict(config=name, regime=s["regime"], index=s["index"], moon=s["moon"], dlnz=r["dlnz"],
                    dlnz_err=r["dlnz_err"], dmaxL=r["dmaxL"], logz_planet=r["logz_planet"], logz_moon=r["logz_moon"],
                    cpu=r["cpu"], wall=r["wall"], ncall=r["ncall"], ndata=r["ndata"], moon_summary=r["moon"],
@@ -121,18 +125,19 @@ def main():
     if args.bench:
         rr = [r for r in rows if r["config"] == "bench"]
         cpu = np.array([r["cpu"] for r in rr])
-        res = dict(bench="firstlook", date=time.strftime("%Y-%m-%d %H:%M"), n=len(rr), settings=cfgs[0][1:],
+        res = dict(bench="firstlook", date=time.strftime("%Y-%m-%d %H:%M"), n=len(rr), preset=args.preset,
+                   settings=firstlook.RECALL_PRESETS[args.preset],
                    cpu_per_lc=float(cpu.mean()), cpu_per_lc_median=float(np.median(cpu)),
                    lc_per_hour_per_core=float(3600 / cpu.mean()), wall=wall, threads=args.threads,
                    ncall_per_lc=float(np.mean([r["ncall"] for r in rr])))
         if args.labels:
             ref = {(r["regime"], r["index"], r["moon"]): r["dlnz"] for r in map(json.loads, open(args.labels))
                    if r["config"] == "ref"}
-            null = np.array([r["dlnz"] for r in rr if not r["moon"]])
-            thr = float(np.quantile(null, 0.98)) if len(null) >= 10 else float(null.max())
+            thr = firstlook.RECALL_PRESETS[args.preset]["threshold"]
+            null = [r["dlnz"] > thr for r in rr if not r["moon"]]
             good = [r for r in rr if r["moon"] and ref.get((r["regime"], r["index"], True), -1) >= 8]
-            res.update(threshold_98=thr, recall_ref8=float(np.mean([r["dlnz"] > thr for r in good])) if good else None,
-                       n_ref8=len(good))
+            res.update(threshold=thr, recall_ref8=float(np.mean([r["dlnz"] > thr for r in good])) if good else None,
+                       n_ref8=len(good), false_passes=int(sum(null)), n_null=len(null))
         print("BENCH", json.dumps(res), flush=True)
         open(os.path.join(os.path.dirname(os.path.abspath(args.out)), "bench_log.jsonl"), "a").write(json.dumps(res) + "\n")
 

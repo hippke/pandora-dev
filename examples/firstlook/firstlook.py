@@ -49,7 +49,15 @@ DEFAULT_PRIORS = dict(
 # first-look settings ("A" in README.md: recall 100 % of 166 moons with reference dlnZ >= 8, 0 of 160 no-moon
 # light curves above 0; white-noise injections, bench_firstlook.py). threshold 2: a 3-nat margin above the
 # largest no-moon value (-1.1)
-DEFAULT_SETTINGS = dict(nlive_planet=200, nsteps_planet=28, nlive_moon=200, nsteps_moon=32, threshold=2.0)
+DEFAULT_SETTINGS = dict(nlive_planet=200, nsteps_planet=28, nlive_moon=200, nsteps_moon=32, repeats=1, threshold=2.0)
+
+# recall presets: target recall of well-detectable moons (reference dlnZ >= 8) -> settings. Repeated small moon
+# runs are cheaper than one large run for the same recall (recall_study.py, README.md "Choosing the recall").
+RETRY_BELOW, RETRY_MAX = -15.0, 2
+DEFAULT_RECALL = 0.95
+_P = dict(nlive_planet=100, nsteps_planet=16, nlive_moon=50, nsteps_moon=16, threshold=3.0)
+RECALL_PRESETS = {0.90: dict(_P, repeats=1), 0.95: dict(_P, repeats=1), 0.99: dict(_P, repeats=3),
+                  0.999: dict(_P, repeats=6)}
 
 MOON_NAMES = ['R_star', 'per_bary', 'a_bary', 'r_planet', 'b_bary', 't0_bary_offset', 'M_planet', 'r_moon',
               'phi_c', 'delta', 'u_m', 'Omega_moon', 'i_moon', 'M_moon', 'q1', 'q2']
@@ -165,42 +173,72 @@ class FirstLook:
                  'per_moon', 'tau', 'Omega_moon', 'i_moon', 'M_moon', 'q1', 'q2']
         return {n: q[:, i] for i, n in enumerate(names)}
 
-    def run(self, nlive_planet=None, nsteps_planet=None, nlive_moon=None, nsteps_moon=None, seed=1, threshold=None,
-            keep_samples=False):
-        """one short nss run per model (serial, one core). Returns dict: dlnz, logz_planet, logz_moon,
-        interesting (dlnz > threshold), moon (median and 16/84 % of the main moon parameters), maxL point,
-        calls, cpu seconds."""
+    def run_planet(self, nlive, nsteps, seed=1):
+        c0 = _time.thread_time()
+        r = nss.run(ll_planet, 7, nlive=nlive, nsteps=nsteps, seed=seed, dirs="pairs", kpair=4, data=self.D_p)
+        r["cpu"] = _time.thread_time() - c0
+        return r
+
+    def run_moon(self, nlive, nsteps, seed=1):
+        c0 = _time.thread_time()
+        r = nss.run(ll_moon, 16, wrapped=self.wrapped_m, nlive=nlive, nsteps=nsteps, seed=seed, dirs="pairs", kpair=4,
+                    data=self.D_m)
+        r["cpu"] = _time.thread_time() - c0
+        return r
+
+    def run(self, recall=DEFAULT_RECALL, nlive_planet=None, nsteps_planet=None, nlive_moon=None, nsteps_moon=None, repeats=None,
+            seed=1, threshold=None, keep_samples=False):
+        """first look of this light curve (serial, one core).
+        recall: target recall of well-detectable moons (0.9, 0.95 = default, 0.99, 0.999): picks the settings from
+        RECALL_PRESETS (README.md); explicit settings override it; recall=None: DEFAULT_SETTINGS (200 live points,
+        one moon run: the first calibration's "A").
+        One planet-only run and `repeats` independent planet+moon runs; lnZ(moon) = log mean Z of the moon runs
+        (a run that missed the moon's mode then costs only ln(repeats)).
+        Returns dict: dlnz, logz_planet, logz_moon, interesting (dlnz > threshold), moon (median and 16/84 % of
+        the main moon parameters, from the best moon run), maxL point, calls, cpu seconds."""
         st = dict(DEFAULT_SETTINGS)
+        if recall is not None:
+            if recall not in RECALL_PRESETS:
+                raise ValueError(f"recall must be one of {sorted(RECALL_PRESETS)}")
+            st.update(RECALL_PRESETS[recall])
         for k, v in (("nlive_planet", nlive_planet), ("nsteps_planet", nsteps_planet), ("nlive_moon", nlive_moon),
-                     ("nsteps_moon", nsteps_moon), ("threshold", threshold)):
+                     ("nsteps_moon", nsteps_moon), ("repeats", repeats), ("threshold", threshold)):
             if v is not None:
                 st[k] = v
         t0 = _time.perf_counter()
-        c0 = _time.thread_time()
-        rp_ = nss.run(ll_planet, 7, nlive=st["nlive_planet"], nsteps=st["nsteps_planet"], seed=seed, dirs="pairs",
-                      kpair=4, data=self.D_p)
-        t1 = _time.perf_counter()
-        c1 = _time.thread_time()
-        rm = nss.run(ll_moon, 16, wrapped=self.wrapped_m, nlive=st["nlive_moon"], nsteps=st["nsteps_moon"],
-                     seed=seed + 7, dirs="pairs", kpair=4, data=self.D_m)
-        t2 = _time.perf_counter()
-        c2 = _time.thread_time()
-        dl = rm["logz"] - rp_["logz"]
+        rp_ = self.run_planet(st["nlive_planet"], st["nsteps_planet"], seed=seed)
+        rms = [self.run_moon(st["nlive_moon"], st["nsteps_moon"], seed=seed + 7 + 101 * j) for j in range(st["repeats"])]
+        lzm = float(np.logaddexp.reduce([r["logz"] for r in rms]) - math.log(len(rms)))
+        # safeguard: the moon model (almost) contains the planet-only model, so a correct moon run is never far below
+        # it (no-moon light curves: dlnZ >= -10.4 in 99.9 % of the cases). dlnZ < RETRY_BELOW means a collapsed run
+        # (~0.7 % of the runs with 50 live points): add moon runs (at most RETRY_MAX)
+        nretry = 0
+        while lzm - rp_["logz"] < RETRY_BELOW and nretry < RETRY_MAX:
+            nretry += 1
+            rms.append(self.run_moon(st["nlive_moon"], st["nsteps_moon"], seed=seed + 7 + 101 * (st["repeats"] + nretry)))
+            # the collapsed runs carry no information: keep the best ones
+            good = [r for r in rms if r["logz"] - rp_["logz"] >= RETRY_BELOW] or rms
+            lzm = float(np.logaddexp.reduce([r["logz"] for r in good]) - math.log(len(good)))
+        wall = _time.perf_counter() - t0
+        rm = max(rms, key=lambda r: r["logz"])
+        dl = lzm - rp_["logz"]
         nat = self.moon_native(rm["samples_u"])
         summ = {}
-        for n, scale in (("per_moon", 1.0), ("r_moon", 1.0), ("i_moon", 1.0), ("Omega_moon", 1.0)):
-            summ[n] = tuple(float(v) for v in np.percentile(nat[n] * scale, [50, 16, 84]))
+        for n in ("per_moon", "r_moon", "i_moon", "Omega_moon"):
+            summ[n] = tuple(float(v) for v in np.percentile(nat[n], [50, 16, 84]))
         mr = nat["M_moon"] / nat["M_planet"]
         summ["M_moon/M_planet"] = tuple(float(v) for v in np.percentile(mr, [50, 16, 84]))
         best = self.moon_native(rm["dead_u"][np.argmax(rm["dead_L"])])
+        cpu_m = sum(r["cpu"] for r in rms)
         out = dict(dlnz=float(dl), dlnz_err=float(math.hypot(rm["logzerr"], rp_["logzerr"])),
-                   logz_planet=rp_["logz"], logz_moon=rm["logz"], maxL_planet=rp_["maxL"], maxL_moon=rm["maxL"],
-                   dmaxL=float(rm["maxL"] - rp_["maxL"]),
+                   logz_planet=rp_["logz"], logz_moon=lzm, logz_moon_runs=[r["logz"] for r in rms],
+                   maxL_planet=rp_["maxL"], maxL_moon=rm["maxL"], dmaxL=float(rm["maxL"] - rp_["maxL"]),
                    interesting=(None if st["threshold"] is None else bool(dl > st["threshold"])),
                    moon=summ, best={k: float(v[0]) for k, v in best.items()},
-                   ncall_planet=rp_["ncall"], ncall_moon=rm["ncall"], ncall=rp_["ncall"] + rm["ncall"],
-                   wall=t2 - t0, cpu_planet=c1 - c0, cpu_moon=c2 - c1, cpu=c2 - c0, settings=st, ndata=self.ndata,
-                   insertion_p_moon=rm["insertion"].get("p"))
+                   ncall_planet=rp_["ncall"], ncall_moon=sum(r["ncall"] for r in rms),
+                   ncall=rp_["ncall"] + sum(r["ncall"] for r in rms),
+                   wall=wall, cpu_planet=rp_["cpu"], cpu_moon=cpu_m, cpu=rp_["cpu"] + cpu_m, settings=st,
+                   ndata=self.ndata, insertion_p_moon=rm["insertion"].get("p"), retries=nretry)
         if keep_samples:
             out["samples_moon"] = nat
         return out
