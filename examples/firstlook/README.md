@@ -172,6 +172,7 @@ The raw results (jsonl, one line per run) are in the project directory
 |---|---|
 | `firstlook.py` | `FirstLook` (one light curve), `run_many`, the compiled likelihoods `ll_planet`, `ll_moon` |
 | `injections.py` | white-noise injections: Kepler-like (30 min, 3–9 transits) and PLATO-like (10 min, 2–3 transits) planets with and without moons |
+| `plot_firstlook.py` | figure drafts from the result files: ΔlnZ distributions, detected fraction vs moon S/N and mass ratio, cost vs miss rate (project `figures/firstlook/`) |
 | `describe_injections.py` | regenerates the injection / cost tables (`injections_table.md`) from the result files |
 | `recall_study.py` | recall vs cost: per-light-curve miss rates of several moon-run sizes from repeated seeds (`--analyse`), and end-to-end validation of the presets (`--validate`) |
 | `bench_firstlook.py` | calibration (reference runs + first-look settings on the same injections, `--summary`) and the **speed benchmark** (`--bench`) |
