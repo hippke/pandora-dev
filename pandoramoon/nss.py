@@ -491,9 +491,51 @@ def make_sampler(ll_u, parallel, with_data=False):
                 m += 1
         return m
 
+    @njit(parallel=parallel)
+    def local_chols(U, alive, nbr, wrapped, Lp):
+        """Lp[q] = Cholesky factor of the covariance of q's neighbour list nbr[q] (minimal-image differences in
+        wrapped dimensions; neighbours relative to q, mean removed), regularised"""
+        n, ndim = U.shape
+        K = nbr.shape[1]
+        for q in prange(n):
+            if not alive[q]:
+                continue
+            dd = np.empty((K, ndim))
+            for t in range(K):
+                r = nbr[q, t]
+                for i in range(ndim):
+                    d = U[r, i] - U[q, i]
+                    if wrapped[i]:
+                        d -= math.floor(d + 0.5)
+                    dd[t, i] = d
+            for i in range(ndim):
+                mu = 0.0
+                for t in range(K):
+                    mu += dd[t, i]
+                mu /= K
+                for t in range(K):
+                    dd[t, i] -= mu
+            C = np.zeros((ndim, ndim))
+            for i in range(ndim):
+                for i2 in range(i + 1):
+                    s_ = 0.0
+                    for t in range(K):
+                        s_ += dd[t, i] * dd[t, i2]
+                    C[i, i2] = s_ / (K - 1)
+                    C[i2, i] = C[i, i2]
+            tr = 0.0
+            for i in range(ndim):
+                tr += C[i, i]
+            for i in range(ndim):
+                C[i, i] += 1e-10 * tr / ndim + 1e-300
+            Lq = np.linalg.cholesky(C)
+            for i in range(ndim):
+                for i2 in range(ndim):
+                    Lp[q, i, i2] = Lq[i, i2]
+
     @njit
     def chain(U, j, L0, nb, Lmin, nsteps, scale, wrapped, x, xn, alive, pjump, chol, dmode, paxis, sdv, nbr, kpair,
-              pglob, D):
+              pglob, D, Lp):
         """slice chain at fixed Lmin from U[j] (logL L0); directions =
         differences of members of nb; with probability pjump per step an
         additional differential-evolution jump x + (U_a - U_b) (a, b random
@@ -554,6 +596,21 @@ def make_sampler(ll_u, parallel, with_data=False):
                         break
                 for i in range(ndim):
                     v[i] = U[pa, i] - U[pb, i]
+                    vv += v[i] * v[i]
+            elif dmode == 3:
+                # local covariance of a random live point's neighbourhood (dirs="lcov"): v = sqrt(2) L_a z
+                # (sqrt 2: the scale of a difference of two points); L_a from the last reclustering, inherited
+                # by new points; independent of the chain's position (exact)
+                while True:
+                    pa = np.random.randint(n)
+                    if alive[pa]:
+                        break
+                z = np.random.standard_normal(ndim)
+                for i in range(ndim):
+                    s_ = 0.0
+                    for i2 in range(i + 1):
+                        s_ += Lp[pa, i, i2] * z[i2]
+                    v[i] = 1.4142135623730951 * s_
                     vv += v[i] * v[i]
             elif dmode == 2:
                 # local pair difference: a random alive point and one of its kpair nearest neighbours
@@ -675,6 +732,7 @@ def make_sampler(ll_u, parallel, with_data=False):
         sd_every = max(1, n // (10 * k))
         labels = np.zeros(n, dtype=np.int64)
         nbr = np.empty((n, K), dtype=np.int64)
+        Lp = np.zeros((n if dirmode == 5 else 1, ndim, ndim))
         for q0 in range(n):
             for t0 in range(K):
                 nbr[q0, t0] = q0
@@ -726,8 +784,10 @@ def make_sampler(ll_u, parallel, with_data=False):
                     sd[i] = math.sqrt(s / n) + 1e-300
             for jj in range(k):
                 alive[sel[jj]] = False
-            if (dirmode == 1 or dirmode == 4) and repl_since >= recluster * n:
+            if (dirmode == 1 or dirmode == 4 or dirmode == 5) and repl_since >= recluster * n:
                 nclus = cluster(U, alive, sd, K, M, labels, nbr, ref)
+                if dirmode == 5:
+                    local_chols(U, alive, nbr, wrapped, Lp)
                 nclus_max = max(nclus_max, nclus)
                 nrecl += 1
                 repl_since = 0
@@ -746,7 +806,7 @@ def make_sampler(ll_u, parallel, with_data=False):
                 m = 0
                 if dirmode == 1:
                     m = members(starts[c], alive, labels, idxs[c])
-                if dirmode == 2 or dirmode == 3 or dirmode == 4:
+                if dirmode == 2 or dirmode == 3 or dirmode == 4 or dirmode == 5:
                     mem = idxs[c, :2]
                     mcount[c] = 0
                 elif m >= 2:
@@ -761,8 +821,9 @@ def make_sampler(ll_u, parallel, with_data=False):
                                                  wrapped, xs[c], xns[c], d2s[c], D)
                 else:
                     Lc, nc, ne, nj = chain(U, starts[c], L[starts[c]], mem, Lmin, nsteps, scale, wrapped, xs[c],
-                                           xns[c], alive, pjump, chol, 1 if dirmode == 2 else (2 if dirmode == 4 else 0),
-                                           paxis, sd, nbr, kpair, pglob, D)
+                                           xns[c], alive, pjump, chol,
+                                           1 if dirmode == 2 else (2 if dirmode == 4 else (3 if dirmode == 5 else 0)),
+                                           paxis, sd, nbr, kpair, pglob, D, Lp)
                 njs[c] = nj
                 newL[c] = Lc
                 ncs[c] = nc
@@ -799,6 +860,10 @@ def make_sampler(ll_u, parallel, with_data=False):
                 labels[q] = labels[starts[c]]
                 for t0 in range(K):                # new point inherits its start's neighbour list
                     nbr[q, t0] = nbr[starts[c], t0]
+                if dirmode == 5:                   # ... and its local covariance factor
+                    for i in range(ndim):
+                        for i2 in range(ndim):
+                            Lp[q, i, i2] = Lp[starts[c], i, i2]
                 alive[q] = True
                 nfallback += mcount[c]
                 ncall += ncs[c]
@@ -891,10 +956,10 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     t0 = time.perf_counter()
     U, L = init(nlive, ndim, seed, D)
     t1 = time.perf_counter()
-    assert dirs in ("cluster", "knn", "localcov", "knnmh", "pairs")
+    assert dirs in ("cluster", "knn", "localcov", "knnmh", "pairs", "lcov")
     (dU, dL, dlogw, ncall, it, scale, exp_rate, njump, nclus, nclus_max, nrecl,
      nfallback, ins, mix) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0, pjump, nbsub,
-                          {"knn": 0, "cluster": 1, "localcov": 2, "knnmh": 3, "pairs": 4}[dirs], recluster, R,
+                          {"knn": 0, "cluster": 1, "localcov": 2, "knnmh": 3, "pairs": 4, "lcov": 5}[dirs], recluster, R,
                           paxis, kpair, stop if stop is not None else np.zeros(1, dtype=np.int64), pglob, D)
     t2 = time.perf_counter()
     lw = dlogw + dL
@@ -1074,10 +1139,19 @@ def bootstrap_logz(rs, B=40, seed=0):
     return float(np.std(v, ddof=1))
 
 
+# accuracy presets of fit() (SAMPLING.md Round 12)
+ACCURACY = {"high": dict(nlive=1000, lz_tol=0.1, ks_tol=0.05, min_runs=16),
+            "medium": dict(nlive=500, lz_tol=0.2, ks_tol=0.08, min_runs=8)}
+
+
 def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=None, min_runs=None,
         max_runs=96, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True, log=None,
-        post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25, data=None):
+        post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25, data=None,
+        accuracy=None):
     """Nested sampling with built-in convergence checks (SAMPLING.md Rounds 6b, 8).
+
+    accuracy: None (use the arguments) or a preset of ACCURACY (overrides nlive, lz_tol, ks_tol, min_runs):
+    "high" (logZ +-0.1 statistical, KS 0.05, 1000 live), "medium" (+-0.2, KS 0.08, 500 live, >= 8 runs).
 
     Independent serial nss runs (n_live = nlive each) run in parallel threads; they are merged as one
     run (merge_weights). Two arms: the result arm at `nsteps` (default 4 ndim) and, if check=True, a
@@ -1094,6 +1168,10 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     Returns dict(logz (merged result arm), logzerr (empirical), logzerr_boot, samples_u, runs, history,
     passed, nsteps, dlnz_check, ...)."""
     from concurrent.futures import ThreadPoolExecutor
+    if accuracy is not None:
+        a = ACCURACY[accuracy]
+        nlive, lz_tol, ks_tol = a["nlive"], a["lz_tol"], a["ks_tol"]
+        min_runs = min_runs or a["min_runs"]
     nsteps = nsteps or 4 * ndim
     max_nsteps = max_nsteps or 64 * ndim
     min_runs = min_runs or max(threads, 4)
