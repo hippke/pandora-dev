@@ -27,6 +27,10 @@ sys.path.insert(0, HERE)
 
 PLANET = {"p200": (200, 28), "p100": (100, 16)}
 MOON = {"m50": (50, 16), "m100": (100, 16), "m100s32": (100, 32), "m200": (200, 32)}
+# Round 12 (cheaper moon runs): --sizes small
+PLANET_SMALL = {"p100": (100, 16), "p50": (50, 12)}
+MOON_SMALL = {"m50": (50, 16), "m50s8": (50, 8), "m50s12": (50, 12), "m30s16": (30, 16), "m30s8": (30, 8),
+              "m70s8": (70, 8)}
 
 
 def analyse(path, thresholds=(2.0, 3.0), max_repeats=8, nboot=2000):
@@ -82,7 +86,11 @@ def main():
     ap.add_argument("--analyse", default="")
     ap.add_argument("--validate", default="", help="comma list of recall presets: end-to-end first looks, fresh seeds")
     ap.add_argument("--seed0", type=int, default=50_000)
+    ap.add_argument("--sizes", default="default", choices=["default", "small"])
     args = ap.parse_args()
+    global PLANET, MOON
+    if args.sizes == "small":
+        PLANET, MOON = PLANET_SMALL, MOON_SMALL
     if args.analyse:
         analyse(args.analyse)
         return

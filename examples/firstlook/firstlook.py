@@ -55,9 +55,15 @@ DEFAULT_SETTINGS = dict(nlive_planet=200, nsteps_planet=28, nlive_moon=200, nste
 # runs are cheaper than one large run for the same recall (recall_study.py, README.md "Choosing the recall").
 RETRY_BELOW, RETRY_MAX = -15.0, 2
 DEFAULT_RECALL = 0.95
-_P = dict(nlive_planet=100, nsteps_planet=16, nlive_moon=50, nsteps_moon=16, threshold=3.0)
-RECALL_PRESETS = {0.90: dict(_P, repeats=1), 0.95: dict(_P, repeats=1), 0.99: dict(_P, repeats=3),
-                  0.999: dict(_P, repeats=6)}
+# Round 12 (study2: smaller runs): planet run 50 live / nsteps 12; moon runs 50 live / nsteps 8 (0.90, 0.95) or
+# 50 live / nsteps 16 (0.99, 0.999)
+_P = dict(nlive_planet=50, nsteps_planet=12, threshold=3.0)
+# (validate3: 70 live / nsteps 8 x 3 / x 6 reached only 99.35 / 99.87 %: misses of short chains are correlated
+# within a light curve, so 0.99 / 0.999 keep nsteps 16)
+RECALL_PRESETS = {0.90: dict(_P, nlive_moon=50, nsteps_moon=8, repeats=1),
+                  0.95: dict(_P, nlive_moon=50, nsteps_moon=8, repeats=2),
+                  0.99: dict(_P, nlive_moon=50, nsteps_moon=16, repeats=3),
+                  0.999: dict(_P, nlive_moon=50, nsteps_moon=16, repeats=6)}
 
 MOON_NAMES = ['R_star', 'per_bary', 'a_bary', 'r_planet', 'b_bary', 't0_bary_offset', 'M_planet', 'r_moon',
               'phi_c', 'delta', 'u_m', 'Omega_moon', 'i_moon', 'M_moon', 'q1', 'q2']

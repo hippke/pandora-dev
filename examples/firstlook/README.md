@@ -44,33 +44,34 @@ sampler effort:
 - `repeats` independent moon runs, combined as the mean of their Z, all miss with probability
   ~p^repeats.
 
-Several small runs are cheaper than one large one for the same recall. All presets use a planet
-run with 100 live points (nsteps 16), moon runs with 50 live points (nsteps 16), and the
-threshold dlnZ > 3.
+Several small runs are cheaper than one large one for the same recall. The presets (Round 12;
+`recall_study.py --sizes small`, then validated end to end):
+- planet run: 50 live points, nsteps 12;
+- moon runs: 50 live points, nsteps 8 (0.90, 0.95) or nsteps 16 (0.99, 0.999);
+- threshold dlnZ > 3.
 
 Validated end to end (`recall_study.py --validate`, fresh seeds, the 232 moons with reference
-dlnZ ≥ 8 and the 240 no-moon light curves of both injection sets; white noise):
+dlnZ ≥ 8 and the 240 no-moon light curves of both injection sets; white noise). CPU-s from the
+benchmark (`bench_firstlook.py --bench --preset P`, 200 light curves, one core of an AMD Ryzen 9
+7950X):
 
-| `recall=` | moon runs (50 live) | measured recall | misses | false passes | CPU-s / light curve | calls | light curves / hour / core |
+| `recall=` | moon runs | measured recall | misses | false passes | CPU-s / light curve | evaluations | light curves / hour / core |
 |---|---|---|---|---|---|---|---|
-| 0.90, **0.95 (default)** | 1 | **97.9 %** | 24 / 1160 | 2 / 720 | **1.05** | 0.33 M | ~3400 |
-| 0.99 | 3 | **99.78 %** | 4 / 1856 | 2 / 720 | **2.1** | 0.64 M | ~1700 |
-| 0.999 | 6 | **99.97 %** | 1 / 3016 | 1 / 720 | **3.7** | 1.1 M | ~1000 |
+| 0.90 | 1 × (50 live, nsteps 8) | **94.5 %** | 38 / 696 | 2 / 720 | **0.35** | 0.14 M | ~10 200 |
+| **0.95 (default)** | 2 × (50, 8) | **97.3 %** | 31 / 1160 | 1 / 720 | **0.61** | 0.22 M | ~5900 |
+| 0.99 | 3 × (50, 16) | **99.84 %** | 3 / 1856 | 2 / 720 | **1.58** | 0.53 M | ~2300 |
+| 0.999 | 6 × (50, 16) | **100 %** (95 % upper limit of the miss rate 0.10 %) | 0 / 3016 | 2 / 720 | **3.07** | 1.03 M | ~1200 |
 
-- 0.90 uses the 0.95 setting; nothing cheaper has been tested.
-- The 0.99 and 0.999 rows were measured before the retry safeguard (below) and can only improve
-  with it.
-- 99.9 % is at the limit of what 3016 trials can show: 1 miss, 95 % upper limit of the miss rate
-  0.13 %.
-- For comparison, `recall=None` (one moon run with 200 live points) costs 6.4 CPU-s, and a full
-  checked fit ~3600 CPU-s.
-- **Retry safeguard:** the moon model (almost) contains the planet-only model. So a moon run more
-  than 15 nats below the planet-only run has collapsed onto a wrong solution (~0.7 % of the runs
-  with 50 live points). Up to 2 extra moon runs are added in that case. This raised the 0.95
-  preset from 97.0 % to 97.9 % at unchanged cost.
-- The remaining misses are moons a short run finds only sometimes (worst light curve: 60 % miss
-  rate per 50-live run). One moon (PLATO-like, reference dlnZ 18.5) is missed by most runs at every
-  preset.
+- The planet-only model uses the fused planet-only kernel `pandora_loglike_planet` (~2.4× faster
+  per call than a dummy moon).
+- Moon runs with nsteps 8 are not good enough for 0.99 / 0.999: 3 × and 6 × (70 live, nsteps 8)
+  gave only 99.35 % / 99.87 %. Misses of short chains are correlated within a light curve, so
+  repeats help less.
+- **Retry safeguard:** the moon model (almost) contains the planet-only model. So a moon run
+  more than 15 nats below the planet-only run has collapsed onto a wrong solution; up to 2 extra
+  moon runs are added in that case.
+- For comparison: one moon run with 200 live points (`recall=None`, the first calibration's
+  "A") costs ~6 CPU-s; a full checked fit ~3600 CPU-s.
 
 ## For publication: setup, injections, cost
 
@@ -132,9 +133,10 @@ there is no Python per evaluation.
 
 | preset | runs | evaluations | CPU-s |
 |---|---|---|---|
-| `recall=0.95` | 1 planet + 1 moon | ~0.34 M | ~1.05 |
-| `recall=0.99` | 1 + 3 | ~0.64 M | ~2.1 |
-| `recall=0.999` | 1 + 6 | ~1.1 M | ~3.7 |
+| `recall=0.90` | 1 planet + 1 moon (Round 12 presets) | ~0.14 M | ~0.35 |
+| `recall=0.95` | 1 + 2 | ~0.22 M | ~0.61 |
+| `recall=0.99` | 1 + 3 | ~0.53 M | ~1.6 |
+| `recall=0.999` | 1 + 6 | ~1.0 M | ~3.1 |
 | full checked fit (`nss.fit`) | 50–130 runs of 1000 live | ~10⁹ | ~3600 |
 | notebook-style UltraNest planet-only fit | | 2.5 M at 36–60 µs | 90–150 |
 
@@ -210,9 +212,11 @@ dlnZ ≥ 8. Two injection sets:
 
 - The moon parameters are rough but honest. For detected moons, the truth lies inside the 16–84 %
   interval in 64–68 % of the cases. Median errors: P_m 18 %, r_m 4 %, M_m/M_p 26 %.
-- Speed benchmark (`--bench`, 200 light curves, AMD Ryzen 9 7950X): preset 0.95 1.05 CPU-s per light
-  curve (3437 per hour per core); 0.99 2.0 s (1769); 0.999 3.6 s (1004). The older 200-live setting:
-  6.2 s (578).
+- Speed benchmark (`--bench`, 200 light curves, AMD Ryzen 9 7950X), CPU-s per light curve, history:
+  - first default (200 live): 6.2 s;
+  - presets v1 (100 / 50 live, nsteps 16): 0.95 1.05 s, 0.99 2.0 s, 0.999 3.6 s;
+  - planet-only kernel: 0.73 / 1.73 / 3.23 s;
+  - presets v2 (Round 12): 0.90 0.35 s, 0.95 0.61 s, 0.99 1.58 s, 0.999 3.07 s.
 - The calibration table above is for the older 200-live setting (`recall=None`); the presets are in
   "Choosing the recall".
 - A cheaper setting with 100 live points and nsteps 16 (1.2–1.7 CPU-s) misses 1–2 % of the
