@@ -36,7 +36,7 @@ from numba import njit
 
 import pandoramoon as pandora
 from pandoramoon import nss
-from pandoramoon.pandora import pandora_loglike
+from pandoramoon.pandora import pandora_loglike, pandora_loglike_planet
 from pandoramoon.reparam import LOGZERO, Reparam, min_physical_period
 
 R_SUN = 696_342_000.0
@@ -111,12 +111,11 @@ def ll_planet(u, D):
     lo, span, T0, ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f, pix, tsorted = D
     th = u * span + lo
     sq = math.sqrt(th[5])
-    # planet only: r_moon = M_moon = 0 and per_moon 1e-6 d put the moon's orbit inside the planet, so Pandora uses
-    # its planet-only path (planet at the barycentre, window = the planet's transit only; _moon_setup). Same logL as
-    # a dummy physical moon up to rounding (<= 6e-9; SAMPLING.md Round 12), 1.3-1.8x faster per call.
-    return pandora_loglike(2.0 * sq * th[6], sq * (1.0 - 2.0 * th[6]), R_SUN, th[0], th[1], th[2], th[3],
-                           0.0, 0.0, T0, th[4], 1e27, 0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                           ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f, None, pix, tsorted)
+    # pandora_loglike_planet: Pandora's planet-only path (moon orbit inside the planet) as one fused kernel; same
+    # logL as a dummy physical moon up to rounding, ~2.4x faster per call (SAMPLING.md Round 12)
+    return pandora_loglike_planet(2.0 * sq * th[6], sq * (1.0 - 2.0 * th[6]), R_SUN, th[0], th[1], th[2], th[3],
+                                  0.0, 0.0, T0, th[4], 1e27, ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f,
+                                  None, pix, tsorted)
 
 
 # ---------------------------------------------------------------------------------------------
