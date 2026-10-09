@@ -1,0 +1,226 @@
+"""First-look exomoon screening with Pandora (example; not part of the package core).
+
+Idea: a full planet+moon retrieval with self-checks costs ~1e9 likelihood calls. Screening many light
+curves needs something ~100x cheaper that still flags nearly all well-detectable moons. A first look
+runs ONE short nested-sampling run per model (planet only, planet+moon) with the compiled sampler
+`pandoramoon.nss` in the phase-at-transit moon coordinates (`pandoramoon.reparam`), and reports
+
+    dlnZ = lnZ(planet+moon) - lnZ(planet only)
+
+with a verdict "interesting" if dlnZ exceeds a threshold calibrated on injections (bench_firstlook.py),
+plus a rough summary of the moon parameters from the same run. Interesting light curves then go to a
+full fit (nss.fit). The numbers of the calibration are in README.md.
+
+    import firstlook
+    fl = firstlook.FirstLook(time, flux, flux_err, t0_bary=11.0, per_bary=(360.25, 370.25), a_bary=(210, 220))
+    r = fl.run()                      # one light curve, one core, a few seconds
+    r["dlnz"], r["interesting"], r["moon"]
+
+    results = firstlook.run_many([fl1, fl2, ...], threads=16)   # many light curves, one per core
+
+All compiled functions take the data as an argument, so numba compiles once per process (~20-40 s) and
+not per light curve.
+
+Model and priors (the notebook's injection-retrieval example; override with `priors=`):
+  planet only : per_bary, a_bary [R_star], r_planet [R_star], b_bary, t0_bary_offset [d], q1, q2
+  planet+moon : R_star [m], per_bary, a_bary, r_planet, b_bary, t0_bary_offset, M_planet [kg], r_moon [R_star],
+                (phi_c, delta, u_m) <-> (per_moon [d], tau), Omega_moon [deg, 0-360 double cover], i_moon [deg],
+                M_moon [kg], q1, q2
+Both models use the same priors for the shared parameters, so dlnZ is a proper Bayes factor.
+"""
+import math
+import time as _time
+
+import numpy as np
+from numba import njit
+
+import pandoramoon as pandora
+from pandoramoon import nss
+from pandoramoon.pandora import pandora_loglike
+from pandoramoon.reparam import LOGZERO, Reparam, min_physical_period
+
+R_SUN = 696_342_000.0
+
+DEFAULT_PRIORS = dict(
+    R_star=(0.4 * R_SUN, 1.2 * R_SUN), r_planet=(0.07, 0.11), b_bary=(0.0, 1.0), t0_bary_offset=(-0.05, 0.05),
+    M_planet=(1.5e27, 2.5e27), r_moon=(0.01, 0.07), per_moon_max=50.0, per_moon_lo=0.05, i_moon=(0.0, 180.0),
+    M_moon=(1.0, 1e27 + 1.0), q1=(0.0, 1.0), q2=(0.0, 1.0))
+
+# first-look settings ("A" in README.md: recall 100 % of 166 moons with reference dlnZ >= 8, 0 of 160 no-moon
+# light curves above 0; white-noise injections, bench_firstlook.py). threshold 2: a 3-nat margin above the
+# largest no-moon value (-1.1)
+DEFAULT_SETTINGS = dict(nlive_planet=200, nsteps_planet=28, nlive_moon=200, nsteps_moon=32, threshold=2.0)
+
+MOON_NAMES = ['R_star', 'per_bary', 'a_bary', 'r_planet', 'b_bary', 't0_bary_offset', 'M_planet', 'r_moon',
+              'phi_c', 'delta', 'u_m', 'Omega_moon', 'i_moon', 'M_moon', 'q1', 'q2']
+PLANET_NAMES = ['per_bary', 'a_bary', 'r_planet', 'b_bary', 't0_bary_offset', 'q1', 'q2']
+
+
+# ---------------------------------------------------------------------------------------------
+# compiled likelihoods: ll(u, D) with u in the unit cube and D a tuple of data and prior constants
+
+@njit(cache=True)
+def _m_of_u(u, CDF, M_MIN):
+    lo, hi = 0, CDF.shape[0] - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if CDF[mid] > u:
+            hi = mid
+        else:
+            lo = mid + 1
+    return M_MIN + lo
+
+
+@njit(cache=True)
+def _to_native(per_bary, t0_bary, t0_off, phi_c, delta, u_m, e_c, CDF, M_MIN, Q, P_MAX):
+    """pandoramoon.reparam.Reparam.to_native with the tables as arguments"""
+    m = _m_of_u(u_m, CDF, M_MIN)
+    N = m + delta
+    per_moon = per_bary / N
+    t_c = t0_bary + t0_off + e_c * per_bary
+    x = t_c * N / per_bary - phi_c
+    tau = x - math.floor(x)
+    if per_moon > P_MAX:
+        return per_moon, tau, LOGZERO
+    return per_moon, tau, math.log(per_bary / P_MAX * Q * m * (m + 1.0) / (N * N))
+
+
+@njit(fastmath=False)
+def ll_moon(u, D):
+    lo, span, T0, E_C, CDF, M_MIN, Q, P_MAX, ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f, pix, tsorted = D
+    th = u * span + lo
+    pm, tau, logw = _to_native(th[1], T0, th[5], th[8], th[9], th[10], E_C, CDF, M_MIN, Q, P_MAX)
+    if not logw > -1e300:
+        return -1e300
+    sq = math.sqrt(th[14])
+    return logw + pandora_loglike(2.0 * sq * th[15], sq * (1.0 - 2.0 * th[15]), th[0], th[1], th[2], th[3], th[4],
+                                  0.0, 0.0, T0, th[5], th[6], th[7], pm, tau, th[11], th[12], 0.0, 0.0, th[13],
+                                  ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f, None, pix, tsorted)
+
+
+@njit(fastmath=False)
+def ll_planet(u, D):
+    lo, span, T0, ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f, pix, tsorted = D
+    th = u * span + lo
+    sq = math.sqrt(th[5])
+    return pandora_loglike(2.0 * sq * th[6], sq * (1.0 - 2.0 * th[6]), R_SUN, th[0], th[1], th[2], th[3],
+                           0.0, 0.0, T0, th[4], 1e27, 1e-8, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-8,
+                           ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f, None, pix, tsorted)
+
+
+# ---------------------------------------------------------------------------------------------
+
+class FirstLook:
+    def __init__(self, time, flux, flux_err, t0_bary, per_bary, a_bary, epoch_distance=None, priors=None,
+                 supersampling_factor=1):
+        """time [d], flux (normalised), flux_err: the light curve (windows around the transits).
+        t0_bary [d]: reference transit time (the fit's t0_bary_offset is relative to it).
+        per_bary = (lo, hi) [d], a_bary = (lo, hi) [R_star]: uniform priors of the planet's period and
+        semi-major axis (usually narrow: the planet is known). priors: overrides of DEFAULT_PRIORS."""
+        pr = dict(DEFAULT_PRIORS)
+        pr.update(priors or {})
+        pr["per_bary"], pr["a_bary"] = tuple(map(float, per_bary)), tuple(map(float, a_bary))
+        self.priors = pr
+        self.t0_bary = float(t0_bary)
+        ed = float(epoch_distance) if epoch_distance is not None else 0.5 * sum(pr["per_bary"]) + 0.01
+        self.like = like = pandora.Likelihood(np.asarray(time, float), np.asarray(flux, float),
+                                              np.asarray(flux_err, float), epoch_distance=ed,
+                                              supersampling_factor=supersampling_factor, occult_small_threshold=0.0,
+                                              hill_sphere_threshold=1.0, numerical_grid=25)
+        tail = like._tail
+        assert tail[9] is None
+        self._tail = tail[:9] + tail[10:]
+        ep = np.unique(np.floor((np.asarray(time) - self.t0_bary) / ed + 0.5).astype(int))
+        self.e_c = int(round(float(np.mean(ep))))
+        self.ndata = len(time)
+        # planet+moon: unit cube -> parameters
+        b = lambda k: pr[k]                                   # noqa: E731
+        lo = np.array([b("R_star")[0], b("per_bary")[0], b("a_bary")[0], b("r_planet")[0], b("b_bary")[0],
+                       b("t0_bary_offset")[0], b("M_planet")[0], b("r_moon")[0], 0, 0, 0, 0, b("i_moon")[0],
+                       b("M_moon")[0], b("q1")[0], b("q2")[0]], dtype=float)
+        hi = np.array([b("R_star")[1], b("per_bary")[1], b("a_bary")[1], b("r_planet")[1], b("b_bary")[1],
+                       b("t0_bary_offset")[1], b("M_planet")[1], b("r_moon")[1], 1, 1, 1, 360, b("i_moon")[1],
+                       b("M_moon")[1], b("q1")[1], b("q2")[1]], dtype=float)
+        self.lo_m, self.span_m = lo, hi - lo
+        self.wrapped_m = np.zeros(16, dtype=np.bool_)
+        self.wrapped_m[[8, 9, 11]] = True                     # phi_c, delta, Omega (double cover)
+        self.rp = rp = Reparam(pr["per_bary"][0], pr["per_bary"][1], p_max=pr["per_moon_max"], p_lo=pr["per_moon_lo"],
+                               e_c=self.e_c)
+        p_phys = min_physical_period(R_star_max=hi[0], rsum_min=lo[3] + lo[7], M_total_max=hi[6] + hi[13])
+        if not pr["per_moon_lo"] < p_phys:
+            raise ValueError(f"per_moon_lo must be below {p_phys:.4f} d (shortest physical moon period)")
+        self.D_m = (lo, self.span_m, self.t0_bary, float(self.e_c), rp.CDF, int(rp.M_MIN), float(rp.Q),
+                    float(rp.P_MAX)) + self._tail
+        # planet only
+        idx = [1, 2, 3, 4, 5, 14, 15]
+        self.lo_p, self.span_p = lo[idx].copy(), self.span_m[idx].copy()
+        self.D_p = (self.lo_p, self.span_p, self.t0_bary) + self._tail
+
+    # -- helpers --
+    def moon_native(self, U):
+        """unit-cube moon-model samples -> dict of physical arrays (per_moon, tau folded with Omega)"""
+        th = self.lo_m + np.atleast_2d(U) * self.span_m
+        q = self.rp.new_to_native_samples(th, t0_bary=self.t0_bary, e_c=self.e_c)
+        names = ['R_star', 'per_bary', 'a_bary', 'r_planet', 'b_bary', 't0_bary_offset', 'M_planet', 'r_moon',
+                 'per_moon', 'tau', 'Omega_moon', 'i_moon', 'M_moon', 'q1', 'q2']
+        return {n: q[:, i] for i, n in enumerate(names)}
+
+    def run(self, nlive_planet=None, nsteps_planet=None, nlive_moon=None, nsteps_moon=None, seed=1, threshold=None,
+            keep_samples=False):
+        """one short nss run per model (serial, one core). Returns dict: dlnz, logz_planet, logz_moon,
+        interesting (dlnz > threshold), moon (median and 16/84 % of the main moon parameters), maxL point,
+        calls, cpu seconds."""
+        st = dict(DEFAULT_SETTINGS)
+        for k, v in (("nlive_planet", nlive_planet), ("nsteps_planet", nsteps_planet), ("nlive_moon", nlive_moon),
+                     ("nsteps_moon", nsteps_moon), ("threshold", threshold)):
+            if v is not None:
+                st[k] = v
+        t0 = _time.perf_counter()
+        c0 = _time.thread_time()
+        rp_ = nss.run(ll_planet, 7, nlive=st["nlive_planet"], nsteps=st["nsteps_planet"], seed=seed, dirs="pairs",
+                      kpair=4, data=self.D_p)
+        t1 = _time.perf_counter()
+        c1 = _time.thread_time()
+        rm = nss.run(ll_moon, 16, wrapped=self.wrapped_m, nlive=st["nlive_moon"], nsteps=st["nsteps_moon"],
+                     seed=seed + 7, dirs="pairs", kpair=4, data=self.D_m)
+        t2 = _time.perf_counter()
+        c2 = _time.thread_time()
+        dl = rm["logz"] - rp_["logz"]
+        nat = self.moon_native(rm["samples_u"])
+        summ = {}
+        for n, scale in (("per_moon", 1.0), ("r_moon", 1.0), ("i_moon", 1.0), ("Omega_moon", 1.0)):
+            summ[n] = tuple(float(v) for v in np.percentile(nat[n] * scale, [50, 16, 84]))
+        mr = nat["M_moon"] / nat["M_planet"]
+        summ["M_moon/M_planet"] = tuple(float(v) for v in np.percentile(mr, [50, 16, 84]))
+        best = self.moon_native(rm["dead_u"][np.argmax(rm["dead_L"])])
+        out = dict(dlnz=float(dl), dlnz_err=float(math.hypot(rm["logzerr"], rp_["logzerr"])),
+                   logz_planet=rp_["logz"], logz_moon=rm["logz"], maxL_planet=rp_["maxL"], maxL_moon=rm["maxL"],
+                   dmaxL=float(rm["maxL"] - rp_["maxL"]),
+                   interesting=(None if st["threshold"] is None else bool(dl > st["threshold"])),
+                   moon=summ, best={k: float(v[0]) for k, v in best.items()},
+                   ncall_planet=rp_["ncall"], ncall_moon=rm["ncall"], ncall=rp_["ncall"] + rm["ncall"],
+                   wall=t2 - t0, cpu_planet=c1 - c0, cpu_moon=c2 - c1, cpu=c2 - c0, settings=st, ndata=self.ndata,
+                   insertion_p_moon=rm["insertion"].get("p"))
+        if keep_samples:
+            out["samples_moon"] = nat
+        return out
+
+
+def warmup():
+    """compile everything once (call before using threads)"""
+    t = np.linspace(10.0, 12.0, 96)
+    fl = FirstLook(t, np.ones_like(t), np.full_like(t, 1e-3), t0_bary=11.0, per_bary=(360.0, 370.0),
+                   a_bary=(210.0, 220.0))
+    nss.run(ll_planet, 7, nlive=40, nsteps=2, max_iter=3, dirs="pairs", data=fl.D_p)
+    nss.run(ll_moon, 16, wrapped=fl.wrapped_m, nlive=40, nsteps=2, max_iter=3, dirs="pairs", data=fl.D_m)
+
+
+def run_many(firstlooks, threads=16, seeds=None, **kw):
+    """first looks of many light curves in parallel threads (one light curve per thread; the compiled
+    sampler releases the GIL). Returns the list of results in input order."""
+    from concurrent.futures import ThreadPoolExecutor
+    warmup()
+    seeds = seeds or [1 + 1000 * i for i in range(len(firstlooks))]
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        futs = [ex.submit(f.run, seed=s, **kw) for f, s in zip(firstlooks, seeds)]
+        return [f.result() for f in futs]

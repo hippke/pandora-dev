@@ -83,10 +83,18 @@ _SAMPLERS = {}
 MAXEXP = 100     # max linear step-outs per side and slice
 
 
-def make_sampler(ll_u, parallel):
-    key = (id(ll_u), parallel)
+def make_sampler(ll_u, parallel, with_data=False):
+    """compiled sampler for ll_u. with_data=False: ll_u(u); with_data=True: ll_u(u, D) with a data tuple D passed
+    through run(data=D), so ONE compiled sampler serves many data sets (no recompilation per light curve)."""
+    key = (id(ll_u), parallel, with_data)
     if key in _SAMPLERS:
         return _SAMPLERS[key]
+    if with_data:
+        LL = ll_u
+    else:
+        @njit(inline="always")
+        def LL(x, D):
+            return ll_u(x)
 
     @njit(inline="always")
     def wrap_inside(x, wrapped):
@@ -351,7 +359,7 @@ def make_sampler(ll_u, parallel):
         return out
 
     @njit
-    def chain_knnmh(U, j, L0, R, nR, sd, K, Lmin, nsteps, scale, wrapped, x, xn, d2):
+    def chain_knnmh(U, j, L0, R, nR, sd, K, Lmin, nsteps, scale, wrapped, x, xn, d2, D):
         """slice chain with position-dependent knn directions made reversible
         by a Metropolis-Hastings check: N(x) = the K nearest reference points
         U[R] to x (R fixed during the chain); a step uses v = U[a] - U[b] with
@@ -390,7 +398,7 @@ def make_sampler(ll_u, parallel):
                 if not wrap_inside(xn, wrapped):
                     break
                 nc += 1
-                if ll_u(xn) > Lmin:
+                if LL(xn, D) > Lmin:
                     left -= scale
                     nexp += 1
                 else:
@@ -401,7 +409,7 @@ def make_sampler(ll_u, parallel):
                 if not wrap_inside(xn, wrapped):
                     break
                 nc += 1
-                if ll_u(xn) > Lmin:
+                if LL(xn, D) > Lmin:
                     right += scale
                     nexp += 1
                 else:
@@ -414,7 +422,7 @@ def make_sampler(ll_u, parallel):
                     xn[i] = x[i] + v[i] * t
                 if wrap_inside(xn, wrapped):
                     nc += 1
-                    Lx = ll_u(xn)
+                    Lx = LL(xn, D)
                     if Lx > Lmin:
                         ok = True
                         break
@@ -485,7 +493,7 @@ def make_sampler(ll_u, parallel):
 
     @njit
     def chain(U, j, L0, nb, Lmin, nsteps, scale, wrapped, x, xn, alive, pjump, chol, dmode, paxis, sdv, nbr, kpair,
-              pglob):
+              pglob, D):
         """slice chain at fixed Lmin from U[j] (logL L0); directions =
         differences of members of nb; with probability pjump per step an
         additional differential-evolution jump x + (U_a - U_b) (a, b random
@@ -515,7 +523,7 @@ def make_sampler(ll_u, parallel):
                     xn[i] = x[i] + U[a, i] - U[b, i]
                 if wrap_inside(xn, wrapped):
                     nc += 1
-                    Lx = ll_u(xn)
+                    Lx = LL(xn, D)
                     if Lx > Lmin:
                         for i in range(ndim):
                             x[i] = xn[i]
@@ -582,7 +590,7 @@ def make_sampler(ll_u, parallel):
                 if not wrap_inside(xn, wrapped):
                     break
                 nc += 1
-                if ll_u(xn) > Lmin:
+                if LL(xn, D) > Lmin:
                     left -= scale
                     nexp += 1
                 else:
@@ -593,7 +601,7 @@ def make_sampler(ll_u, parallel):
                 if not wrap_inside(xn, wrapped):
                     break
                 nc += 1
-                if ll_u(xn) > Lmin:
+                if LL(xn, D) > Lmin:
                     right += scale
                     nexp += 1
                 else:
@@ -605,7 +613,7 @@ def make_sampler(ll_u, parallel):
                     xn[i] = x[i] + v[i] * t
                 if wrap_inside(xn, wrapped):
                     nc += 1
-                    Lx = ll_u(xn)
+                    Lx = LL(xn, D)
                     if Lx > Lmin:
                         for i in range(ndim):
                             x[i] = xn[i]
@@ -634,7 +642,7 @@ def make_sampler(ll_u, parallel):
 
     @njit(parallel=parallel, nogil=True)
     def ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed, scale0, pjump, M, dirmode, recluster, R,
-           paxis, kpair, stop, pglob):
+           paxis, kpair, stop, pglob, D):
         n, ndim = U.shape
         # seeds (per thread in parallel mode: numba seeds each thread's state)
         np.random.seed(seed)
@@ -750,11 +758,11 @@ def make_sampler(ll_u, parallel):
                 if dirmode == 3:
                     nR = refset(alive, starts[c], M, idxs[c])
                     Lc, nc, ne, nj = chain_knnmh(U, starts[c], L[starts[c]], idxs[c], nR, sd, K, Lmin, nsteps, scale,
-                                                 wrapped, xs[c], xns[c], d2s[c])
+                                                 wrapped, xs[c], xns[c], d2s[c], D)
                 else:
                     Lc, nc, ne, nj = chain(U, starts[c], L[starts[c]], mem, Lmin, nsteps, scale, wrapped, xs[c],
                                            xns[c], alive, pjump, chol, 1 if dirmode == 2 else (2 if dirmode == 4 else 0),
-                                           paxis, sd, nbr, kpair, pglob)
+                                           paxis, sd, nbr, kpair, pglob, D)
                 njs[c] = nj
                 newL[c] = Lc
                 ncs[c] = nc
@@ -817,12 +825,12 @@ def make_sampler(ll_u, parallel):
                 nclus, nclus_max, nrecl, nfallback, ins[:nins], mix / max(nmix, 1))
 
     @njit(parallel=parallel, nogil=True)
-    def init(n, ndim, seed):
+    def init(n, ndim, seed, D):
         np.random.seed(seed)
         U = np.random.uniform(0.0, 1.0, (n, ndim))
         L = np.empty(n)
         for a in prange(n):
-            L[a] = ll_u(U[a])
+            L[a] = LL(U[a], D)
         return U, L
 
     _SAMPLERS[key] = (ns, init)
@@ -867,25 +875,27 @@ def insertion_test(ranks, m, nlive, seed=0):
 
 def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_remain=0.01,
         max_iter=10_000_000, seed=1, scale0=1.0, threads=None, pjump=0.0, nbsub=2000, dirs="cluster",
-        recluster=0.25, R=200, paxis=0.0, kpair=4, stop=None, pglob=0.0):
-    """returns dict(logz, logzerr, ncall, niter, wall, samples_u (equal weight), dead_u, dead_L, logw)"""
+        recluster=0.25, R=200, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None):
+    """returns dict(logz, logzerr, ncall, niter, wall, samples_u (equal weight), dead_u, dead_L, logw).
+    data: None -> ll_u(u); a tuple D -> ll_u(u, D) (one compiled sampler for many data sets)"""
     import numba
     parallel = k > 1
     assert 1 <= k <= nlive // 4, "k (points replaced per iteration) must be <= nlive / 4"
     if threads is not None:
         numba.set_num_threads(threads)
-    ns, init = make_sampler(ll_u, parallel)
+    ns, init = make_sampler(ll_u, parallel, data is not None)
+    D = data if data is not None else (0,)
     wrapped = np.array(wrapped if wrapped is not None else [False] * ndim, dtype=np.bool_)
     nsteps = nsteps or 4 * ndim
     K = K or 2 * ndim
     t0 = time.perf_counter()
-    U, L = init(nlive, ndim, seed)
+    U, L = init(nlive, ndim, seed, D)
     t1 = time.perf_counter()
     assert dirs in ("cluster", "knn", "localcov", "knnmh", "pairs")
     (dU, dL, dlogw, ncall, it, scale, exp_rate, njump, nclus, nclus_max, nrecl,
      nfallback, ins, mix) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0, pjump, nbsub,
                           {"knn": 0, "cluster": 1, "localcov": 2, "knnmh": 3, "pairs": 4}[dirs], recluster, R,
-                          paxis, kpair, stop if stop is not None else np.zeros(1, dtype=np.int64), pglob)
+                          paxis, kpair, stop if stop is not None else np.zeros(1, dtype=np.int64), pglob, D)
     t2 = time.perf_counter()
     lw = dlogw + dL
     logz = float(np.logaddexp.reduce(lw))
@@ -1066,7 +1076,7 @@ def bootstrap_logz(rs, B=40, seed=0):
 
 def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=None, min_runs=None,
         max_runs=96, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True, log=None,
-        post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25):
+        post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25, data=None):
     """Nested sampling with built-in convergence checks (SAMPLING.md Rounds 6b, 8).
 
     Independent serial nss runs (n_live = nlive each) run in parallel threads; they are merged as one
@@ -1087,8 +1097,8 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     nsteps = nsteps or 4 * ndim
     max_nsteps = max_nsteps or 64 * ndim
     min_runs = min_runs or max(threads, 4)
-    make_sampler(ll_u, False)                    # compile once, outside the threads
-    run(ll_u, ndim, wrapped=wrapped, nlive=max(40, 2 * ndim + 8), nsteps=2, k=1, max_iter=3, seed=seed + 999,
+    make_sampler(ll_u, False, data is not None)  # compile once, outside the threads
+    run(ll_u, ndim, wrapped=wrapped, nlive=max(40, 2 * ndim + 8), nsteps=2, k=1, max_iter=3, seed=seed + 999, data=data,
         dirs=dirs, kpair=min(kpair, 4))
     arms = {}                                    # nsteps -> list of runs
     hist = []
@@ -1171,7 +1181,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 nxt += 1
                 inflight[ex.submit(run, ll_u, ndim, wrapped=wrapped, nlive=nlive, nsteps=ns, k=1, seed=sd, dirs=dirs,
                                    frac_remain=frac_remain, paxis=paxis, kpair=kpair, stop=stopflag, pglob=pglob,
-                                   recluster=recluster)] = ns
+                                   recluster=recluster, data=data)] = ns
 
         top_up()
         ndone = 0
