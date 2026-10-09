@@ -111,8 +111,11 @@ def ll_planet(u, D):
     lo, span, T0, ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f, pix, tsorted = D
     th = u * span + lo
     sq = math.sqrt(th[5])
+    # planet only: r_moon = M_moon = 0 and per_moon 1e-6 d put the moon's orbit inside the planet, so Pandora uses
+    # its planet-only path (planet at the barycentre, window = the planet's transit only; _moon_setup). Same logL as
+    # a dummy physical moon up to rounding (<= 6e-9; SAMPLING.md Round 12), 1.3-1.8x faster per call.
     return pandora_loglike(2.0 * sq * th[6], sq * (1.0 - 2.0 * th[6]), R_SUN, th[0], th[1], th[2], th[3],
-                           0.0, 0.0, T0, th[4], 1e27, 1e-8, 30.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-8,
+                           0.0, 0.0, T0, th[4], 1e27, 0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                            ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f, None, pix, tsorted)
 
 
