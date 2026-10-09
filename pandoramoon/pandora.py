@@ -755,6 +755,90 @@ def pandora_loglike(
     return -0.5 * chi2
 
 
+# Planet-only model: the moon parameters that select Pandora's planet-only path
+# (moon orbit inside the planet -> _moon_setup "unphysical": planet at the
+# barycentre, window = the planet's transit only)
+PLANET_ONLY_MOON = (0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)  # r_moon, per_moon, tau, Omega, i, ecc, w, M_moon
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def pandora_loglike_planet(
+    u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+    t0_bary, t0_bary_offset, M_planet, epoch_distance, supersampling_factor,
+    occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
+    inv_var, lin_terms, chi2_flat, cache, eclipse_pixelmap, time_sorted
+):
+    """Log-likelihood of the planet-only model (no moon): the same value as
+    pandora_loglike() with the moon parameters PLANET_ONLY_MOON (r_moon =
+    M_moon = 0, per_moon = 1e-6 d), up to rounding, but faster (no moon
+    setup, no moon arrays and occultation pass; the planet's z^2, flux and
+    the chi^2 in three passes over the planet's transit windows). The
+    trailing arguments are those of Likelihood._tail. Falls back to
+    pandora_loglike() for eccentric planets, supersampling, the occultation
+    cache, unsorted time, a planet smaller than the dummy orbit (r_planet <
+    1e-3) or when the sorted window search does not apply."""
+    r_m, p_m, tau_m, om_m, i_m, e_m, w_m, m_m = PLANET_ONLY_MOON
+    fast = (ecc_bary == 0 and supersampling_factor <= 1 and time_sorted and r_planet >= 1e-3)
+    if cache is not None:
+        fast = False
+    if not fast:
+        return pandora_loglike(
+            u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+            t0_bary, t0_bary_offset, M_planet, r_m, p_m, tau_m, om_m, i_m, e_m,
+            w_m, m_m, epoch_distance, supersampling_factor, occult_small_threshold,
+            hill_sphere_threshold, numerical_grid, time, inv_var, lin_terms,
+            chi2_flat, cache, eclipse_pixelmap, time_sorted
+        )
+    if not params_valid(
+        u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+        t0_bary, t0_bary_offset, M_planet, r_m, p_m, tau_m, om_m, i_m, e_m, w_m,
+        m_m, epoch_distance, supersampling_factor, numerical_grid
+    ):
+        return NEG_INF
+    reach = 1 + r_planet + 1e-6          # _cull_reach() of the planet-only path
+    ok, los, his, c_t, c_d, tdur, t0_shift = x_bary_runs_sorted(
+        time, float(a_bary), float(per_bary), float(t0_bary), float(t0_bary_offset),
+        epoch_distance, 0.0, float(w_bary), reach
+    )
+    if not ok:
+        return pandora_loglike(
+            u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
+            t0_bary, t0_bary_offset, M_planet, r_m, p_m, tau_m, om_m, i_m, e_m,
+            w_m, m_m, epoch_distance, supersampling_factor, occult_small_threshold,
+            hill_sphere_threshold, numerical_grid, time, inv_var, lin_terms,
+            chi2_flat, cache, eclipse_pixelmap, time_sorted
+        )
+    total = 0
+    for k in range(len(los)):
+        total += his[k] - los[k]
+    b = float(b_bary)
+    b2 = b * b
+    z2 = np.empty(total)
+    m = 0
+    for k in range(len(los)):
+        ct = c_t[k]
+        cd = c_d[k]
+        lo = los[k]
+        for j in range(his[k] - lo):
+            x = (2 * (time[lo + j] - ct)) / tdur - t0_shift - cd
+            z2[m + j] = x * x + b2
+        m += his[k] - lo
+    flux = occult_hybrid_z2(z2, float(r_planet), u1, u2)
+    chi2 = 0.0
+    m = 0
+    for k in range(len(los)):
+        lo = los[k]
+        cnt = his[k] - lo
+        wr = inv_var[lo:lo + cnt]
+        cr = lin_terms[lo:lo + cnt]
+        fr = flux[m:m + cnt]
+        for j in range(cnt):
+            d = 1.0 - fr[j]
+            chi2 += d * (wr[j] * d - cr[j])
+        m += cnt
+    return -0.5 * (chi2_flat + chi2)
+
+
 # ----------------------------------------------------------------------------
 # Building blocks of pandora()
 # ----------------------------------------------------------------------------
