@@ -60,7 +60,7 @@ benchmark (`bench_firstlook.py --bench --preset P`, 200 light curves, one core o
 | 0.90 | 1 × (50 live, nsteps 8) | **94.5 %** | 38 / 696 | 2 / 720 | **0.35** | 0.14 M | ~10 200 |
 | **0.95 (default)** | 2 × (50, 8) | **97.3 %** | 31 / 1160 | 1 / 720 | **0.61** | 0.22 M | ~5900 |
 | 0.99 | 3 × (50, 16) | **99.84 %** | 3 / 1856 | 2 / 720 | **1.58** | 0.53 M | ~2300 |
-| 0.999 | 6 × (50, 16) | **100 %** (95 % upper limit of the miss rate 0.10 %) | 0 / 3016 | 2 / 720 | **3.07** | 1.03 M | ~1200 |
+| 0.999 | 6 × (50, 16) | **100 %** (95 % upper limit of the miss rate 0.023 %) | 0 / 12 992 | 3 / 1440 | **3.07** | 1.03 M | ~1200 |
 
 - The planet-only model uses the fused planet-only kernel `pandora_loglike_planet` (~2.4× faster
   per call than a dummy moon).

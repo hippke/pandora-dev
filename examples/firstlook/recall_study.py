@@ -87,6 +87,7 @@ def main():
     ap.add_argument("--validate", default="", help="comma list of recall presets: end-to-end first looks, fresh seeds")
     ap.add_argument("--seed0", type=int, default=50_000)
     ap.add_argument("--sizes", default="default", choices=["default", "small"])
+    ap.add_argument("--vseeds", type=int, default=0, help="--validate: seeds per moon light curve (0: preset default)")
     args = ap.parse_args()
     global PLANET, MOON
     if args.sizes == "small":
@@ -105,7 +106,7 @@ def main():
         presets = [float(x) for x in args.validate.split(",")]
         jobs = []
         for p in presets:
-            nsp = {0.9: 3, 0.95: 5, 0.99: 8, 0.999: 13}.get(p, 5)
+            nsp = args.vseeds or {0.9: 3, 0.95: 5, 0.99: 8, 0.999: 13}.get(p, 5)
             for k, d in ref.items():
                 if (k[2] and d >= 8) or not k[2]:
                     jobs += [(p, k, s) for s in range(nsp if k[2] else 3)]
