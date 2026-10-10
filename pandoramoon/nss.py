@@ -949,6 +949,22 @@ def _ks_sets(ra, rb, post_map, sub=40_000, seed=0):
     return float(d[j]), j
 
 
+def ks_null(ra, rb, post_map, nperm=19, sub=20_000, seed=0):
+    """noise distribution of the KS distance between the merged arms ra and rb (Round 16): KS distances between
+    random re-splits of the pooled runs into two sets of the arms' sizes (if both arms sample the same posterior,
+    their runs are exchangeable). Returns an array of nperm values."""
+    rng = np.random.default_rng(seed)
+    allr = list(ra) + list(rb)
+    na = len(ra)
+    out = []
+    for k in range(nperm):
+        idx = rng.permutation(len(allr))
+        A = [allr[i] for i in sorted(idx[:na])]
+        B = [allr[i] for i in sorted(idx[na:])]
+        out.append(_ks_sets(A, B, post_map, sub=sub, seed=seed + 31 * k)[0])
+    return np.array(out)
+
+
 def pooled_insertion(rs):
     """insertion-index test pooled over runs: KS of all jittered insertion ranks (uniform for exact NS) and
     the Fisher combination of the per-run p-values. Returns (D, p_pooled, p_fisher)."""
@@ -983,7 +999,7 @@ ACCURACY = {"high": dict(nlive=1000, lz_tol=0.1, ks_tol=0.05, min_runs=16),
 def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=None, min_runs=None,
         max_runs=96, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True, log=None,
         post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25, data=None,
-        accuracy=None, resume=None, callback=None):
+        accuracy=None, resume=None, callback=None, check_rule="r16"):
     """Nested sampling with built-in convergence checks (SAMPLING.md Rounds 6b, 8).
 
     accuracy: None (use the arguments) or a preset of ACCURACY (overrides nlive, lz_tol, ks_tol, min_runs):
@@ -1003,6 +1019,15 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     remaining bias at N. Stops at max_runs (result arm) with passed=False if the checks fail.
     Returns dict(logz (merged result arm), logzerr (empirical), logzerr_boot, samples_u, runs, history,
     passed, nsteps, dlnz_check, ...).
+
+    check_rule: "r16" (default since Round 16) or "r8" (the rule of Rounds 8-15). "r16" judges the SIZE of the
+    difference between the arms against the tolerances, not its significance (SAMPLING.md Round 16): the KS
+    distance between the arms is compared with ks_tol after removing its noise (permutation null of the arms'
+    KS, ks_null): pass the KS part if ksa^2 - median(null)^2 <= ks_tol^2, escalate if ksa^2 - max(null)^2 >
+    ks_tol^2, otherwise add runs. dlnZ: pass if |d| + sigma <= 2 lz_tol, escalate if |d| - 2 sigma > 2 lz_tol
+    (3 sigma while an arm has fewer than min_runs runs: the sd of lnZ from few runs is unreliable), grey zone
+    (own criteria met, sigma <= 0.6 lz_tol) only if |d| - sigma > lz_tol. Offline simulations on pools of real
+    runs: false escalations C0 25 % -> 2 %, C7 47 % -> 0 % (cost -13 %), logZ unchanged.
 
     Resume (Round 15, used by pandoramoon.sampling): callback(event, **kw) is called in the main thread with
     event "run" (r=run dict, nsteps=arm, idx=run index) for every finished run that enters an arm, and "state"
@@ -1060,6 +1085,8 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
         d = sC["mean"] - sR["mean"]
         sig = math.hypot(sR["err"], sC["err"])
         enough = sC["M"] >= max(4, min_runs // 2) and sR["M"] >= max(4, min_runs // 2)
+        if check_rule == "r16":
+            return bool(enough and N < max_nsteps and abs(d) - 2 * sig > 2 * lz_tol)
         return bool(enough and N < max_nsteps and abs(d) > 2 * lz_tol and abs(d) > 2.5 * sig)
 
     def evaluate(N, final=False):
@@ -1085,12 +1112,27 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
             sig = math.hypot(sR["err"], sC["err"])
             ksa, ja = _ks_sets(sC["good"], Rg, post_map, seed=len(R) + 7) if len(sC["good"]) >= 2 else (np.nan, -1)
             h.update(check_nsteps=Nc, check_runs=sC["M"], dlnz=d, dlnz_err=sig, ks_arms=ksa, ks_arms_param=ja)
-            # bias at N ~ dlnZ(N/2, N) if it falls at least like 1/nsteps (known-Z tests, SAMPLING.md Round 8):
-            # pass if its ~1 sigma upper bound is <= 2 lz_tol; escalate if it is significantly above that
-            ok_bias = bool(abs(d) + sig <= 2 * lz_tol and ksa <= ks_tol)
             enough = sC["M"] >= max(4, min_runs // 2) and sR["M"] >= max(4, min_runs // 2)
-            escalate = bool(enough and N < max_nsteps and
-                            ((abs(d) > 2 * lz_tol and abs(d) > 2.5 * sig) or ksa > max(ks_tol, 2 * ks)))
+            if check_rule == "r16":
+                need = bool(np.isfinite(ksa) and ksa > ks_tol)
+                if need:
+                    nl = ks_null(sC["good"], Rg, post_map, seed=len(R) + 101)
+                    med, hi = float(np.median(nl)), float(nl.max())
+                else:
+                    med = hi = 0.0
+                h.update(ks_null_med=med, ks_null_hi=hi)
+                ks_pass = (not need) or (ksa * ksa - med * med <= ks_tol * ks_tol)
+                ks_esc = need and (ksa * ksa - hi * hi > ks_tol * ks_tol)
+                k_sig = 3.0 if min(sR["M"], sC["M"]) < min_runs else 2.0
+                dl_esc = abs(d) - k_sig * sig > 2 * lz_tol
+                ok_bias = bool(abs(d) + sig <= 2 * lz_tol and ks_pass)
+                escalate = bool(enough and N < max_nsteps and (dl_esc or ks_esc))
+            else:
+                # bias at N ~ dlnZ(N/2, N) if it falls at least like 1/nsteps (known-Z tests, SAMPLING.md Round 8):
+                # pass if its ~1 sigma upper bound is <= 2 lz_tol; escalate if it is significantly above that
+                ok_bias = bool(abs(d) + sig <= 2 * lz_tol and ksa <= ks_tol)
+                escalate = bool(enough and N < max_nsteps and
+                                ((abs(d) > 2 * lz_tol and abs(d) > 2.5 * sig) or ksa > max(ks_tol, 2 * ks)))
         hist.append(h)
         if verbose:
             s = (f"  fit: nsteps {N:4d}: {sR['M']:3d} runs x {nlive} live: logZ {lzR:.3f} +- {sR['err']:.3f} "
@@ -1108,8 +1150,10 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
         # more than 10 % failed runs: n_live per run too small to find the best mode reliably
         own_ok = bool(sR["M"] >= min_runs and ks <= ks_tol and sR["err"] <= lz_tol)
         passed = bool(own_ok and ok_bias and sR["n_failed"] <= 0.1 * sR["M_all"])
-        if check and own_ok and not ok_bias and N < max_nsteps and (h["dlnz_err"] <= 0.6 * lz_tol
-                                                                     or h["ks_arms"] > ks_tol):
+        grey_r8 = check_rule != "r16" and (h.get("dlnz_err", np.inf) <= 0.6 * lz_tol or h.get("ks_arms", 0) > ks_tol)
+        grey_r16 = (check_rule == "r16" and h.get("dlnz_err", np.inf) <= 0.6 * lz_tol
+                    and abs(h.get("dlnz", 0.0)) - h.get("dlnz_err", np.inf) > lz_tol)
+        if check and own_ok and not ok_bias and N < max_nsteps and (grey_r8 or grey_r16):
             # grey zone (C0: dlnZ ~ 0.15-0.2 or KS arms ~ ks_tol for 50+ runs): the result arm is converged by
             # its own criteria but the nsteps check does not pass, and the check is precise enough to say so
             # (C7: escalated at dlnZ 0.10 +- 0.10 without the sigma condition) -> doubling nsteps is cheaper
