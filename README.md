@@ -73,6 +73,29 @@ See the [example workflow](https://github.com/hippke/Pandora/blob/main/examples/
 | `pandora_deficit()` | `1 - flux` for the three components, float32 (half the memory; 2^-24 relative precision of the deficit) | own likelihoods on dense arrays |
 | `pandora_window()` | `(idx, flux_planet, flux_moon, flux_total)` at the output cadences near transit only (flux is 1 elsewhere); `time_sorted=True` for ascending time | own likelihoods, sparse |
 
+### Fitting: evidence and posterior with the built-in nested sampler
+`NestedSampler` fits a `Likelihood` with priors, compares planet+moon with planet-only (Bayes factor) and checks its own convergence. Parameters are Pandora's (same names and units); give a prior or a fixed number for each. The limb darkening is set as `q1, q2` (Kipping) or `u1, u2` (e.g. `Normal` priors from stellar models, with `ld_correlation`). `w_bary`, `ecc_bary`, `ecc_moon` and `w_moon` default to 0.
+
+```
+from pandoramoon import NestedSampler, Uniform, LogUniform, Normal
+R_sun = 696_342_000
+priors = dict(q1=Uniform(0, 1), q2=Uniform(0, 1), R_star=Uniform(0.4 * R_sun, 1.2 * R_sun),
+              per_bary=Uniform(360.25, 370.25), a_bary=Uniform(210, 220), r_planet=Uniform(0.07, 0.11),
+              b_bary=Uniform(0, 1), t0_bary=11.0, t0_bary_offset=Uniform(-0.05, 0.05),
+              M_planet=Uniform(1.5e27, 2.5e27), r_moon=Uniform(0.01, 0.07), per_moon=Uniform(0, 50),
+              tau_moon=Uniform(0, 1), Omega_moon=Uniform(0, 180), i_moon=Uniform(0, 180), M_moon=Uniform(1, 1e27))
+sampler = NestedSampler(like, priors, log_dir="fit_out")    # model="moon" (default) or "planet"
+results = sampler.run()                                     # accuracy="high" (logZ +-0.1) or "medium"
+sampler.print_results()
+results["logz"], results["logzerr"], results["dlogz"]      # dlogz = logZ(moon) - logZ(planet only)
+results["samples"], results["paramnames"]                  # equal-weight posterior samples
+results["planet"]                                           # the planet-only fit, same structure
+```
+- **Results** follow UltraNest's result dictionary: `logz`, `logzerr`, `samples`, `weighted_samples`, `posterior` (mean, stdev, median, errlo, errup), `maxlikelihood`, `ncall`, `ess`, `H`, `paramnames`. In addition: `passed` (the self-checks), `history`, `nsteps`, `runs`, and for moon fits `planet`, `dlogz`, `dlogzerr`.
+- **Files** (`log_dir`) are laid out as in UltraNest: `info/results.json`, `info/post_summary.csv`, `chains/equal_weighted_post.txt`, `chains/weighted_post.npz`, `plots/corner.pdf` (`sampler.plot_corner()`, needs `corner`). The planet-only fit goes to `log_dir/planet/`. Every finished run is stored, so `resume="resume"` continues an interrupted fit; `"subfolder"` (default) or `"overwrite"` start a new one.
+- **Sampler:** `pandoramoon.nss` is a compiled nested slice sampler. It runs independent runs on all cores (`threads=`), merges them and adds runs and longer chains until its error and reproducibility checks pass. The likelihood is compiled once per process (~15 s) and reused for every fit.
+- **Moon orbit:** by default the moon's period and phase are sampled as phases at transit, which removes the comb of period aliases. An exact weight keeps your prior, evidence and posterior unchanged. This needs a `per_moon` prior with an upper bound ≤ the planet period and `tau_moon=Uniform(0, 1)`; otherwise the native parameters are sampled (`moon_phase=False` forces this).
+
 ### Installation
 Install with `pip install pandoramoon`. Compatibility has been tested for the latest Python 3.14 (January 2026):
 

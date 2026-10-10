@@ -59,6 +59,25 @@ from numba import njit, prange
 
 _SAMPLERS = {}
 _HELPERS = {}
+
+
+@njit(cache=True)
+def _cholesky(C):
+    """lower Cholesky factor of a symmetric positive definite matrix (plain loops: numba's np.linalg needs
+    scipy, which is not a dependency of the package)"""
+    n = C.shape[0]
+    L = np.zeros((n, n))
+    for j in range(n):
+        s = C[j, j]
+        for k in range(j):
+            s -= L[j, k] * L[j, k]
+        L[j, j] = math.sqrt(max(s, 1e-300))
+        for i in range(j + 1, n):
+            t = C[i, j]
+            for k in range(j):
+                t -= L[i, k] * L[j, k]
+            L[i, j] = t / L[j, j]
+    return L
 MAXEXP = 100     # max linear step-outs per side and slice
 
 
@@ -385,7 +404,7 @@ def make_sampler(ll_u, parallel, with_data=False):
                 tr += C[i, i]
             for i in range(ndim):
                 C[i, i] += 1e-10 * tr / ndim + 1e-300
-            Lq = np.linalg.cholesky(C)
+            Lq = _cholesky(C)
             for i in range(ndim):
                 for i2 in range(ndim):
                     Lp[q, i, i2] = Lq[i, i2]
@@ -964,7 +983,7 @@ ACCURACY = {"high": dict(nlive=1000, lz_tol=0.1, ks_tol=0.05, min_runs=16),
 def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=None, min_runs=None,
         max_runs=96, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True, log=None,
         post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25, data=None,
-        accuracy=None):
+        accuracy=None, resume=None, callback=None):
     """Nested sampling with built-in convergence checks (SAMPLING.md Rounds 6b, 8).
 
     accuracy: None (use the arguments) or a preset of ACCURACY (overrides nlive, lz_tol, ks_tol, min_runs):
@@ -983,7 +1002,14 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     sampling continues. With a bias that falls at least like 1/nsteps, dlnZ(N/2, N) bounds the
     remaining bias at N. Stops at max_runs (result arm) with passed=False if the checks fail.
     Returns dict(logz (merged result arm), logzerr (empirical), logzerr_boot, samples_u, runs, history,
-    passed, nsteps, dlnz_check, ...)."""
+    passed, nsteps, dlnz_check, ...).
+
+    Resume (Round 15, used by pandoramoon.sampling): callback(event, **kw) is called in the main thread with
+    event "run" (r=run dict, nsteps=arm, idx=run index) for every finished run that enters an arm, and "state"
+    (N=current result nsteps, nesc, dropped=nsteps of a dropped arm or None) after every escalation. resume =
+    dict(runs=[(nsteps, idx, run dict), ...], N=..., nesc=...) restarts from stored runs: the runs of the arms N
+    and N/2 are reloaded, new run indices continue after the largest stored one (run seed = seed + 1000 idx), and
+    the checks are evaluated before any new run is started (a fit that had passed passes again at once)."""
     from concurrent.futures import ThreadPoolExecutor
     if accuracy is not None:
         a = ACCURACY[accuracy]
@@ -1004,6 +1030,15 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     N = nsteps
     nesc = 0
     ncall_tot = [0]
+    if resume is not None:
+        N = int(resume.get("N", nsteps))
+        nesc = int(resume.get("nesc", 0))
+        for ns_, idx_, r_ in resume.get("runs", []):
+            nxt = max(nxt, int(idx_) + 1)
+            if ns_ == N or (check and ns_ == max(1, N // 2)):
+                arms.setdefault(ns_, []).append(r_)
+        for v_ in arms.values():
+            v_.sort(key=lambda q: q["seed"])
 
     def precheck(N):
         """cheap necessary condition (scalars only: lnZ statistics of both arms) for evaluate() to pass or to
@@ -1100,28 +1135,63 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 nC = len(arms.get(Nc, [])) + sum(v[0] == Nc for v in inflight.values())
                 ns = Nc if (check and nC < nR) else N
                 sd = seed + 1000 * nxt
-                nxt += 1
                 flag = np.zeros(1, dtype=np.int64)
                 inflight[ex.submit(run, ll_u, ndim, wrapped=wrapped, nlive=nlive, nsteps=ns, k=1, seed=sd, dirs=dirs,
                                    frac_remain=frac_remain, paxis=paxis, kpair=kpair, stop=flag, pglob=pglob,
-                                   recluster=recluster, data=data)] = (ns, flag)
+                                   recluster=recluster, data=data)] = (ns, flag, nxt)
+                nxt += 1
+
+        def escalate_now():
+            nonlocal N, nesc
+            if verbose:
+                print(f"  fit: nsteps {N} vs {max(1, N // 2)} disagree -> nsteps {2 * N}", flush=True)
+            dropped = max(1, N // 2)
+            arms.pop(dropped, None)
+            N *= 2
+            nesc += 1
+            # runs of the dropped arm (old N / 2) still in flight are useless: abort them now
+            for f, (ns, flag, _i) in inflight.items():
+                if ns != N and ns != max(1, N // 2):
+                    flag[0] = 1
+                    n_obsolete[0] += 1
+            if callback is not None:
+                callback("state", N=N, nesc=nesc, dropped=dropped)
 
         # When to evaluate (Round 13): the full evaluation (merges, KS) costs ~0.5-3 s, so up to Round 12 it ran
         # after every `threads` finished runs, and a fit passed on average ~half a run time after its criteria
         # were met. Now the cheap scalar precheck runs after every finished run and triggers the full evaluation
         # as soon as a pass (or a dlnZ escalation) is possible; while the precheck stays true but the KS checks
         # fail, the full evaluation is repeated every max(1, threads // 4) runs. The regular cadence stays.
-        top_up()
+        stop_now = False
+        if resume is not None and len(arms.get(N, [])) >= 2:
+            # resumed: evaluate the stored runs first (a fit that had passed passes again without new runs)
+            while True:
+                passed, escalate, M = evaluate(N)
+                if passed or M >= max_runs:
+                    stop_now = True
+                    break
+                if not escalate:
+                    break
+                escalate_now()
+                if len(arms.get(N, [])) < 2:
+                    break
+        if not stop_now:
+            top_up()
         ndone = 0
         pre_last = False
-        while True:
+        while not stop_now:
             done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
             for f in done:
-                ns, _flag = inflight.pop(f)
+                ns, _flag, idx = inflight.pop(f)
                 r = f.result()
                 r.pop("samples_u", None)
                 ncall_tot[0] += r["ncall"]
+                if _flag[0] != 0:                # aborted (dropped arm): incomplete, never used
+                    ndone += 1
+                    continue
                 if ns == N or (check and ns == max(1, N // 2)):
+                    if callback is not None:
+                        callback("run", r=r, nsteps=ns, idx=idx)
                     # kept sorted by seed (Round 14): merges, split halves and KS depend only on WHICH runs are
                     # done, not on the order in which they finished (Round 13: KS arms 0.049 vs 0.053 for the same
                     # runs in a different order flipped an escalation at ks_tol 0.05)
@@ -1143,21 +1213,12 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 if passed or M >= max_runs:
                     break
                 if escalate:
-                    if verbose:
-                        print(f"  fit: nsteps {N} vs {max(1, N // 2)} disagree -> nsteps {2 * N}", flush=True)
-                    arms.pop(max(1, N // 2), None)
-                    N *= 2
-                    nesc += 1
+                    escalate_now()
                     pre_last = False
-                    # runs of the dropped arm (old N / 2) still in flight are useless: abort them now
-                    for f, (ns, flag) in inflight.items():
-                        if ns != N and ns != max(1, N // 2):
-                            flag[0] = 1
-                            n_obsolete[0] += 1
             top_up()
         # abort the runs still in flight (the compiled loop polls its stop flag every iteration) and discard them:
         # waiting for them cost up to one run time (C7 at nsteps 256: 140 s of 790)
-        for ns, flag in inflight.values():
+        for ns, flag, _i in inflight.values():
             flag[0] = 1
         for f in list(inflight):
             inflight.pop(f)
