@@ -1041,7 +1041,7 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     pos = (rng.uniform() + np.arange(nsamp)) / nsamp
     samples = dU[np.searchsorted(cw, pos)]
     insd = insertion_test(ins, nlive - k, nlive, seed)
-    return dict(nlive=int(nlive), ins_u=((ins + np.random.default_rng(seed + 11).uniform(size=len(ins))) / (nlive - k + 1)
+    return dict(seed=int(seed), nlive=int(nlive), ins_u=((ins + np.random.default_rng(seed + 11).uniform(size=len(ins))) / (nlive - k + 1)
                                        ).astype(np.float32), mix=mix, insertion=insd, logz=logz, logzerr=math.sqrt(max(H, 0.0) / nlive), H=H, ncall=int(ncall) + nlive, niter=int(it),
                 wall=t2 - t0, wall_init=t1 - t0, samples_u=samples, ess=ess, dead_u=dU, dead_L=dL, logw=dlogw,
                 maxL=float(dL.max()), final_scale=scale, expand_rate=exp_rate, njump_acc=int(njump),
@@ -1369,7 +1369,11 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 r.pop("samples_u", None)
                 ncall_tot[0] += r["ncall"]
                 if ns == N or (check and ns == max(1, N // 2)):
+                    # kept sorted by seed (Round 14): merges, split halves and KS depend only on WHICH runs are
+                    # done, not on the order in which they finished (Round 13: KS arms 0.049 vs 0.053 for the same
+                    # runs in a different order flipped an escalation at ks_tol 0.05)
                     arms.setdefault(ns, []).append(r)
+                    arms[ns].sort(key=lambda q: q["seed"])
                 ndone += 1
             top_up()                             # refill before the (slow, Python) evaluation
             if len(arms.get(N, [])) < 2:
