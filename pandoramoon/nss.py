@@ -1,6 +1,6 @@
 """nss: a compiled nested slice sampler for Pandora (experimental).
 
-Description: NSS_SAMPLER.md; development history and validation: SAMPLING.md (Rounds 4-8) in the
+Description: NSS_SAMPLER.md; development history and validation: SAMPLING.md (Rounds 4-14) in the
 project directory. `fit()` is the entry point (independent runs merged, self-checking); `run()` is one
 nested-sampling run. Both take a numba-compiled function ll_u(u) of a point u in the unit cube
 (prior transform inside). A builder of ll_u from a `pandoramoon.Likelihood` and user priors is not
@@ -20,44 +20,21 @@ PolyChord / UltraNest's slice samplers, Neal 2003):
   are drawn above Lmin = the highest removed logL, each by a slice chain
   of `nsteps` accepted moves started at a random surviving live point.
   The k chains run in parallel threads (numba prange) when k > 1.
-- Directions, dirs="cluster" (default since the Gaussian-mixture test,
-  SAMPLING.md Round 4): the live points are clustered every
-  `recluster` x n replacements (connected components of the K-nearest-
-  neighbour graph, K = 2 ndim, neighbours among <= nbsub random reference
-  points; new points inherit their start point's cluster). Each slice
-  step uses the difference of two random live points of the start
-  point's cluster (start excluded): local to the mode, but not to the
-  position inside it. Clusters with < 2 other points fall back to "knn".
-- Directions, dirs="localcov": every `recluster` x n replacements the
-  mean local covariance (average over R = 200 random live points of the
-  covariance of their K nearest neighbours) is computed; each slice step
-  uses v = chol @ N(0, I). Local (within-mode) shape and scale, but the
-  same for every chain, so no dependence on the start point's position.
-- Directions, dirs="knnmh": knn directions made exact. N(x) = the K
-  nearest of a fixed (per chain) reference set to the current point x; a
-  slice step along U_a - U_b (a, b in N(x)) is accepted only if a, b are
-  also in N(x') (Metropolis-Hastings check of the direction probability;
-  `njump_acc` then counts these rejections). One knn search per step.
-- Directions, dirs="pairs" (Round 7): v = +-(U_a - U_b) with a a random live point and b one of
-  its `kpair` nearest neighbours (neighbour lists recomputed every `recluster` x n replacements, since
-  Round 13 by pair_lists(): the same lists ~10x cheaper than the full K-nearest graph of cluster()).
-  Local orientation and scale, but independent of the chain's position (exact).
-- Directions, dirs="knn" (first version; biased for short chains, see
-  SAMPLING.md): at the start
-  of a chain, the K nearest live neighbours of the start point (distance
-  scaled by the live points' per-dimension spread) are found; each slice
-  step uses the difference of two random members of {start, neighbours}
-  as direction vector (local orientation and scale; a chain stays in its
-  mode). The direction distribution is fixed for the chain, so each step
-  is a valid slice update of the constrained prior. For n > `nbsub`
-  (default 2000) the neighbours are searched among nbsub random alive
-  points (O(nbsub ndim) per chain).
-- Optional mode jumps (`pjump`): with probability pjump per step an extra
-  differential-evolution move x + (U_a - U_b) with two random live points
-  (ter Braak 2006), accepted if L > Lmin (symmetric proposal while the
-  live set is fixed during the chain). For comb-like posteriors (modes =
-  shifted copies) it moves points between modes in proportion to their
-  volume instead of their live counts.
+- Directions, dirs="pairs" (Round 7; fit()'s default since Round 8): v = +-(U_a - U_b) with a a random
+  live point and b one of its `kpair` nearest neighbours (neighbour lists recomputed every `recluster` x n
+  replacements, since Round 13 by pair_lists(): the same lists ~10x cheaper than the full K-nearest graph
+  of cluster()). Local orientation and scale, but independent of the chain's position (exact).
+- Directions, dirs="cluster" (run()'s default, Round 4): the live points are clustered every
+  `recluster` x n replacements (connected components of the K-nearest-neighbour graph, K = 2 ndim,
+  neighbours among <= nbsub random reference points; new points inherit their start point's cluster).
+  Each slice step uses the difference of two random live points of the start point's cluster (start
+  excluded). Clusters with < 2 other points fall back to the start point's K nearest neighbours.
+- Directions, dirs="lcov" (Round 12): v = sqrt(2) L_a z with L_a the Cholesky factor of the covariance of
+  a random live point's neighbour list (exact; no gain over "pairs").
+- Optional extra steps: a fraction `paxis` along coordinate axes, `pglob` along global pair differences.
+- Removed in Round 14 (superseded, user-approved cleanup): dirs="knn" (biased), "knnmh", "localcov" and the
+  differential-evolution mode jumps `pjump`. They are kept in pandoramoon/nss_legacy.py (same API, frozen)
+  and in git (tag nss-all-dirs).
 - Slice (Neal 2003): an interval of width w = `scale` (in units of v)
   placed at random around the point, linear stepping-out by w per side
   (exact; doubling would need Neal's extra acceptance test), then
@@ -333,182 +310,6 @@ def make_sampler(ll_u, parallel, with_data=False):
         return nc
 
     @njit
-    def local_cov(U, alive, sd, K, M, R, ref):
-        """mean over R random alive points y of the covariance of y's K
-        nearest neighbours (among <= M distinct random alive reference
-        points): the typical *local* (within-mode) shape, independent of
-        any chain's start point. Returns its Cholesky factor."""
-        n, ndim = U.shape
-        nref = 0
-        if n <= M:
-            for q in range(n):
-                if alive[q]:
-                    ref[nref] = q
-                    nref += 1
-        else:
-            while True:
-                stride = 1 + np.random.randint(n - 1)
-                a_, b_ = stride, n
-                while b_:
-                    a_, b_ = b_, a_ % b_
-                if a_ == 1:
-                    break
-            q = np.random.randint(n)
-            for _t in range(n):
-                if alive[q]:
-                    ref[nref] = q
-                    nref += 1
-                    if nref == M:
-                        break
-                q = (q + stride) % n
-        C = np.zeros((ndim, ndim))
-        d2 = np.empty(nref)
-        mu = np.empty(ndim)
-        for _r in range(R):
-            while True:
-                y = np.random.randint(n)
-                if alive[y]:
-                    break
-            for a in range(nref):
-                r = ref[a]
-                s = 0.0
-                for i in range(ndim):
-                    t = (U[r, i] - U[y, i]) / sd[i]
-                    s += t * t
-                d2[a] = s
-            sel = k_smallest_all(d2, K)
-            m = sel.shape[0]
-            for i in range(ndim):
-                mu[i] = 0.0
-                for a in range(m):
-                    mu[i] += U[ref[sel[a]], i]
-                mu[i] /= m
-            for a in range(m):
-                r = ref[sel[a]]
-                for i in range(ndim):
-                    di = U[r, i] - mu[i]
-                    for i2 in range(i + 1):
-                        C[i, i2] += di * (U[r, i2] - mu[i2])
-        for i in range(ndim):
-            for i2 in range(i + 1):
-                C[i, i2] /= R * (K - 1)
-                C[i2, i] = C[i, i2]
-        for i in range(ndim):
-            C[i, i] += 1e-12 + 1e-9 * C[i, i]
-        return np.linalg.cholesky(C)
-
-    @njit
-    def knn_point(x, U, R, nR, sd, K, d2):
-        """indices (into U) of the K nearest of U[R[:nR]] to the point x"""
-        ndim = U.shape[1]
-        for a in range(nR):
-            r = R[a]
-            s = 0.0
-            for i in range(ndim):
-                t = (U[r, i] - x[i]) / sd[i]
-                s += t * t
-            d2[a] = s
-        sel = k_smallest_all(d2[:nR], K)
-        out = np.empty(sel.shape[0], dtype=np.int64)
-        for a in range(sel.shape[0]):
-            out[a] = R[sel[a]]
-        return out
-
-    @njit
-    def chain_knnmh(U, j, L0, R, nR, sd, K, Lmin, nsteps, scale, wrapped, x, xn, d2, D):
-        """slice chain with position-dependent knn directions made reversible
-        by a Metropolis-Hastings check: N(x) = the K nearest reference points
-        U[R] to x (R fixed during the chain); a step uses v = U[a] - U[b] with
-        a pair from N(x) (uniform over ordered pairs); the slice point x' is
-        accepted only if a and b are also in N(x') (then p_x(v) = p_x'(v),
-        detailed balance), else the chain stays at x.
-        Returns (L, ncalls, nexpand, n_mh_reject)."""
-        ndim = U.shape[1]
-        for i in range(ndim):
-            x[i] = U[j, i]
-        L = L0
-        nc = 0
-        nexp = 0
-        nrej = 0
-        N = knn_point(x, U, R, nR, sd, K, d2)
-        m = N.shape[0]
-        v = np.empty(ndim)
-        for _ in range(nsteps):
-            ia = np.random.randint(m)
-            ib = np.random.randint(m - 1)
-            if ib >= ia:
-                ib += 1
-            a = N[ia]
-            b = N[ib]
-            vv = 0.0
-            for i in range(ndim):
-                v[i] = U[a, i] - U[b, i]
-                vv += v[i] * v[i]
-            if vv == 0.0:
-                continue
-            left = -scale * np.random.uniform(0.0, 1.0)
-            right = left + scale
-            for _e in range(MAXEXP):
-                for i in range(ndim):
-                    xn[i] = x[i] + v[i] * left
-                if not wrap_inside(xn, wrapped):
-                    break
-                nc += 1
-                if LL(xn, D) > Lmin:
-                    left -= scale
-                    nexp += 1
-                else:
-                    break
-            for _e in range(MAXEXP):
-                for i in range(ndim):
-                    xn[i] = x[i] + v[i] * right
-                if not wrap_inside(xn, wrapped):
-                    break
-                nc += 1
-                if LL(xn, D) > Lmin:
-                    right += scale
-                    nexp += 1
-                else:
-                    break
-            Lx = -np.inf
-            ok = False
-            while True:
-                t = np.random.uniform(left, right)
-                for i in range(ndim):
-                    xn[i] = x[i] + v[i] * t
-                if wrap_inside(xn, wrapped):
-                    nc += 1
-                    Lx = LL(xn, D)
-                    if Lx > Lmin:
-                        ok = True
-                        break
-                if t < 0.0:
-                    left = t
-                else:
-                    right = t
-                if right - left < 1e-14:
-                    break
-            if not ok:
-                continue
-            N2 = knn_point(xn, U, R, nR, sd, K, d2)
-            fa = False
-            fb = False
-            for q in range(N2.shape[0]):
-                if N2[q] == a:
-                    fa = True
-                if N2[q] == b:
-                    fb = True
-            if fa and fb:
-                for i in range(ndim):
-                    x[i] = xn[i]
-                L = Lx
-                N = N2
-                m = N.shape[0]
-            else:
-                nrej += 1
-        return L, nc, nexp, nrej
-
-    @njit
     def refset(alive, j, M, R):
         """R[:nR] = all alive points (n <= M) or M distinct random alive ones"""
         n = alive.shape[0]
@@ -590,13 +391,10 @@ def make_sampler(ll_u, parallel, with_data=False):
                     Lp[q, i, i2] = Lq[i, i2]
 
     @njit
-    def chain(U, j, L0, nb, Lmin, nsteps, scale, wrapped, x, xn, alive, pjump, chol, dmode, paxis, sdv, nbr, kpair,
-              pglob, D, Lp):
-        """slice chain at fixed Lmin from U[j] (logL L0); directions =
-        differences of members of nb; with probability pjump per step an
-        additional differential-evolution jump x + (U_a - U_b) (a, b random
-        alive live points; symmetric -> Metropolis accept if L > Lmin).
-        Returns (L, ncalls, nexpand, njump_acc) with the end point in x"""
+    def chain(U, j, L0, nb, Lmin, nsteps, scale, wrapped, x, xn, alive, dmode, paxis, sdv, nbr, kpair, pglob, D, Lp):
+        """slice chain at fixed Lmin from U[j] (logL L0); directions by dmode: 0 = differences of members of nb
+        ("cluster"), 2 = local pairs ("pairs"), 3 = local covariance ("lcov"); optional axis / global-pair steps.
+        Returns (L, ncalls, nexpand) with the end point in x"""
         ndim = U.shape[1]
         n = U.shape[0]
         for i in range(ndim):
@@ -604,29 +402,9 @@ def make_sampler(ll_u, parallel, with_data=False):
         L = L0
         nc = 0
         nexp = 0
-        nja = 0
         m = nb.shape[0]
         v = np.empty(ndim)
         for _ in range(nsteps):
-            if pjump > 0.0 and np.random.uniform(0.0, 1.0) < pjump:
-                while True:
-                    a = np.random.randint(n)
-                    if alive[a]:
-                        break
-                while True:
-                    b = np.random.randint(n)
-                    if alive[b] and b != a:
-                        break
-                for i in range(ndim):
-                    xn[i] = x[i] + U[a, i] - U[b, i]
-                if wrap_inside(xn, wrapped):
-                    nc += 1
-                    Lx = LL(xn, D)
-                    if Lx > Lmin:
-                        for i in range(ndim):
-                            x[i] = xn[i]
-                        L = Lx
-                        nja += 1
             a = np.random.randint(m)
             b = np.random.randint(m - 1)
             if b >= a:
@@ -680,14 +458,6 @@ def make_sampler(ll_u, parallel, with_data=False):
                 for i in range(ndim):
                     v[i] = sg * (U[pa, i] - U[pb, i])
                     vv += v[i] * v[i]
-            elif dmode == 1:
-                z = np.random.standard_normal(ndim)
-                for i in range(ndim):
-                    s_ = 0.0
-                    for i2 in range(i + 1):
-                        s_ += chol[i, i2] * z[i2]
-                    v[i] = s_
-                    vv += s_ * s_
             else:
                 for i in range(ndim):
                     v[i] = U[nb[a], i] - U[nb[b], i]
@@ -738,7 +508,7 @@ def make_sampler(ll_u, parallel, with_data=False):
                     right = t
                 if right - left < 1e-14:
                     break
-        return L, nc, nexp, nja
+        return L, nc, nexp
 
     @njit
     def grow(dU, dL, dlogw, nd):
@@ -754,8 +524,9 @@ def make_sampler(ll_u, parallel, with_data=False):
         return a, b, c
 
     @njit(parallel=parallel, nogil=True)
-    def ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed, scale0, pjump, M, dirmode, recluster, R,
-           paxis, kpair, stop, pglob, D, knnfast):
+    def ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed, scale0, M, dirmode, recluster, paxis, kpair,
+           stop, pglob, D):
+        # dirmode: 1 = "cluster", 4 = "pairs", 5 = "lcov" (the numbers of the full version, nss_legacy)
         n, ndim = U.shape
         # seeds (per thread in parallel mode: numba seeds each thread's state)
         np.random.seed(seed)
@@ -776,10 +547,7 @@ def make_sampler(ll_u, parallel, with_data=False):
         newL = np.empty(k)
         ncs = np.zeros(k, dtype=np.int64)
         nexps = np.zeros(k, dtype=np.int64)
-        njs = np.zeros(k, dtype=np.int64)
-        nj_tot = 0
         starts = np.empty(k, dtype=np.int64)
-        nbs = np.empty((k, K + 1), dtype=np.int64)
         xs = np.empty((k, ndim))
         xns = np.empty((k, ndim))
         alive = np.ones(n, dtype=np.bool_)
@@ -798,7 +566,6 @@ def make_sampler(ll_u, parallel, with_data=False):
         nclus_max = 1
         nrecl = 0
         repl_since = n * 10           # force clustering at the first iteration
-        chol = np.eye(ndim)
         nfallback = 0
         ranks = np.zeros(k, dtype=np.int64)
         mix = np.zeros(ndim)
@@ -840,19 +607,15 @@ def make_sampler(ll_u, parallel, with_data=False):
                     sd[i] = math.sqrt(s / n) + 1e-300
             for jj in range(k):
                 alive[sel[jj]] = False
-            if dirmode == 4 and knnfast != 0 and repl_since >= recluster * n:
+            if dirmode == 4 and repl_since >= recluster * n:
                 pair_lists(U, alive, sd, kpair, M, nbr, ref)
                 nrecl += 1
                 repl_since = 0
-            if (dirmode == 1 or (dirmode == 4 and knnfast == 0) or dirmode == 5) and repl_since >= recluster * n:
+            if (dirmode == 1 or dirmode == 5) and repl_since >= recluster * n:
                 nclus = cluster(U, alive, sd, K, M, labels, nbr, ref)
                 if dirmode == 5:
                     local_chols(U, alive, nbr, wrapped, Lp)
                 nclus_max = max(nclus_max, nclus)
-                nrecl += 1
-                repl_since = 0
-            if dirmode == 2 and repl_since >= recluster * n:
-                chol = local_cov(U, alive, sd, K, M, R, ref)
                 nrecl += 1
                 repl_since = 0
             repl_since += k
@@ -866,7 +629,7 @@ def make_sampler(ll_u, parallel, with_data=False):
                 m = 0
                 if dirmode == 1:
                     m = members(starts[c], alive, labels, idxs[c])
-                if dirmode == 2 or dirmode == 3 or dirmode == 4 or dirmode == 5:
+                if dirmode == 4 or dirmode == 5:
                     mem = idxs[c, :2]
                     mcount[c] = 0
                 elif m >= 2:
@@ -875,16 +638,8 @@ def make_sampler(ll_u, parallel, with_data=False):
                 else:
                     mem = neighbours(U, starts[c], alive, sd, K, d2s[c], M, idxs[c])
                     mcount[c] = 1 if dirmode == 1 else 0
-                if dirmode == 3:
-                    nR = refset(alive, starts[c], M, idxs[c])
-                    Lc, nc, ne, nj = chain_knnmh(U, starts[c], L[starts[c]], idxs[c], nR, sd, K, Lmin, nsteps, scale,
-                                                 wrapped, xs[c], xns[c], d2s[c], D)
-                else:
-                    Lc, nc, ne, nj = chain(U, starts[c], L[starts[c]], mem, Lmin, nsteps, scale, wrapped, xs[c],
-                                           xns[c], alive, pjump, chol,
-                                           1 if dirmode == 2 else (2 if dirmode == 4 else (3 if dirmode == 5 else 0)),
-                                           paxis, sd, nbr, kpair, pglob, D, Lp)
-                njs[c] = nj
+                Lc, nc, ne = chain(U, starts[c], L[starts[c]], mem, Lmin, nsteps, scale, wrapped, xs[c], xns[c], alive,
+                                   2 if dirmode == 4 else (3 if dirmode == 5 else 0), paxis, sd, nbr, kpair, pglob, D, Lp)
                 newL[c] = Lc
                 ncs[c] = nc
                 nexps[c] = ne
@@ -928,7 +683,6 @@ def make_sampler(ll_u, parallel, with_data=False):
                 nfallback += mcount[c]
                 ncall += ncs[c]
                 nexp_tot += nexps[c]
-                nj_tot += njs[c]
             nstep_tot += k * nsteps
             # scale adaptation: aim at ~1 expansion per step (interval comparable to the slice)
             if nexps.sum() > k * nsteps:
@@ -946,7 +700,7 @@ def make_sampler(ll_u, parallel, with_data=False):
             dL[nd] = L[a]
             dlogw[nd] = logw_live
             nd += 1
-        return (dU[:nd], dL[:nd], dlogw[:nd], ncall, it, scale, nexp_tot / max(nstep_tot, 1), nj_tot,
+        return (dU[:nd], dL[:nd], dlogw[:nd], ncall, it, scale, nexp_tot / max(nstep_tot, 1),
                 nclus, nclus_max, nrecl, nfallback, ins[:nins], mix / max(nmix, 1))
 
     @njit(parallel=parallel, nogil=True)
@@ -1000,12 +754,12 @@ def insertion_test(ranks, m, nlive, seed=0):
 
 
 def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_remain=0.01,
-        max_iter=10_000_000, seed=1, scale0=1.0, threads=None, pjump=0.0, nbsub=2000, dirs="cluster",
-        recluster=0.25, R=200, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None, knnfast=True):
+        max_iter=10_000_000, seed=1, scale0=1.0, threads=None, nbsub=2000, dirs="cluster",
+        recluster=0.25, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None):
     """returns dict(logz, logzerr, ncall, niter, wall, samples_u (equal weight), dead_u, dead_L, logw).
     data: None -> ll_u(u); a tuple D -> ll_u(u, D) (one compiled sampler for many data sets).
-    knnfast (dirs="pairs" only): neighbour lists by pair_lists() (Round 13) instead of the full K-nearest graph +
-    union-find of cluster() (the same lists up to rounding ties; False = the Round 7-12 code, for A/B tests)"""
+    dirs: "pairs" (fit's default), "cluster", "lcov". The superseded "knn", "knnmh", "localcov" and the mode jumps
+    `pjump` were removed in Round 14; they are in pandoramoon.nss_legacy (same API) and git tag nss-all-dirs."""
     import numba
     parallel = k > 1
     assert 1 <= k <= nlive // 4, "k (points replaced per iteration) must be <= nlive / 4"
@@ -1019,12 +773,12 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     t0 = time.perf_counter()
     U, L = init(nlive, ndim, seed, D)
     t1 = time.perf_counter()
-    assert dirs in ("cluster", "knn", "localcov", "knnmh", "pairs", "lcov")
-    (dU, dL, dlogw, ncall, it, scale, exp_rate, njump, nclus, nclus_max, nrecl,
-     nfallback, ins, mix) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0, pjump, nbsub,
-                          {"knn": 0, "cluster": 1, "localcov": 2, "knnmh": 3, "pairs": 4, "lcov": 5}[dirs], recluster, R,
-                          paxis, kpair, stop if stop is not None else np.zeros(1, dtype=np.int64), pglob, D,
-                          1 if knnfast else 0)
+    if dirs not in ("cluster", "pairs", "lcov"):
+        raise ValueError(f"dirs={dirs!r}: removed in Round 14 (superseded); use pandoramoon.nss_legacy")
+    (dU, dL, dlogw, ncall, it, scale, exp_rate, nclus, nclus_max, nrecl,
+     nfallback, ins, mix) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0, nbsub,
+                          {"cluster": 1, "pairs": 4, "lcov": 5}[dirs], recluster, paxis, kpair,
+                          stop if stop is not None else np.zeros(1, dtype=np.int64), pglob, D)
     t2 = time.perf_counter()
     lw = dlogw + dL
     logz = float(np.logaddexp.reduce(lw))
@@ -1044,10 +798,9 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     return dict(seed=int(seed), nlive=int(nlive), ins_u=((ins + np.random.default_rng(seed + 11).uniform(size=len(ins))) / (nlive - k + 1)
                                        ).astype(np.float32), mix=mix, insertion=insd, logz=logz, logzerr=math.sqrt(max(H, 0.0) / nlive), H=H, ncall=int(ncall) + nlive, niter=int(it),
                 wall=t2 - t0, wall_init=t1 - t0, samples_u=samples, ess=ess, dead_u=dU, dead_L=dL, logw=dlogw,
-                maxL=float(dL.max()), final_scale=scale, expand_rate=exp_rate, njump_acc=int(njump),
+                maxL=float(dL.max()), final_scale=scale, expand_rate=exp_rate,
                 nclusters=int(nclus), nclusters_max=int(nclus_max), nrecluster=int(nrecl),
-                nfallback=int(nfallback), dirs=dirs,
-                jump_acc_per_chain=njump / max(it * k, 1))
+                nfallback=int(nfallback), dirs=dirs)
 
 
 # ---------------------------------------------------------------------------------------------
