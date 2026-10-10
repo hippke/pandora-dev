@@ -43,7 +43,8 @@ Quick start
    print(results["dlogz"], results["dlogzerr"])      # Bayes factor ln Z(moon) - ln Z(planet)
    samples = results["samples"]                      # equal-weight posterior, columns results["paramnames"]
 
-With the notebook's data (3 transits, 30-min cadence, 500 ppm) the planet+moon fit takes 2–4 minutes on
+A complete worked example is ``examples/injection_retrieval.ipynb``. With the notebook's data (3 transits,
+30-min cadence, 500 ppm) the planet+moon fit takes 2–4 minutes on
 16 cores and the planet-only fit a few seconds.
 
 
@@ -97,6 +98,17 @@ Interface
 
       Prints ln Z ± error, whether the checks passed, and median, 68 % interval, mean and standard
       deviation of every parameter (for ``model="moon"`` also the planet-only fit and the Bayes factor).
+
+   .. method:: parameters(point=None, model=None)
+
+      All 20 Pandora model parameters (a dict with Pandora's names; limb darkening as ``u1, u2``) for a
+      point of the free parameters, by default the maximum-likelihood point of the fit. With
+      ``model="planet"``: the planet-only fit, with Pandora's planet-only moon values. Example, the
+      best-fit light curve::
+
+         for k, v in sampler.parameters().items():
+             setattr(params, k, v)          # params: a pandora.model_params() with the time-grid settings
+         flux_total, flux_planet, flux_moon = pandora.moon_model(params).light_curve(time)
 
    .. method:: plot_corner(model=None, filename=None, **kwargs)
 
