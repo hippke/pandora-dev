@@ -39,7 +39,8 @@ PolyChord / UltraNest's slice samplers, Neal 2003):
   also in N(x') (Metropolis-Hastings check of the direction probability;
   `njump_acc` then counts these rejections). One knn search per step.
 - Directions, dirs="pairs" (Round 7): v = +-(U_a - U_b) with a a random live point and b one of
-  its `kpair` nearest neighbours (neighbour lists recomputed every `recluster` x n replacements).
+  its `kpair` nearest neighbours (neighbour lists recomputed every `recluster` x n replacements, since
+  Round 13 by pair_lists(): the same lists ~10x cheaper than the full K-nearest graph of cluster()).
   Local orientation and scale, but independent of the chain's position (exact).
 - Directions, dirs="knn" (first version; biased for short chains, see
   SAMPLING.md): at the start
@@ -80,6 +81,7 @@ import numpy as np
 from numba import njit, prange
 
 _SAMPLERS = {}
+_HELPERS = {}
 MAXEXP = 100     # max linear step-outs per side and slice
 
 
@@ -219,6 +221,60 @@ def make_sampler(ll_u, parallel, with_data=False):
             sel = k_smallest_all(d2, K)
             for t in range(K):
                 nbr[q, t] = ref[sel[t]] if t < sel.shape[0] else q
+
+    @njit
+    def pair_lists(U, alive, sd, kk, M, nbr, ref):
+        """dirs="pairs" (Round 13): nbr[q, :kk] = the kk nearest alive points to U[q] (metric scaled by sd) among
+        the reference set (all alive points if n <= M, else M distinct random ones), ascending. The same lists as
+        the first kk columns of cluster()'s K-nearest graph (checked: test_knnfast.py), without the union-find
+        (the labels are not used by "pairs") and faster: scaled reference coordinates stored transposed, so the
+        squared distances of one point to all references are summed dimension by dimension over contiguous
+        arrays (SIMD), then one selection pass keeps the kk smallest; no allocation per point."""
+        n, ndim = U.shape
+        nref = refset(alive, -1, M, ref)
+        inv = np.empty(ndim)
+        for i in range(ndim):
+            inv[i] = 1.0 / sd[i]
+        VT = np.empty((ndim, nref))
+        for a in range(nref):
+            r = ref[a]
+            for i in range(ndim):
+                VT[i, a] = U[r, i] * inv[i]
+        d = np.empty(nref)
+        bd = np.empty(kk)
+        bi = np.empty(kk, dtype=np.int64)
+        for q in range(n):
+            if not alive[q]:
+                continue
+            for a in range(nref):
+                d[a] = 0.0
+            for i in range(ndim):
+                xi = U[q, i] * inv[i]
+                row = VT[i]
+                for a in range(nref):
+                    t = row[a] - xi
+                    d[a] += t * t
+            m = 0
+            worst = np.inf
+            for a in range(nref):
+                s = d[a]
+                if s >= worst or ref[a] == q:
+                    continue
+                if m < kk:
+                    p = m
+                    m += 1
+                else:
+                    p = kk - 1
+                while p > 0 and bd[p - 1] > s:
+                    bd[p] = bd[p - 1]
+                    bi[p] = bi[p - 1]
+                    p -= 1
+                bd[p] = s
+                bi[p] = ref[a]
+                if m == kk:
+                    worst = bd[kk - 1]
+            for t in range(kk):
+                nbr[q, t] = bi[t] if t < m else q
 
     @njit
     def find(parent, q):
@@ -699,7 +755,7 @@ def make_sampler(ll_u, parallel, with_data=False):
 
     @njit(parallel=parallel, nogil=True)
     def ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed, scale0, pjump, M, dirmode, recluster, R,
-           paxis, kpair, stop, pglob, D):
+           paxis, kpair, stop, pglob, D, knnfast):
         n, ndim = U.shape
         # seeds (per thread in parallel mode: numba seeds each thread's state)
         np.random.seed(seed)
@@ -784,7 +840,11 @@ def make_sampler(ll_u, parallel, with_data=False):
                     sd[i] = math.sqrt(s / n) + 1e-300
             for jj in range(k):
                 alive[sel[jj]] = False
-            if (dirmode == 1 or dirmode == 4 or dirmode == 5) and repl_since >= recluster * n:
+            if dirmode == 4 and knnfast != 0 and repl_since >= recluster * n:
+                pair_lists(U, alive, sd, kpair, M, nbr, ref)
+                nrecl += 1
+                repl_since = 0
+            if (dirmode == 1 or (dirmode == 4 and knnfast == 0) or dirmode == 5) and repl_since >= recluster * n:
                 nclus = cluster(U, alive, sd, K, M, labels, nbr, ref)
                 if dirmode == 5:
                     local_chols(U, alive, nbr, wrapped, Lp)
@@ -899,6 +959,7 @@ def make_sampler(ll_u, parallel, with_data=False):
         return U, L
 
     _SAMPLERS[key] = (ns, init)
+    _HELPERS[key] = dict(pair_lists=pair_lists, cluster=cluster)      # for tests (test_knnfast.py)
     return ns, init
 
 
@@ -940,9 +1001,11 @@ def insertion_test(ranks, m, nlive, seed=0):
 
 def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_remain=0.01,
         max_iter=10_000_000, seed=1, scale0=1.0, threads=None, pjump=0.0, nbsub=2000, dirs="cluster",
-        recluster=0.25, R=200, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None):
+        recluster=0.25, R=200, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None, knnfast=True):
     """returns dict(logz, logzerr, ncall, niter, wall, samples_u (equal weight), dead_u, dead_L, logw).
-    data: None -> ll_u(u); a tuple D -> ll_u(u, D) (one compiled sampler for many data sets)"""
+    data: None -> ll_u(u); a tuple D -> ll_u(u, D) (one compiled sampler for many data sets).
+    knnfast (dirs="pairs" only): neighbour lists by pair_lists() (Round 13) instead of the full K-nearest graph +
+    union-find of cluster() (the same lists up to rounding ties; False = the Round 7-12 code, for A/B tests)"""
     import numba
     parallel = k > 1
     assert 1 <= k <= nlive // 4, "k (points replaced per iteration) must be <= nlive / 4"
@@ -960,7 +1023,8 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     (dU, dL, dlogw, ncall, it, scale, exp_rate, njump, nclus, nclus_max, nrecl,
      nfallback, ins, mix) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0, pjump, nbsub,
                           {"knn": 0, "cluster": 1, "localcov": 2, "knnmh": 3, "pairs": 4, "lcov": 5}[dirs], recluster, R,
-                          paxis, kpair, stop if stop is not None else np.zeros(1, dtype=np.int64), pglob, D)
+                          paxis, kpair, stop if stop is not None else np.zeros(1, dtype=np.int64), pglob, D,
+                          1 if knnfast else 0)
     t2 = time.perf_counter()
     lw = dlogw + dL
     logz = float(np.logaddexp.reduce(lw))
@@ -1175,9 +1239,11 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     nsteps = nsteps or 4 * ndim
     max_nsteps = max_nsteps or 64 * ndim
     min_runs = min_runs or max(threads, 4)
+    tc = time.perf_counter()
     make_sampler(ll_u, False, data is not None)  # compile once, outside the threads
     run(ll_u, ndim, wrapped=wrapped, nlive=max(40, 2 * ndim + 8), nsteps=2, k=1, max_iter=3, seed=seed + 999, data=data,
         dirs=dirs, kpair=min(kpair, 4))
+    t_compile = time.perf_counter() - tc         # numba compile (first call per process); not in `wall`
     arms = {}                                    # nsteps -> list of runs
     hist = []
     t0 = time.perf_counter()
@@ -1185,6 +1251,28 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     N = nsteps
     nesc = 0
     ncall_tot = [0]
+
+    def precheck(N):
+        """cheap necessary condition (scalars only: lnZ statistics of both arms) for evaluate() to pass or to
+        escalate by the dlnZ rule; the KS-based escalation is covered by the regular evaluation every `threads`
+        finished runs (Round 13)"""
+        Nc = max(1, N // 2)
+        R = arms.get(N, [])
+        if len(R) < 2:
+            return False
+        sR = _lnz_stats(R)
+        if sR["M"] >= min_runs and sR["err"] <= lz_tol:
+            return True                          # pass or grey-zone escalation possible
+        if not check:
+            return False
+        C = arms.get(Nc, [])
+        if len(C) < 2:
+            return False
+        sC = _lnz_stats(C)
+        d = sC["mean"] - sR["mean"]
+        sig = math.hypot(sR["err"], sC["err"])
+        enough = sC["M"] >= max(4, min_runs // 2) and sR["M"] >= max(4, min_runs // 2)
+        return bool(enough and N < max_nsteps and abs(d) > 2 * lz_tol and abs(d) > 2.5 * sig)
 
     def evaluate(N, final=False):
         Nc = max(1, N // 2)
@@ -1194,11 +1282,13 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
         Rg = sR["good"]
         lzR, _ = merge_weights(Rg)
         ks, j = split_half_ks(Rg, seed=len(R), post_map=post_map)
+        # the pooled insertion test is reported only (no power, Round 9): computed for the final evaluation only
+        insp = pooled_insertion(Rg) if final else (np.nan, np.nan, np.nan)
         h = dict(nsteps=N, runs=sR["M_all"], runs_good=sR["M"], n_failed=sR["n_failed"], wall=time.perf_counter() - t0,
                  logz=lzR, logz_meanlnz=sR["mean"], logz_err=sR["err"], logz_sd=sR["sd"], logz_mad_sd=sR["mad_sd"],
                  quoted=float(np.mean([r["logzerr"] for r in R]) / math.sqrt(sR["M"])), ks_split=ks, ks_param=j,
                  insertion_p_min=min(r["insertion"]["p"] for r in R), final=final,
-                 **dict(zip(("ins_pooled_D", "ins_pooled_p", "ins_fisher_p"), pooled_insertion(Rg))),
+                 **dict(zip(("ins_pooled_D", "ins_pooled_p", "ins_fisher_p"), insp)),
                  ncall=int(ncall_tot[0]), ncall_result=int(sum(r["ncall"] for r in R)))
         ok_bias, escalate = True, False
         if check:
@@ -1242,31 +1332,39 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     # runs (done + in flight); the checks are evaluated after every `threads` completed runs (the workers
     # keep running meanwhile: the compiled runs release the GIL)
     from concurrent.futures import wait, FIRST_COMPLETED
-    inflight = {}
+    inflight = {}                                # future -> (nsteps, its own stop flag)
     passed = False
-    stopflag = np.zeros(1, dtype=np.int64)
     n_aborted = [0]
+    n_obsolete = [0]                             # runs aborted at an escalation (their arm was dropped)
+    n_eval = [0, 0]                              # full evaluations: regular cadence / triggered by precheck
     t_eval = [0.0]                               # wall time of the Python checks (main thread)
     with ThreadPoolExecutor(max_workers=threads) as ex:
         def top_up():
             nonlocal nxt
             while len(inflight) < threads:
                 Nc = max(1, N // 2)
-                nR = len(arms.get(N, [])) + sum(v == N for v in inflight.values())
-                nC = len(arms.get(Nc, [])) + sum(v == Nc for v in inflight.values())
+                nR = len(arms.get(N, [])) + sum(v[0] == N for v in inflight.values())
+                nC = len(arms.get(Nc, [])) + sum(v[0] == Nc for v in inflight.values())
                 ns = Nc if (check and nC < nR) else N
                 sd = seed + 1000 * nxt
                 nxt += 1
+                flag = np.zeros(1, dtype=np.int64)
                 inflight[ex.submit(run, ll_u, ndim, wrapped=wrapped, nlive=nlive, nsteps=ns, k=1, seed=sd, dirs=dirs,
-                                   frac_remain=frac_remain, paxis=paxis, kpair=kpair, stop=stopflag, pglob=pglob,
-                                   recluster=recluster, data=data)] = ns
+                                   frac_remain=frac_remain, paxis=paxis, kpair=kpair, stop=flag, pglob=pglob,
+                                   recluster=recluster, data=data)] = (ns, flag)
 
+        # When to evaluate (Round 13): the full evaluation (merges, KS) costs ~0.5-3 s, so up to Round 12 it ran
+        # after every `threads` finished runs, and a fit passed on average ~half a run time after its criteria
+        # were met. Now the cheap scalar precheck runs after every finished run and triggers the full evaluation
+        # as soon as a pass (or a dlnZ escalation) is possible; while the precheck stays true but the KS checks
+        # fail, the full evaluation is repeated every max(1, threads // 4) runs. The regular cadence stays.
         top_up()
         ndone = 0
+        pre_last = False
         while True:
             done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
             for f in done:
-                ns = inflight.pop(f)
+                ns, _flag = inflight.pop(f)
                 r = f.result()
                 r.pop("samples_u", None)
                 ncall_tot[0] += r["ncall"]
@@ -1274,11 +1372,17 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                     arms.setdefault(ns, []).append(r)
                 ndone += 1
             top_up()                             # refill before the (slow, Python) evaluation
-            if len(arms.get(N, [])) >= 2 and ndone >= threads:
+            if len(arms.get(N, [])) < 2:
+                continue
+            regular = ndone >= threads
+            pre = precheck(N)
+            if regular or (pre and (not pre_last or ndone >= max(1, threads // 4))):
                 ndone = 0
+                n_eval[0 if regular else 1] += 1
                 te = time.perf_counter()
                 passed, escalate, M = evaluate(N)
                 t_eval[0] += time.perf_counter() - te
+                pre_last = pre
                 if passed or M >= max_runs:
                     break
                 if escalate:
@@ -1287,10 +1391,17 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                     arms.pop(max(1, N // 2), None)
                     N *= 2
                     nesc += 1
+                    pre_last = False
+                    # runs of the dropped arm (old N / 2) still in flight are useless: abort them now
+                    for f, (ns, flag) in inflight.items():
+                        if ns != N and ns != max(1, N // 2):
+                            flag[0] = 1
+                            n_obsolete[0] += 1
             top_up()
-        # abort the runs still in flight (the compiled loop polls stopflag every iteration) and discard them:
+        # abort the runs still in flight (the compiled loop polls its stop flag every iteration) and discard them:
         # waiting for them cost up to one run time (C7 at nsteps 256: 140 s of 790)
-        stopflag[0] = 1
+        for ns, flag in inflight.values():
+            flag[0] = 1
         for f in list(inflight):
             inflight.pop(f)
             r = f.result()
@@ -1305,7 +1416,8 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     lzb = float(np.std(zg[_rng.integers(0, len(zg), (1000, len(zg)))].mean(axis=1), ddof=1)) if len(zg) > 1 else np.nan
     mixm = np.mean([r["mix"] for r in R], axis=0)
     return dict(mix=mixm, logz=lzm, logzerr=hist[-1]["logz_err"], logzerr_boot=lzb, samples_u=samples, ess=ess,
-                runs=R, n_failed=len(bad), n_aborted=n_aborted[0], t_eval=t_eval[0], runs_check=arms.get(max(1, N // 2), []) if check else [], history=hist, passed=passed,
+                runs=R, n_failed=len(bad), n_aborted=n_aborted[0], n_obsolete=n_obsolete[0], n_eval=n_eval[0],
+                n_eval_pre=n_eval[1], t_eval=t_eval[0], t_compile=t_compile, runs_check=arms.get(max(1, N // 2), []) if check else [], history=hist, passed=passed,
                 wall=time.perf_counter() - t0, ncall=hist[-1]["ncall"], nlive=nlive, nsteps=N, nsteps0=nsteps,
                 n_escalations=nesc, dlnz_check=hist[-1].get("dlnz"), dlnz_check_err=hist[-1].get("dlnz_err"),
                 ks_arms=hist[-1].get("ks_arms"), maxL=float(max(r["maxL"] for r in R)))
