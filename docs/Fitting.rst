@@ -279,8 +279,16 @@ It adds runs until all of these hold:
   error), and their posteriors within ``ks_tol``;
 - at least ``min_runs`` runs (16 / 8) and at most 10 % failed runs.
 
-If the two arms disagree significantly, ``nsteps`` is doubled: the old result arm becomes the check arm
-and sampling continues. Data that need longer chains are detected and handled automatically. The checks
+The two arms always differ a little (by noise, and by small real differences well below the
+tolerances), so the check judges the *size* of their difference against the tolerances:
+
+- the KS distance between the arms is corrected for its noise, measured by randomly re-splitting the
+  runs of both arms;
+- the ln Z difference must exceed twice the tolerance by more than two standard errors (three while an
+  arm has fewer than ``min_runs`` runs).
+
+If the arms disagree by more than the tolerances, ``nsteps`` is doubled: the old result arm becomes the
+check arm and sampling continues. Data that need longer chains are detected and handled automatically. The checks
 are evaluated after every finished run, as soon as a pass is possible, and the fit stops at once. A fit
 that does not pass within ``max_runs`` runs is returned with ``passed=False``.
 
@@ -360,7 +368,7 @@ see ``SAMPLING.md`` and ``NSS_SAMPLER.md`` in the project directory. In summary:
   - the compiled likelihood equals ``Likelihood`` to 10⁻¹⁴;
   - prior transforms, the moon-phase weights and the limb-darkening prior reproduce their target
     distributions;
-  - resuming after a crash gives exactly the uninterrupted result;
+  - a fit resumed after a crash continues and agrees with an uninterrupted fit within its error;
   - evidences agree with the earlier scripts (notebook data: −185.975 ± 0.018 over five seeds vs
     −185.95 ± 0.02) and with an independent prediction for an informative limb-darkening prior.
   - Tests: ``test_cases/test_sampling.py``.
@@ -371,10 +379,19 @@ Limitations
 
 - The noise model is white Gaussian noise with the given errors. There is no jitter term and no
   correlated noise.
-- Supersampling (long-cadence data) is supported through the ``Likelihood``, but its effect on fits has
-  not been tested yet.
-- The chain-length check decides with fixed thresholds. Near them, a fit may double its chains
-  unnecessarily (costing time, not accuracy).
+- **Long-cadence data need supersampling** (set in the ``Likelihood``: ``supersampling_factor`` and a
+  supersampled time grid, as for ``pandora()``). On injected Kepler-like 30-min data (exposure smearing
+  simulated at a factor of 30), fits without supersampling biased the limb darkening and transit shape
+  by up to 1.5–2.5 standard deviations and overestimated the Bayes factor by 1.7 (3 transits, 500 ppm)
+  to 12.6 nats (7 transits, 300 ppm). Use ``supersampling_factor=5`` for 30-min cadence (posterior
+  shifts ≤ 0.1 sigma, Bayes factor within 0.4) and 7 for evidence comparisons at high signal-to-noise. Each
+  call then costs about 2× (5) or 2.4× (7) as much.
+- The chain-length check compares ``nsteps`` with ``nsteps / 2``. It detects a chain-length bias that
+  changes by more than about 2 ``lz_tol`` per doubling, but not one that stays nearly constant between
+  ``nsteps / 2`` and ``nsteps`` before it falls. Such a plateau was found in a 16-dimensional test problem
+  with two strongly curved (banana) degeneracies (bias +0.26 nats at 64 steps, undetected). On Pandora's
+  test data, ln Z does not depend on the chain length between 32 and 512 steps, and simulation-based
+  calibration is passed. For other, strongly curved posteriors, start with longer chains (``nsteps=``).
 - Very narrow per_moon priors are handled through a density ratio. They are correct but sample less
   efficiently.
 - One process at a time should use the cores (``threads``): fits are already parallel.

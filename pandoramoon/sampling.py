@@ -886,11 +886,36 @@ class NestedSampler:
             block(r["planet"], "planet only")
             print(f"Bayes factor: dlogZ = logZ(moon) - logZ(planet) = {r['dlogz']:.3f} +- {r['dlogzerr']:.3f}")
 
+    def parameters(self, point=None, model=None):
+        """all 20 Pandora model parameters (dict, Pandora's names; limb darkening as u1, u2) for a point of
+        the free parameters (default: the maximum-likelihood point of the fit). model: None (the fitted
+        model) or "planet" (the planet-only fit; its moon parameters are Pandora's planet-only values).
+        Use e.g. `for k, v in sampler.parameters().items(): setattr(params, k, v)` to plot the best fit."""
+        name = model or self.model
+        m = self.models[name]
+        if point is None:
+            r = self.results if name == self.model else self.results["planet"]
+            point = r["maxlikelihood"]["point"]
+        point = list(point)
+        vals = {}
+        for k, v in m.spec.items():
+            vals[k] = None if isinstance(v, Prior) else float(v)
+        for k, x in zip(m.free, point):
+            vals[k] = float(x)
+        if "q1" in vals:
+            sq = math.sqrt(vals.pop("q1"))
+            q2 = vals.pop("q2")
+            vals["u1"], vals["u2"] = 2.0 * sq * q2, sq * (1.0 - 2.0 * q2)
+        if name == "planet":
+            for k, x in zip(MOON_NAMES, (0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)):
+                vals[k] = x
+        return {k: vals[k] for k in PARAMS}
+
     def plot_corner(self, model=None, filename=None, **kwargs):
         """corner plot of the posterior (needs the `corner` package); saved to log_dir/plots/corner.pdf"""
         import corner
-        import matplotlib.pyplot as plt
         r = self.results if (model is None or model == self.model) else self.results[model]
+        kwargs.setdefault("title_fmt", ".3g")      # values like R_star [m] or masses [kg] need significant digits
         fig = corner.corner(r["samples"], labels=r["paramnames"], show_titles=True, **kwargs)
         if filename is None and self.log_dir is not None:
             sub = "" if (model is None or model == self.model) else model
@@ -898,5 +923,4 @@ class NestedSampler:
             os.makedirs(os.path.dirname(filename), exist_ok=True)
         if filename:
             fig.savefig(filename, bbox_inches="tight")
-            plt.close(fig)
-        return fig
+        return fig                                # left open, so that notebooks display it
