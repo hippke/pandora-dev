@@ -1026,7 +1026,9 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     KS, ks_null): pass the KS part if ksa^2 - median(null)^2 <= ks_tol^2, escalate if ksa^2 - max(null)^2 >
     ks_tol^2, otherwise add runs. dlnZ: pass if |d| + sigma <= 2 lz_tol, escalate if |d| - 2 sigma > 2 lz_tol
     (3 sigma while an arm has fewer than min_runs runs: the sd of lnZ from few runs is unreliable), grey zone
-    (own criteria met, sigma <= 0.6 lz_tol) only if |d| - sigma > lz_tol. Offline simulations on pools of real
+    (own criteria met): escalate if sigma <= 0.6 lz_tol and |d| - sigma > lz_tol, or if both arms have >= 2 min_runs
+    runs and the noise-corrected KS (median null) still exceeds ks_tol; and escalate if the per-run lnZ sd exceeds
+    3.5 x the quoted sqrt(H/n) (>= max(16, 2 min_runs) runs): the chains do not mix. Offline simulations on pools of real
     runs: false escalations C0 25 % -> 2 %, C7 47 % -> 0 % (cost -13 %), logZ unchanged.
 
     Resume (Round 15, used by pandoramoon.sampling): callback(event, **kw) is called in the main thread with
@@ -1126,7 +1128,13 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 k_sig = 3.0 if min(sR["M"], sC["M"]) < min_runs else 2.0
                 dl_esc = abs(d) - k_sig * sig > 2 * lz_tol
                 ok_bias = bool(abs(d) + sig <= 2 * lz_tol and ks_pass)
-                escalate = bool(enough and N < max_nsteps and (dl_esc or ks_esc))
+                # excess scatter: per-run lnZ sd > 3.5 x the quoted sqrt(H/n) -> the chains do not mix (e.g. runs that
+                # miss modes); longer chains help (SBC draw 73: ratio ~5, logZ 1.2 too low at 64 steps; Pandora suite
+                # 1.2-2.5). Needs >= max(16, 2 min_runs) runs (the sd of lnZ from few runs is heavy-tailed).
+                q_run = float(np.mean([r["logzerr"] for r in Rg]))
+                sc_esc = bool(sR["M"] >= max(16, 2 * min_runs) and sR["sd"] > 3.5 * q_run)
+                h.update(scatter_ratio=float(sR["sd"] / q_run) if q_run > 0 else np.nan)
+                escalate = bool(enough and N < max_nsteps and (dl_esc or ks_esc or sc_esc))
             else:
                 # bias at N ~ dlnZ(N/2, N) if it falls at least like 1/nsteps (known-Z tests, SAMPLING.md Round 8):
                 # pass if its ~1 sigma upper bound is <= 2 lz_tol; escalate if it is significantly above that
@@ -1153,6 +1161,14 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
         grey_r8 = check_rule != "r16" and (h.get("dlnz_err", np.inf) <= 0.6 * lz_tol or h.get("ks_arms", 0) > ks_tol)
         grey_r16 = (check_rule == "r16" and h.get("dlnz_err", np.inf) <= 0.6 * lz_tol
                     and abs(h.get("dlnz", 0.0)) - h.get("dlnz_err", np.inf) > lz_tol)
+        # r16 grey zone for the KS: the result arm meets its own criteria, both arms have >= 2 min_runs runs, and
+        # the noise-corrected KS (median null) still exceeds ks_tol -> by the point estimate the arms differ by more
+        # than the tolerance; doubling nsteps is cheaper than running to max_runs (SBC draws of Round 12 that
+        # needed long chains stayed undecided without it, SAMPLING.md Round 16)
+        if (check_rule == "r16" and check and h.get("ks_arms", 0) > ks_tol
+                and h["ks_arms"] ** 2 - h.get("ks_null_med", 0.0) ** 2 > ks_tol ** 2
+                and min(h.get("runs_good", 0), h.get("check_runs", 0)) >= 2 * min_runs):
+            grey_r16 = True
         if check and own_ok and not ok_bias and N < max_nsteps and (grey_r8 or grey_r16):
             # grey zone (C0: dlnZ ~ 0.15-0.2 or KS arms ~ ks_tol for 50+ runs): the result arm is converged by
             # its own criteria but the nsteps check does not pass, and the check is precise enough to say so
