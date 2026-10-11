@@ -11,6 +11,9 @@ Hill radii (P_m <= 40 d), tau, Omega uniform, i_moon uniform 0-180 deg.
     sysd = injections.draw(17, "kepler", moon=True)       # deterministic in (index, regime, moon)
     t, flux, err = injections.simulate(sysd)
     sysd["priors"]   # per_bary, a_bary prior boxes for FirstLook
+    # long-cadence data with exposure smearing (truth averaged over 30 sub-exposures per cadence), fitted with
+    # supersampling factor 5 (t = the fit's sub-exposure grid, flux / err at the cadences; SAMPLING.md backlog 7):
+    t, flux, err = injections.simulate(sysd, true_ssf=30, fit_ssf=5)
 """
 import math
 
@@ -72,7 +75,12 @@ def draw(i, regime, moon=True, seed=2026):
     raise RuntimeError("no valid system")
 
 
-def simulate(s, noise_seed=None):
+def simulate(s, noise_seed=None, true_ssf=1, fit_ssf=1):
+    """light curve of system s: (time, flux, err). true_ssf: supersampling factor of the injected truth (> 1:
+    each cadence is the average over true_ssf sub-exposures, i.e. real exposure smearing; 1 = instantaneous flux at
+    the cadence mid-times, as in Round 11). fit_ssf: the returned time grid is the sub-exposure grid of that factor
+    (for Likelihood / FirstLook(supersampling_factor=fit_ssf)); flux and err are at the cadences either way. The
+    noise is the same for every (true_ssf, fit_ssf) of a system."""
     p = pandora.model_params()
     p.R_star = R_SUN
     p.u1, p.u2 = LD
@@ -84,15 +92,23 @@ def simulate(s, noise_seed=None):
     p.ecc_bary = 0.0
     p.ecc_moon = 0
     p.w_moon = 0
-    p.supersampling_factor = 1
+    p.supersampling_factor = int(true_ssf)
     p.occult_small_threshold = 0
-    p.hill_sphere_threshold = 1.2
+    # the fits use 1.0 (FirstLook); was 1.2 until Round 17 (no injection lies above 0.45 Hill radii: data unchanged)
+    p.hill_sphere_threshold = 1.0
+    flux, _, _ = pandora.moon_model(p).light_curve(pandora.time(p).grid())     # at the cadences
+    p.supersampling_factor = int(fit_ssf)
     t = pandora.time(p).grid()
-    flux, _, _ = pandora.moon_model(p).light_curve(t)
     rng = np.random.default_rng(noise_seed if noise_seed is not None else
                                 [7, s["index"], REGIMES[s["regime"]], int(s["moon"])])
-    err = np.full(len(t), s["noise_ppm"] * 1e-6)
-    return t, flux + rng.normal(0.0, 1.0, len(t)) * err, err
+    err = np.full(len(flux), s["noise_ppm"] * 1e-6)
+    return t, flux + rng.normal(0.0, 1.0, len(flux)) * err, err
+
+
+def planet_snr(s):
+    """photometric S/N of the planet's transits: depth r_p^2 x sqrt(in-transit cadences) / noise per cadence"""
+    dur = s["per_bary"] / math.pi * (1 + s["r_planet"]) / s["a_bary"]
+    return float(s["r_planet"] ** 2 * math.sqrt(s["epochs"] * dur * s["cadences_per_day"]) / (s["noise_ppm"] * 1e-6))
 
 
 def moon_snr(s, t, err):

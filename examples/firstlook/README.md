@@ -234,3 +234,15 @@ Not tested yet:
 - eccentric orbits;
 - single transits.
 
+## Supersampling for detection (`ss_detect.py`, SAMPLING.md backlog 7)
+
+Kepler long-cadence injections with real exposure smearing (`injections.simulate(s, true_ssf=30, fit_ssf=k)`:
+the truth averaged over 30 sub-exposures per cadence; the returned time grid is the fit's sub-exposure grid of
+factor k), with and without a moon, first look at several fit factors, plus reference fits (1000 live points,
+factor 7) that label the detectable moons:
+
+    python ss_detect.py --n-moon 60 --n-null 60 --factors 1,3,5 --recall 0.95 --threads 20 --out ss_detect.jsonl
+    python ss_detect.py --summary ss_detect.jsonl     # false positives, recall, dlnZ shift vs factor, CPU-s
+
+`FirstLook(..., supersampling_factor=k)` takes the sub-exposure time grid and the flux / errors at the cadences.
+Since Pandora `8b1ce11` the planet-only kernel has a fast path for supersampled cadences.
