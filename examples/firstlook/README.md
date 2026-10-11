@@ -82,7 +82,11 @@ benchmark (`bench_firstlook.py --bench --preset P`, 200 light curves, one core o
 - moon orbit 0.08–0.45 Hill radii (P_m ≤ 40 d), τ, Ω uniform, i_moon uniform in 0–180° (many
   moons do not transit);
 - data = windows around each transit (transit duration + the moon's maximal offset), white
-  Gaussian noise of known σ, one sample per cadence (no supersampling);
+  Gaussian noise of known σ, one sample per cadence (no supersampling; **the injections contain no
+  exposure smearing either**, so this calibration does not cover real long-cadence data. In a later test
+  (SAMPLING.md, "Supersampling: findings"), fits without supersampling inflated ΔlnZ by +1.7 to +12.6 on
+  smeared 30-min data, which could create false detections for high-S/N planets. To be tested for the
+  first look (SAMPLING.md backlog item 7); until then use `supersampling_factor=5` for 30-min data);
 - S/N = depth × √(in-transit cadences) / σ per cadence. For the moon, its transit is assumed to
   last as long as the planet's.
 

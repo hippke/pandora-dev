@@ -399,7 +399,9 @@ Limitations
   by up to 1.5–2.5 standard deviations and overestimated the Bayes factor by 1.7 (3 transits, 500 ppm)
   to 12.6 nats (7 transits, 300 ppm). Use ``supersampling_factor=5`` for 30-min cadence (posterior
   shifts ≤ 0.1 sigma, Bayes factor within 0.4) and 7 for evidence comparisons at high signal-to-noise. Each
-  call then costs about 2× (5) or 2.4× (7) as much.
+  call then costs about 2× (5) or 2.4× (7) as much. The Bayes-factor inflation without supersampling grows
+  with the planet's signal-to-noise, not the moon's. For light curves without a moon it may therefore
+  produce false detections near the usual thresholds (not yet tested).
 - The chain-length check compares ``nsteps`` with ``nsteps / 2``. It detects a chain-length bias that
   changes by more than about 2 ``lz_tol`` per doubling, but not one that stays nearly constant between
   ``nsteps / 2`` and ``nsteps`` before it falls. Such a plateau was found in a 16-dimensional test problem
