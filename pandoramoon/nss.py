@@ -1146,7 +1146,12 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 # miss modes); longer chains help (SBC draw 73: ratio ~5, logZ 1.2 too low at 64 steps; Pandora suite
                 # 1.2-2.5). Needs >= max(16, 2 min_runs) runs (the sd of lnZ from few runs is heavy-tailed).
                 q_run = float(np.mean([r["logzerr"] for r in Rg]))
-                sc_esc = bool(sR["M"] >= max(16, 2 * min_runs) and sR["sd"] > 3.5 * q_run)
+                # only if the scatter falls with the chain length (the check arm at N/2 scatters >= 1.25x more):
+                # scatter from multimodality (e.g. a moon model fitted to a light curve without a moon, Round 18:
+                # 4 escalations to nsteps 1024 without effect) is not cured by longer chains
+                sc_falls = bool(sC["M"] >= max(4, min_runs // 2) and np.isfinite(sC.get("sd", np.nan))
+                                and sC["sd"] >= 1.25 * sR["sd"])
+                sc_esc = bool(sR["M"] >= max(16, 2 * min_runs) and sR["sd"] > 3.5 * q_run and sc_falls)
                 h.update(scatter_ratio=float(sR["sd"] / q_run) if q_run > 0 else np.nan)
                 escalate = bool(enough and N < max_nsteps and (dl_esc or ks_esc or sc_esc))
             else:
