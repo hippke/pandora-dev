@@ -300,7 +300,9 @@ tolerances), so the check judges the *size* of their difference against the tole
   arm has fewer than ``min_runs`` runs).
 
 If the arms disagree by more than the tolerances, ``nsteps`` is doubled: the old result arm becomes the
-check arm and sampling continues. Data that need longer chains are detected and handled automatically. The checks
+check arm and sampling continues. ``nsteps`` is also doubled if ln Z scatters between the runs by more
+than 3.5 times the single-run error. The chains then do not mix (e.g. runs miss modes), and both arms
+can be equally wrong. Data that need longer chains are detected and handled automatically. The checks
 are evaluated after every finished run, as soon as a pass is possible, and the fit stops at once. A fit
 that does not pass within ``max_runs`` runs is returned with ``passed=False``.
 
