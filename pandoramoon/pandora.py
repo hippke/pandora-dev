@@ -773,12 +773,14 @@ def pandora_loglike_planet(
     M_moon = 0, per_moon = 1e-6 d), up to rounding, but faster (no moon
     setup, no moon arrays and occultation pass; the planet's z^2, flux and
     the chi^2 in three passes over the planet's transit windows). The
-    trailing arguments are those of Likelihood._tail. Falls back to
-    pandora_loglike() for eccentric planets, supersampling, the occultation
-    cache, unsorted time, a planet smaller than the dummy orbit (r_planet <
-    1e-3) or when the sorted window search does not apply."""
+    trailing arguments are those of Likelihood._tail. Supersampled cadences
+    are averaged over their sub-exposures as in pandora_loglike()
+    (_window_chi2_runs_planet). Falls back to pandora_loglike() for eccentric
+    planets, the occultation cache, unsorted time, a planet smaller than the
+    dummy orbit (r_planet < 1e-3) or when the sorted window search does not
+    apply."""
     r_m, p_m, tau_m, om_m, i_m, e_m, w_m, m_m = PLANET_ONLY_MOON
-    fast = (ecc_bary == 0 and supersampling_factor <= 1 and time_sorted and r_planet >= 1e-3)
+    fast = (ecc_bary == 0 and time_sorted and r_planet >= 1e-3)
     if cache is not None:
         fast = False
     if not fast:
@@ -824,6 +826,9 @@ def pandora_loglike_planet(
             z2[m + j] = x * x + b2
         m += his[k] - lo
     flux = occult_hybrid_z2(z2, float(r_planet), u1, u2)
+    if supersampling_factor > 1:
+        return -0.5 * (chi2_flat + _window_chi2_runs_planet(
+            len(time), los, his, flux, supersampling_factor, inv_var, lin_terms))
     chi2 = 0.0
     m = 0
     for k in range(len(los)):
@@ -1405,6 +1410,60 @@ def _window_chi2_runs(n, los, his, flux_planet_w, flux_moon_w,
             q = min(hi, end)
             for j in range(m, m + q - p):
                 s += (1.0 - flux_planet_w[j]) + (1.0 - flux_moon_w[j])
+            m += q - p
+            p = q
+    if out >= 0:
+        d = s / (end - out * factor)
+        chi2 += d * (inv_var[out] * d - lin_terms[out])
+    return chi2
+
+
+@jit(cache=True, nopython=True, fastmath=True, parallel=False)
+def _window_chi2_runs_planet(n, los, his, flux_w, supersampling_factor, inv_var, lin_terms):
+    """_window_chi2_runs() for supersampling_factor > 1 with the planet flux only (no moon term): the same
+    cadences, the same block means (deficit sums over the sub-exposures divided by the full block length; samples
+    outside the window have deficit 0) and the same chi^2 form D (inv_var D - lin_terms)"""
+    factor = supersampling_factor
+    chi2 = 0.0
+    m = 0
+    out = -1
+    end = 0
+    s = 0.0
+    for k in range(len(los)):
+        p = los[k]
+        hi = his[k]
+        while p < hi:
+            if out >= 0:
+                if p < end:
+                    q = min(hi, end)
+                    for j in range(m, m + q - p):
+                        s += 1.0 - flux_w[j]
+                    m += q - p
+                    p = q
+                    continue
+                d = s / (end - out * factor)
+                chi2 += d * (inv_var[out] * d - lin_terms[out])
+                out = -1
+            o = p // factor
+            start = o * factor
+            if p == start:
+                nb = (hi - p) // factor
+                for b in range(nb):
+                    s = 0.0
+                    for j in range(m, m + factor):
+                        s += 1.0 - flux_w[j]
+                    d = s / factor
+                    chi2 += d * (inv_var[o + b] * d - lin_terms[o + b])
+                    m += factor
+                p += nb * factor
+                if nb > 0:
+                    continue
+            out = o
+            end = min(start + factor, n)
+            s = 0.0
+            q = min(hi, end)
+            for j in range(m, m + q - p):
+                s += 1.0 - flux_w[j]
             m += q - p
             p = q
     if out >= 0:
