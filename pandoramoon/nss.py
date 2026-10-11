@@ -79,6 +79,7 @@ def _cholesky(C):
             L[i, j] = t / L[j, j]
     return L
 MAXEXP = 100     # max linear step-outs per side and slice
+PLATEAU = -1e299  # logL at or below this is the LOGZERO plateau (outside the prior; sampling.LOGZERO = -1e300)
 
 
 def make_sampler(ll_u, parallel, with_data=False):
@@ -219,13 +220,14 @@ def make_sampler(ll_u, parallel, with_data=False):
                 nbr[q, t] = ref[sel[t]] if t < sel.shape[0] else q
 
     @njit
-    def pair_lists(U, alive, sd, kk, M, nbr, ref):
+    def pair_lists(U, alive, sd, kk, M, nbr, ref, wmi):
         """dirs="pairs" (Round 13): nbr[q, :kk] = the kk nearest alive points to U[q] (metric scaled by sd) among
         the reference set (all alive points if n <= M, else M distinct random ones), ascending. The same lists as
         the first kk columns of cluster()'s K-nearest graph (checked: test_knnfast.py), without the union-find
         (the labels are not used by "pairs") and faster: scaled reference coordinates stored transposed, so the
         squared distances of one point to all references are summed dimension by dimension over contiguous
-        arrays (SIMD), then one selection pass keeps the kk smallest; no allocation per point."""
+        arrays (SIMD), then one selection pass keeps the kk smallest; no allocation per point.
+        wmi[i] True: minimal-image difference in dimension i (wrapped dimensions with minimg=True, Round 19 / E2)."""
         n, ndim = U.shape
         nref = refset(alive, -1, M, ref)
         inv = np.empty(ndim)
@@ -247,9 +249,15 @@ def make_sampler(ll_u, parallel, with_data=False):
             for i in range(ndim):
                 xi = U[q, i] * inv[i]
                 row = VT[i]
-                for a in range(nref):
-                    t = row[a] - xi
-                    d[a] += t * t
+                if wmi[i]:
+                    for a in range(nref):
+                        t = U[ref[a], i] - U[q, i]
+                        t = (t - math.floor(t + 0.5)) * inv[i]
+                        d[a] += t * t
+                else:
+                    for a in range(nref):
+                        t = row[a] - xi
+                        d[a] += t * t
             m = 0
             worst = np.inf
             for a in range(nref):
@@ -412,8 +420,10 @@ def make_sampler(ll_u, parallel, with_data=False):
     @njit
     def chain(U, j, L0, nb, Lmin, nsteps, scale, wrapped, x, xn, alive, dmode, paxis, sdv, nbr, kpair, pglob, D, Lp):
         """slice chain at fixed Lmin from U[j] (logL L0); directions by dmode: 0 = differences of members of nb
-        ("cluster"), 2 = local pairs ("pairs"), 3 = local covariance ("lcov"); optional axis / global-pair steps.
-        Returns (L, ncalls, nexpand) with the end point in x"""
+        ("cluster"), 2 = local pairs ("pairs"), 6 = local pairs with the minimal image in wrapped dimensions
+        (Round 19, SAMPLING_REVIEW.md E2), 3 = local covariance ("lcov"); optional axis / global-pair steps.
+        Returns (L, ncalls, nexpand, nstuck, nmaxexp) with the end point in x; nstuck = steps whose shrink collapsed
+        without an accepted point (the chain did not move), nmaxexp = step-outs that hit MAXEXP (B7)"""
         ndim = U.shape[1]
         n = U.shape[0]
         for i in range(ndim):
@@ -421,6 +431,8 @@ def make_sampler(ll_u, parallel, with_data=False):
         L = L0
         nc = 0
         nexp = 0
+        nstuck = 0
+        nmaxexp = 0
         m = nb.shape[0]
         v = np.empty(ndim)
         for _ in range(nsteps):
@@ -465,7 +477,7 @@ def make_sampler(ll_u, parallel, with_data=False):
                         s_ += Lp[pa, i, i2] * z[i2]
                     v[i] = 1.4142135623730951 * s_
                     vv += v[i] * v[i]
-            elif dmode == 2:
+            elif dmode == 2 or dmode == 6:
                 # local pair difference: a random alive point and one of its kpair nearest neighbours
                 # (neighbour lists from the last reclustering; independent of the chain's position)
                 while True:
@@ -475,7 +487,10 @@ def make_sampler(ll_u, parallel, with_data=False):
                 pb = nbr[pa, np.random.randint(kpair)]
                 sg = 1.0 if np.random.uniform(0.0, 1.0) < 0.5 else -1.0
                 for i in range(ndim):
-                    v[i] = sg * (U[pa, i] - U[pb, i])
+                    dv = U[pa, i] - U[pb, i]
+                    if dmode == 6 and wrapped[i]:
+                        dv -= math.floor(dv + 0.5)     # minimal image (still independent of the chain's position)
+                    v[i] = sg * dv
                     vv += v[i] * v[i]
             else:
                 for i in range(ndim):
@@ -495,6 +510,8 @@ def make_sampler(ll_u, parallel, with_data=False):
                 if LL(xn, D) > Lmin:
                     left -= scale
                     nexp += 1
+                    if _e == MAXEXP - 1:
+                        nmaxexp += 1
                 else:
                     break
             for _e in range(MAXEXP):
@@ -506,6 +523,8 @@ def make_sampler(ll_u, parallel, with_data=False):
                 if LL(xn, D) > Lmin:
                     right += scale
                     nexp += 1
+                    if _e == MAXEXP - 1:
+                        nmaxexp += 1
                 else:
                     break
             # shrink
@@ -526,8 +545,9 @@ def make_sampler(ll_u, parallel, with_data=False):
                 else:
                     right = t
                 if right - left < 1e-14:
+                    nstuck += 1
                     break
-        return L, nc, nexp
+        return L, nc, nexp, nstuck, nmaxexp
 
     @njit
     def grow(dU, dL, dlogw, nd):
@@ -544,8 +564,12 @@ def make_sampler(ll_u, parallel, with_data=False):
 
     @njit(parallel=parallel, nogil=True)
     def ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed, scale0, M, dirmode, recluster, paxis, kpair,
-           stop, pglob, D):
+           stop, pglob, D, logx0, scale_gain, freeze_after, minimg):
         # dirmode: 1 = "cluster", 4 = "pairs", 5 = "lcov" (the numbers of the full version, nss_legacy)
+        # Round 19 options (SAMPLING_REVIEW.md; defaults = the behaviour before): logx0 = ln X at the start (rejection
+        # init, B1); scale_gain = factor of the scale adaptation per iteration (1.1; 1.0 = fixed scale), freeze_after =
+        # iteration after which the scale is frozen (-1: never) (E1 / X3); minimg = minimal image in wrapped dimensions
+        # for the pair metric, the pair directions and the metric's spread (circular sd) (E2 / X5)
         n, ndim = U.shape
         # seeds (per thread in parallel mode: numba seeds each thread's state)
         np.random.seed(seed)
@@ -554,9 +578,15 @@ def make_sampler(ll_u, parallel, with_data=False):
         dL = np.empty(cap)
         dlogw = np.empty(cap)
         nd = 0
-        logX = 0.0
+        logX = logx0
         logZ = -np.inf
         ncall = 0
+        nstuck_tot = 0
+        nmaxexp_tot = 0
+        wmi = np.zeros(ndim, dtype=np.bool_)
+        if minimg:
+            for i in range(ndim):
+                wmi[i] = wrapped[i]
         scale = scale0
         it = 0
         nexp_tot = 0
@@ -566,6 +596,8 @@ def make_sampler(ll_u, parallel, with_data=False):
         newL = np.empty(k)
         ncs = np.zeros(k, dtype=np.int64)
         nexps = np.zeros(k, dtype=np.int64)
+        nstucks = np.zeros(k, dtype=np.int64)
+        nmaxexps = np.zeros(k, dtype=np.int64)
         starts = np.empty(k, dtype=np.int64)
         xs = np.empty((k, ndim))
         xns = np.empty((k, ndim))
@@ -616,6 +648,17 @@ def make_sampler(ll_u, parallel, with_data=False):
             # spread of the live points (for the neighbour metric), every n/10 replacements
             if it % sd_every == 0:
                 for i in range(ndim):
+                    if wmi[i]:
+                        # circular spread: sqrt(-2 ln R) / (2 pi), R = |mean exp(2 pi i u)| (a seam-split clump is one clump)
+                        cs = 0.0
+                        sn = 0.0
+                        for a in range(n):
+                            cs += math.cos(2.0 * math.pi * U[a, i])
+                            sn += math.sin(2.0 * math.pi * U[a, i])
+                        R = math.sqrt(cs * cs + sn * sn) / n
+                        sd[i] = min(math.sqrt(-2.0 * math.log(max(R, 1e-300))) / (2.0 * math.pi),
+                                    0.28867513459481287) + 1e-300
+                        continue
                     mu = 0.0
                     for a in range(n):
                         mu += U[a, i]
@@ -627,7 +670,7 @@ def make_sampler(ll_u, parallel, with_data=False):
             for jj in range(k):
                 alive[sel[jj]] = False
             if dirmode == 4 and repl_since >= recluster * n:
-                pair_lists(U, alive, sd, kpair, M, nbr, ref)
+                pair_lists(U, alive, sd, kpair, M, nbr, ref, wmi)
                 nrecl += 1
                 repl_since = 0
             if (dirmode == 1 or dirmode == 5) and repl_since >= recluster * n:
@@ -664,11 +707,14 @@ def make_sampler(ll_u, parallel, with_data=False):
                 else:
                     mem = neighbours(U, starts[c], alive, sd, K, d2s[c], M, idxs[c])
                     mcount[c] = 1 if dirmode == 1 else 0
-                Lc, nc, ne = chain(U, starts[c], L[starts[c]], mem, Lmin, nsteps, scale, wrapped, xs[c], xns[c], alive,
-                                   2 if dirmode == 4 else (3 if dirmode == 5 else 0), paxis, sd, nbr, kpair, pglob, D, Lp)
+                Lc, nc, ne, nst, nmx = chain(U, starts[c], L[starts[c]], mem, Lmin, nsteps, scale, wrapped, xs[c], xns[c],
+                                             alive, (6 if minimg else 2) if dirmode == 4 else (3 if dirmode == 5 else 0),
+                                             paxis, sd, nbr, kpair, pglob, D, Lp)
                 newL[c] = Lc
                 ncs[c] = nc
                 nexps[c] = ne
+                nstucks[c] = nst
+                nmaxexps[c] = nmx
                 for i in range(ndim):
                     newU[c, i] = xs[c, i]
                 # insertion index (Fowlie, Handley & Su 2020): rank of the new logL among the n - k
@@ -709,13 +755,16 @@ def make_sampler(ll_u, parallel, with_data=False):
                 nfallback += mcount[c]
                 ncall += ncs[c]
                 nexp_tot += nexps[c]
+                nstuck_tot += nstucks[c]
+                nmaxexp_tot += nmaxexps[c]
             nstep_tot += k * nsteps
             # scale adaptation: aim at ~1 expansion per step (interval comparable to the slice)
-            if nexps.sum() > k * nsteps:
-                scale *= 1.1
-            else:
-                scale /= 1.1
-            scale = min(max(scale, 1e-3), 1e3)
+            if freeze_after < 0 or it < freeze_after:
+                if nexps.sum() > k * nsteps:
+                    scale *= scale_gain
+                else:
+                    scale /= scale_gain
+                scale = min(max(scale, 1e-3), 1e3)
             it += 1
         # live points
         logw_live = logX - math.log(n)
@@ -727,7 +776,7 @@ def make_sampler(ll_u, parallel, with_data=False):
             dlogw[nd] = logw_live
             nd += 1
         return (dU[:nd], dL[:nd], dlogw[:nd], ncall, it, scale, nexp_tot / max(nstep_tot, 1),
-                nclus, nclus_max, nrecl, nfallback, ins[:nins], mix / max(nmix, 1))
+                nclus, nclus_max, nrecl, nfallback, ins[:nins], mix / max(nmix, 1), nstuck_tot, nmaxexp_tot)
 
     @njit(parallel=parallel, nogil=True)
     def init(n, ndim, seed, D):
@@ -781,8 +830,16 @@ def insertion_test(ranks, m, nlive, seed=0):
 
 def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_remain=0.01,
         max_iter=10_000_000, seed=1, scale0=1.0, threads=None, nbsub=2000, dirs="cluster",
-        recluster=0.25, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None):
+        recluster=0.25, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None, init_reject=False,
+        init_min_draws=100_000, logx0=None, scale_gain=1.1, freeze_after=-1, minimg=False):
     """returns dict(logz, logzerr, ncall, niter, wall, samples_u (equal weight), dead_u, dead_L, logw).
+    Round 19 options (SAMPLING_REVIEW.md; the defaults keep the behaviour before):
+    init_reject: draw the initial live points only where logL > PLATEAU (the LOGZERO plateau, B1) and start at
+      ln X0 = ln(accepted / drawn) over >= init_min_draws draws (or the given logx0, e.g. an analytic 1 - f);
+      the draws are counted in ncall. Without it, plateau points enter the live set (n_plateau in the result).
+    scale_gain, freeze_after: scale adaptation per iteration (x/: scale_gain; 1.0 = fixed scale0) and the iteration
+      after which it is frozen (-1: never) (E1, experiment X3).
+    minimg: minimal image in wrapped dimensions for the pair metric, the pair directions and the spread (E2, X5).
     data: None -> ll_u(u); a tuple D -> ll_u(u, D) (one compiled sampler for many data sets).
     dirs: "pairs" (fit's default), "cluster", "lcov". The superseded "knn", "knnmh", "localcov" and the mode jumps
     `pjump` were removed in Round 14; they are in pandoramoon.nss_legacy (same API) and git tag nss-all-dirs."""
@@ -797,14 +854,38 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     nsteps = nsteps or 4 * ndim
     K = K or 2 * ndim
     t0 = time.perf_counter()
-    U, L = init(nlive, ndim, seed, D)
+    ninit = nlive
+    if init_reject:
+        Us, Ls, nacc, ndraw, j = [], [], 0, 0, 0
+        while nacc < nlive or ndraw < init_min_draws:
+            m = max(nlive, min(init_min_draws, 100_000))
+            U_, L_ = init(m, ndim, (seed * 7919 + 1_000_003 * (j + 1)) % 4294967296, D)
+            ok = L_ > PLATEAU
+            nacc += int(ok.sum())
+            ndraw += m
+            if sum(len(q) for q in Ls) < nlive:
+                Us.append(U_[ok])
+                Ls.append(L_[ok])
+            j += 1
+            if j > 10_000:
+                raise RuntimeError("init_reject: almost no prior volume above the LOGZERO plateau")
+        U = np.ascontiguousarray(np.concatenate(Us)[:nlive])
+        L = np.ascontiguousarray(np.concatenate(Ls)[:nlive])
+        lx0 = float(logx0) if logx0 is not None else math.log(nacc / ndraw)
+        ninit = ndraw
+    else:
+        U, L = init(nlive, ndim, seed, D)
+        nacc, ndraw = 0, 0
+        lx0 = float(logx0) if logx0 is not None else 0.0
+    n_plateau = int(np.sum(L <= PLATEAU))
     t1 = time.perf_counter()
     if dirs not in ("cluster", "pairs", "lcov"):
         raise ValueError(f"dirs={dirs!r}: removed in Round 14 (superseded); use pandoramoon.nss_legacy")
     (dU, dL, dlogw, ncall, it, scale, exp_rate, nclus, nclus_max, nrecl,
-     nfallback, ins, mix) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0, nbsub,
-                          {"cluster": 1, "pairs": 4, "lcov": 5}[dirs], recluster, paxis, kpair,
-                          stop if stop is not None else np.zeros(1, dtype=np.int64), pglob, D)
+     nfallback, ins, mix, nstuck, nmaxexp) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0,
+                                              nbsub, {"cluster": 1, "pairs": 4, "lcov": 5}[dirs], recluster, paxis, kpair,
+                                              stop if stop is not None else np.zeros(1, dtype=np.int64), pglob, D,
+                                              lx0, float(scale_gain), int(freeze_after), bool(minimg))
     t2 = time.perf_counter()
     lw = dlogw + dL
     logz = float(np.logaddexp.reduce(lw))
@@ -822,11 +903,12 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     samples = dU[np.searchsorted(cw, pos)]
     insd = insertion_test(ins, nlive - k, nlive, seed)
     return dict(seed=int(seed), nlive=int(nlive), ins_u=((ins + np.random.default_rng(seed + 11).uniform(size=len(ins))) / (nlive - k + 1)
-                                       ).astype(np.float32), mix=mix, insertion=insd, logz=logz, logzerr=math.sqrt(max(H, 0.0) / nlive), H=H, ncall=int(ncall) + nlive, niter=int(it),
+                                       ).astype(np.float32), mix=mix, insertion=insd, logz=logz, logzerr=math.sqrt(max(H, 0.0) / nlive), H=H, ncall=int(ncall) + ninit, niter=int(it),
                 wall=t2 - t0, wall_init=t1 - t0, samples_u=samples, ess=ess, dead_u=dU, dead_L=dL, logw=dlogw,
                 maxL=float(dL.max()), final_scale=scale, expand_rate=exp_rate,
                 nclusters=int(nclus), nclusters_max=int(nclus_max), nrecluster=int(nrecl),
-                nfallback=int(nfallback), dirs=dirs)
+                nfallback=int(nfallback), dirs=dirs, logx0=lx0, init_acc=int(nacc), init_draws=int(ndraw),
+                n_plateau=n_plateau, nstuck=int(nstuck), nmaxexp=int(nmaxexp))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -864,7 +946,12 @@ def merge_weights(rs):
     ntot = int(f.sum())
     nl = ntot - (np.cumsum(fo) - fo)            # live points just before removing point j
     dlx = 1.0 / nl
-    lx = -np.cumsum(dlx)
+    # start volume (Round 19, init_reject): pooled acceptance fraction of the runs' rejection draws, else the mean logx0
+    if all(r.get("init_draws", 0) > 0 for r in rs):
+        lx0 = math.log(sum(r["init_acc"] for r in rs) / sum(r["init_draws"] for r in rs))
+    else:
+        lx0 = float(np.mean([r.get("logx0", 0.0) for r in rs]))
+    lx = lx0 - np.cumsum(dlx)
     lxprev = lx + dlx
     lw = lxprev + np.log(-np.expm1(-dlx))       # X_{j-1} - X_j
     lwl = np.empty(len(L))
@@ -1006,7 +1093,7 @@ ACCURACY = {"high": dict(nlive=1000, lz_tol=0.1, ks_tol=0.05, min_runs=16),
 def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=None, min_runs=None,
         max_runs=96, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True, log=None,
         post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25, data=None,
-        accuracy=None, resume=None, callback=None, check_rule="r16"):
+        accuracy=None, resume=None, callback=None, check_rule="r16", run_kw=None):
     """Nested sampling with built-in convergence checks (SAMPLING.md Rounds 6b, 8).
 
     accuracy: None (use the arguments) or a preset of ACCURACY (overrides nlive, lz_tol, ks_tol, min_runs):
@@ -1221,7 +1308,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 flag = np.zeros(1, dtype=np.int64)
                 inflight[ex.submit(run, ll_u, ndim, wrapped=wrapped, nlive=nlive, nsteps=ns, k=1, seed=sd, dirs=dirs,
                                    frac_remain=frac_remain, paxis=paxis, kpair=kpair, stop=flag, pglob=pglob,
-                                   recluster=recluster, data=data)] = (ns, flag, idx)
+                                   recluster=recluster, data=data, **(run_kw or {}))] = (ns, flag, idx)
 
         def escalate_now():
             nonlocal N, nesc
