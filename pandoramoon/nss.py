@@ -638,6 +638,11 @@ def make_sampler(ll_u, parallel, with_data=False):
                 nrecl += 1
                 repl_since = 0
             repl_since += k
+            if k > 1:
+                # reproducible parallel runs (Round 17): numba keeps one random state per thread, and which thread
+                # runs which chain is not fixed. Each chain therefore reseeds its thread's state from (seed, iteration,
+                # chain), and the main thread is reseeded after the parallel loop (below).
+                np.random.seed((seed * 1000003 + 2 * it + 1) % 4294967296)
             for c in range(k):
                 while True:
                     j = np.random.randint(n)
@@ -645,6 +650,8 @@ def make_sampler(ll_u, parallel, with_data=False):
                         break
                 starts[c] = j
             for c in prange(k):
+                if k > 1:
+                    np.random.seed((seed * 2654435761 + it * k + c) % 4294967296)
                 m = 0
                 if dirmode == 1:
                     m = members(starts[c], alive, labels, idxs[c])
@@ -1033,9 +1040,11 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
 
     Resume (Round 15, used by pandoramoon.sampling): callback(event, **kw) is called in the main thread with
     event "run" (r=run dict, nsteps=arm, idx=run index) for every finished run that enters an arm, and "state"
-    (N=current result nsteps, nesc, dropped=nsteps of a dropped arm or None) after every escalation. resume =
+    (N=current result nsteps, nesc, dropped=nsteps of a dropped arm, dropped_idx=the run indices of that arm and of
+    the runs aborted with it) after every escalation. resume = dict(..., skip=[indices not to reuse]) +
     dict(runs=[(nsteps, idx, run dict), ...], N=..., nesc=...) restarts from stored runs: the runs of the arms N
-    and N/2 are reloaded, new run indices continue after the largest stored one (run seed = seed + 1000 idx), and
+    and N/2 are reloaded, new runs take the smallest unused indices (run seed = seed + 1000 idx; the runs lost in
+    flight at a crash are redone with their original seeds), and
     the checks are evaluated before any new run is started (a fit that had passed passes again at once)."""
     from concurrent.futures import ThreadPoolExecutor
     if accuracy is not None:
@@ -1057,11 +1066,16 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     N = nsteps
     nesc = 0
     ncall_tot = [0]
+    used = set()                                 # run indices consumed (seed = seed + 1000 idx)
     if resume is not None:
         N = int(resume.get("N", nsteps))
         nesc = int(resume.get("nesc", 0))
+        # indices of runs of dropped arms (and runs aborted with them) are not reused; indices of runs that were in
+        # flight at a crash are (the same seeds as in the interrupted fit, Round 17)
+        used |= set(int(i) for i in resume.get("skip", []))
         for ns_, idx_, r_ in resume.get("runs", []):
-            nxt = max(nxt, int(idx_) + 1)
+            used.add(int(idx_))
+            r_["idx"] = int(idx_)
             if ns_ == N or (check and ns_ == max(1, N // 2)):
                 arms.setdefault(ns_, []).append(r_)
         for v_ in arms.values():
@@ -1194,28 +1208,32 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 nR = len(arms.get(N, [])) + sum(v[0] == N for v in inflight.values())
                 nC = len(arms.get(Nc, [])) + sum(v[0] == Nc for v in inflight.values())
                 ns = Nc if (check and nC < nR) else N
-                sd = seed + 1000 * nxt
+                while nxt in used:                # smallest free index (fills the gaps left by a crash)
+                    nxt += 1
+                idx = nxt
+                used.add(idx)
+                sd = seed + 1000 * idx
                 flag = np.zeros(1, dtype=np.int64)
                 inflight[ex.submit(run, ll_u, ndim, wrapped=wrapped, nlive=nlive, nsteps=ns, k=1, seed=sd, dirs=dirs,
                                    frac_remain=frac_remain, paxis=paxis, kpair=kpair, stop=flag, pglob=pglob,
-                                   recluster=recluster, data=data)] = (ns, flag, nxt)
-                nxt += 1
+                                   recluster=recluster, data=data)] = (ns, flag, idx)
 
         def escalate_now():
             nonlocal N, nesc
             if verbose:
                 print(f"  fit: nsteps {N} vs {max(1, N // 2)} disagree -> nsteps {2 * N}", flush=True)
             dropped = max(1, N // 2)
-            arms.pop(dropped, None)
+            dropped_idx = [int(r.get("idx", -1)) for r in arms.pop(dropped, [])]
             N *= 2
             nesc += 1
             # runs of the dropped arm (old N / 2) still in flight are useless: abort them now
-            for f, (ns, flag, _i) in inflight.items():
+            for f, (ns, flag, i_) in inflight.items():
                 if ns != N and ns != max(1, N // 2):
                     flag[0] = 1
                     n_obsolete[0] += 1
+                    dropped_idx.append(int(i_))
             if callback is not None:
-                callback("state", N=N, nesc=nesc, dropped=dropped)
+                callback("state", N=N, nesc=nesc, dropped=dropped, dropped_idx=dropped_idx)
 
         # When to evaluate (Round 13): the full evaluation (merges, KS) costs ~0.5-3 s, so up to Round 12 it ran
         # after every `threads` finished runs, and a fit passed on average ~half a run time after its criteria
@@ -1250,6 +1268,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                     ndone += 1
                     continue
                 if ns == N or (check and ns == max(1, N // 2)):
+                    r["idx"] = int(idx)
                     if callback is not None:
                         callback("run", r=r, nsteps=ns, idx=idx)
                     # kept sorted by seed (Round 14): merges, split halves and KS depend only on WHICH runs are

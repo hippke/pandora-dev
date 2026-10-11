@@ -139,6 +139,36 @@ def _norm_cdf(z):
     return 0.5 * math.erfc(-z / math.sqrt(2.0))
 
 
+# Pandora's valid range of each parameter (pandora.params_valid); priors reaching beyond it are truncated to it
+# and renormalised (Round 17), else their mass outside would be silently lost (likelihood -inf there)
+PHYSICAL = dict(q1=(0.0, 1.0), q2=(0.0, 1.0), R_star=(0.0, math.inf), per_bary=(0.0, math.inf),
+                a_bary=(0.0, math.inf), M_planet=(0.0, math.inf), per_moon=(0.0, math.inf), r_planet=(0.0, math.inf),
+                r_moon=(0.0, math.inf), M_moon=(0.0, math.inf), ecc_bary=(0.0, 1.0), ecc_moon=(0.0, 1.0))
+
+
+def _mass_in(p, lo, hi):
+    """prior mass of p in [lo, hi]"""
+    if isinstance(p, Uniform):
+        return max(0.0, min(hi, p.hi) - max(lo, p.lo)) / (p.hi - p.lo)
+    if isinstance(p, LogUniform):
+        a, b = max(lo, p.lo), min(hi, p.hi)
+        return max(0.0, math.log(b / a)) / math.log(p.hi / p.lo) if b > a > 0 else 0.0
+    _, _, c, d = p.par()
+    a = _norm_cdf((max(lo, p.lo) - p.mean) / p.sigma)
+    b = _norm_cdf((min(hi, p.hi) - p.mean) / p.sigma)
+    return max(0.0, b - a) / (d - c)
+
+
+def _truncate(p, lo, hi):
+    """p restricted to [lo, hi] and renormalised (same type)"""
+    a, b = max(lo, p.lo), min(hi, p.hi)
+    if isinstance(p, Uniform):
+        return Uniform(a, b)
+    if isinstance(p, LogUniform):
+        return LogUniform(a, b)
+    return Normal(p.mean, p.sigma, a, b)
+
+
 # ------------------------------------------------------------------------------- compiled building blocks
 
 @njit(cache=True)
@@ -333,6 +363,20 @@ class _Model:
                     spec[k] = float(v)
                 except (TypeError, ValueError):
                     raise ValueError(f"{k}: a prior (Uniform, LogUniform, Normal) or a number, got {v!r}")
+        self.truncated = {}
+        for k, v in list(spec.items()):
+            if isinstance(v, Prior) and k in PHYSICAL:
+                lo, hi = PHYSICAL[k]
+                if v.lo < lo or v.hi > hi:
+                    frac = _mass_in(v, lo, hi)
+                    if not frac > 1e-6:
+                        raise ValueError(f"{k}: the prior {v!r} has (almost) no mass in Pandora's valid range [{lo}, {hi}]")
+                    spec[k] = _truncate(v, lo, hi)
+                    if frac < 1 - 1e-9:
+                        self.truncated[k] = 1.0 - frac
+                        import warnings
+                        warnings.warn(f"{k}: {100 * (1 - frac):.3g} % of the prior {v!r} lies outside Pandora's valid range "
+                                      f"[{lo}, {hi}]; the prior is truncated to it and renormalised", stacklevel=3)
         self.spec = spec
         self.ld = ld
         self.free = [k for k in spec if isinstance(spec[k], Prior)]
@@ -630,7 +674,33 @@ class _Store:
         return out
 
 
-def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label):
+def _thin(w, max_n, seed=0):
+    """indices and new weights of an unbiased thinning of weighted points to about max_n (Horvitz-Thompson):
+    point i is kept with probability p_i = min(1, w_i / c) and then carries the weight w_i / p_i; c is chosen so
+    that sum p_i = max_n. Points with large weight are always kept; estimates of means are unbiased."""
+    if max_n is None or len(w) <= max_n:
+        return np.arange(len(w)), w
+    ws = np.sort(w)[::-1]
+    cs = np.cumsum(ws)
+    # find c: sum min(1, w/c) = max_n  <=>  k + (S - cs[k-1]) / c = max_n for the k largest kept with p = 1
+    c = None
+    for k in range(0, int(max_n)):
+        rest = cs[-1] - (cs[k - 1] if k > 0 else 0.0)
+        cc = rest / (max_n - k)
+        if k == 0 or ws[k - 1] >= cc:
+            if ws[k] <= cc:
+                c = cc
+                break
+    if c is None:
+        c = cs[-1] / max_n
+    p = np.minimum(1.0, w / c)
+    keep = np.random.default_rng(seed).uniform(size=len(w)) < p
+    idx = np.nonzero(keep)[0]
+    nw = w[idx] / p[idx]
+    return idx, nw / nw.sum()
+
+
+def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max_weighted=None):
     """one nss.fit of a _Model, with the run store / resume; returns the UltraNest-like result dict"""
     resume = None
     callback = None
@@ -646,7 +716,7 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label):
                     runs.append((ns, idx, _load_run(path)))
                 except Exception:                 # e.g. a file cut by a crash: ignore it
                     pass
-            resume = dict(runs=runs, N=st.get("N"), nesc=st.get("nesc", 0))
+            resume = dict(runs=runs, N=st.get("N"), nesc=st.get("nesc", 0), skip=st.get("skip", []))
             if verbose:
                 print(f"  {label}: resuming with {len(runs)} stored runs (nsteps {st.get('N')})", flush=True)
         else:
@@ -659,7 +729,8 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label):
                 _save_run(store.run_path(kw["nsteps"], kw["idx"]), kw["r"])
             elif event == "state":
                 st = store.read_state() or {}
-                st.update(hash=settings_hash, N=kw["N"], nesc=kw["nesc"])
+                st.update(hash=settings_hash, N=kw["N"], nesc=kw["nesc"],
+                          skip=sorted(set(st.get("skip", [])) | set(kw.get("dropped_idx", []))))
                 store.write_state(st)
                 for ns, _idx, path in store.stored_runs():
                     if ns == kw["dropped"]:
@@ -687,6 +758,9 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label):
     U = np.concatenate([q["dead_u"] for q in runs])[keep]
     Lp = np.concatenate([q["dead_L"] for q in runs])[keep]
     w = w[keep] / w[keep].sum()
+    n_weighted_all = len(w)
+    ti, w = _thin(w, max_weighted, seed=1)
+    U, Lp = U[ti], Lp[ti]
     _, lw = m.native(U)
     logl = Lp - lw                                # the user's log-likelihood (without the coordinate weight)
     pts = m.to_params(U)
@@ -708,7 +782,10 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label):
         runs_check=len(r["runs_check"]), n_escalations=int(r["n_escalations"]), n_failed=int(r["n_failed"]),
         dlogz_check=r.get("dlnz_check"), ks_arms=r.get("ks_arms"), history=r["history"], wall=wall,
         t_compile=float(r["t_compile"]), model=m.model, moon_phase=bool(m.moon_phase),
-        sampled_coordinates=list(m.cube_names))
+        sampled_coordinates=list(m.cube_names), priors_truncated=dict(m.truncated),
+        n_weighted_all=int(n_weighted_all),
+        run_logz=[float(q["logz"]) for q in runs], run_logzerr=[float(q["logzerr"]) for q in runs],
+        run_maxL=[float(q["maxL"]) for q in runs])
     if store is not None:
         st = store.read_state() or {}
         st.update(hash=settings_hash, N=int(r["nsteps"]), nesc=int(r["n_escalations"]), finished=True)
@@ -823,9 +900,11 @@ class NestedSampler:
         h.update(repr((name, m.moon_phase, self.ld_correlation, self.seed, sorted(nss_kw.items()))).encode())
         return h.hexdigest()
 
-    def run(self, accuracy="high", **nss_kw):
-        """run the fit(s). accuracy: "high" (logZ +-0.1, default) or "medium" (+-0.2, faster); further keyword
-        arguments go to pandoramoon.nss.fit (e.g. nlive, lz_tol, ks_tol, max_runs, nsteps).
+    def run(self, accuracy="high", max_weighted_samples=None, **nss_kw):
+        """run the fit(s). accuracy: "high" (logZ +-0.1, default) or "medium" (+-0.2, faster); max_weighted_samples:
+        thin results["weighted_samples"] (all points of the merged runs, up to ~1e6) to about this many points
+        (unbiased: Horvitz-Thompson thinning; None = keep all); further keyword arguments go to
+        pandoramoon.nss.fit (e.g. nlive, lz_tol, ks_tol, max_runs, nsteps).
         Returns the results dict (also self.results)."""
         kw = dict(accuracy=accuracy, threads=self.threads, seed=self.seed)
         kw.update(nss_kw)
@@ -842,7 +921,7 @@ class NestedSampler:
                       f"({', '.join(m.cube_names)})", flush=True)
             mode = self.resume if self.resume == "resume" else "fresh"
             hs = self._settings_hash(name, {k: v for k, v in kw.items() if k != "threads"})
-            out[name] = _fit_model(m, kw, store, mode, hs, self.verbose, name)
+            out[name] = _fit_model(m, kw, store, mode, hs, self.verbose, name, max_weighted=max_weighted_samples)
         res = out[self.model]
         if self.model == "moon" and "planet" in out:
             pl = out["planet"]
@@ -910,6 +989,46 @@ class NestedSampler:
             for k, x in zip(MOON_NAMES, (0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)):
                 vals[k] = x
         return {k: vals[k] for k in PARAMS}
+
+    def plot_run(self, model=None, filename=None):
+        """diagnostic plots of the fit (like UltraNest's run plots), saved to log_dir/plots/run.pdf:
+        (1) ln Z of every merged run with the merged ln Z +- error; (2) the history of the checks: ln Z +- error and
+        the chain length vs the number of runs; (3) the posterior weight of each merged point vs the posterior mass at
+        higher likelihood (a well-resolved posterior: a smooth curve without isolated heavy points)."""
+        import matplotlib.pyplot as plt
+        r = self.results if (model is None or model == self.model) else self.results[model]
+        fig, ax = plt.subplots(1, 3, figsize=(15, 4))
+        lz = np.array(r["run_logz"])
+        ax[0].errorbar(np.arange(len(lz)), lz, yerr=r["run_logzerr"], fmt="o", ms=3, color="k", alpha=0.6)
+        ax[0].axhspan(r["logz"] - r["logzerr"], r["logz"] + r["logzerr"], color="C1", alpha=0.4)
+        ax[0].axhline(r["logz"], color="C1")
+        ax[0].set_xlabel("run (seed order)")
+        ax[0].set_ylabel("ln Z")
+        ax[0].set_title(f"runs: ln Z = {r['logz']:.2f} +- {r['logzerr']:.2f}")
+        h = r["history"]
+        x = [q["runs"] for q in h]
+        ax[1].errorbar(x, [q["logz"] for q in h], yerr=[q["logz_err"] for q in h], fmt="o-", ms=3)
+        ax[1].set_xlabel("runs in the result arm")
+        ax[1].set_ylabel("merged ln Z")
+        a2 = ax[1].twinx()
+        a2.step(x, [q["nsteps"] for q in h], where="post", color="C2")
+        a2.set_ylabel("nsteps", color="C2")
+        ax[1].set_title("checks: " + ("passed" if r["passed"] else "NOT passed"))
+        ws = r["weighted_samples"]
+        o = np.argsort(ws["logl"])
+        cw = np.cumsum(ws["weights"][o][::-1])[::-1]       # posterior mass above each likelihood level
+        ax[2].plot(np.log(np.maximum(cw, 1e-300)), np.log(np.maximum(ws["weights"][o], 1e-300)), ".", ms=1)
+        ax[2].set_xlabel("ln (posterior mass with higher L)")
+        ax[2].set_ylabel("ln (posterior weight per point)")
+        ax[2].set_title("weights of the merged points")
+        fig.tight_layout()
+        if filename is None and self.log_dir is not None:
+            sub = "" if (model is None or model == self.model) else model
+            filename = os.path.join(self.log_dir, sub, "plots", "run.pdf")
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+        if filename:
+            fig.savefig(filename, bbox_inches="tight")
+        return fig
 
     def plot_corner(self, model=None, filename=None, **kwargs):
         """corner plot of the posterior (needs the `corner` package); saved to log_dir/plots/corner.pdf"""

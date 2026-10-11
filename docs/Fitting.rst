@@ -82,7 +82,7 @@ Interface
    :seed: *(int)* Random seed. A fit is reproducible for a given seed and number of threads.
    :verbose: *(bool)* Print the progress of the checks.
 
-   .. method:: run(accuracy="high", **kwargs)
+   .. method:: run(accuracy="high", max_weighted_samples=None, **kwargs)
 
       Runs the fit (for ``model="moon"``: first the planet-only fit, then the planet+moon fit) and
       returns the results dictionary (also stored as ``sampler.results``).
@@ -90,6 +90,9 @@ Interface
       :accuracy: ``"high"`` (default): statistical error of ln Z ≤ 0.1, posterior reproducible to a
          KS distance ≤ 0.05, 1000 live points per run, at least 16 runs. ``"medium"``: ≤ 0.2 and
          ≤ 0.08, 500 live points per run, at least 8 runs; about 2–5× faster.
+      :max_weighted_samples: Thin ``weighted_samples`` (all points of the merged runs, up to ~10⁶) to about
+         this many points. Unbiased Horvitz–Thompson thinning: heavy points are kept, light ones kept at
+         random with their weight scaled up. ``None`` (default): keep all.
       :kwargs: Passed to :func:`pandoramoon.nss.fit`, e.g. ``nlive``, ``lz_tol``, ``ks_tol``,
          ``min_runs``, ``max_runs`` (default 96), ``nsteps`` (initial chain length, default 4 × the
          number of sampled coordinates).
@@ -98,6 +101,12 @@ Interface
 
       Prints ln Z ± error, whether the checks passed, and median, 68 % interval, mean and standard
       deviation of every parameter (for ``model="moon"`` also the planet-only fit and the Bayes factor).
+
+   .. method:: plot_run(model=None, filename=None)
+
+      Diagnostic plots of the fit (saved as ``plots/run.pdf``): ln Z of every run with the merged value, the
+      history of the convergence checks (ln Z ± error and chain length vs the number of runs), and the
+      posterior weights of the merged points.
 
    .. method:: parameters(point=None, model=None)
 
@@ -136,6 +145,12 @@ Priors
 Every prior is applied exactly. The sampler draws in a unit cube, and the inverse cumulative
 distribution function of each prior maps the cube to the parameter. The evidence is therefore that of
 your prior.
+
+**Priors reaching outside Pandora's valid range** (e.g. a ``Normal`` on ``r_planet`` that extends below 0,
+on ``q1`` beyond [0, 1], or on an eccentricity outside [0, 1)) are truncated to the valid range and
+renormalised, with a warning. Their mass outside would otherwise be lost silently (the likelihood is
+−∞ there), which would lower the evidence. The truncated fractions are reported in
+``results["priors_truncated"]``.
 
 **Limb darkening.**
 
@@ -211,6 +226,9 @@ With *log_dir*, the layout follows UltraNest:
 
 **Resume.** A new ``NestedSampler`` with ``resume="resume"`` and the same *log_dir* reloads the stored
 runs, evaluates the checks, and continues with new runs if needed. A finished fit is returned at once.
+Runs that were in flight at an interruption are redone with their original seeds, so a resumed fit
+usually gives the same result as an uninterrupted one. It is not guaranteed: which check arm a new run
+joins depends on the timing.
 If the data, priors or settings differ from the stored fit, an error is raised.
 
 
@@ -382,7 +400,7 @@ see ``SAMPLING.md`` and ``NSS_SAMPLER.md`` in the project directory. In summary:
   - the compiled likelihood equals ``Likelihood`` to 10⁻¹⁴;
   - prior transforms, the moon-phase weights and the limb-darkening prior reproduce their target
     distributions;
-  - a fit resumed after a crash continues and agrees with an uninterrupted fit within its error;
+  - a fit resumed after a crash continues; in the test it gives the same result as an uninterrupted fit;
   - evidences agree with the earlier scripts (notebook data: −185.975 ± 0.018 over five seeds vs
     −185.95 ± 0.02) and with an independent prediction for an informative limb-darkening prior.
   - Tests: ``test_cases/test_sampling.py``.
