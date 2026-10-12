@@ -1094,8 +1094,21 @@ ACCURACY = {"high": dict(nlive=1000, lz_tol=0.1, ks_tol=0.05, min_runs=16),
 def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=None, min_runs=None,
         max_runs=96, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True, log=None,
         post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25, data=None,
-        accuracy=None, resume=None, callback=None, check_rule="r16", run_kw=None):
+        accuracy=None, resume=None, callback=None, check_rule="r16", run_kw=None, max_nlive=None):
     """Nested sampling with built-in convergence checks (SAMPLING.md Rounds 6b, 8).
+
+    n_live escalation (Round 20, SAMPLING_REVIEW.md B3 / X4): runs that miss a compact mode bias lnZ low by up to the
+    mode's mass; longer chains do not help, more live points do. If an arm with >= max(12, min_runs) runs shows a
+    mode problem -- a heavy-tailed per-run lnZ distribution (sd > 3 x MAD-sd: a minority of runs found a better
+    mode; >= max(12, min_runs) runs) or a large scatter (sd > 2.75 x the quoted sqrt(H/n); >= max(16, 2 min_runs) runs;
+    normal at nsteps 64: 1.1-2.1) that does not fall with the chain length -- n_live is
+    doubled at the same nsteps and both arms restart (up to max_nlive, default 4 nlive); the nsteps escalation is
+    blocked in that evaluation (its dlnZ / KS tests compare which arm got the lucky runs; Round 18: a Kepler no-moon
+    fit escalated 4x to nsteps 1024 that way). At max_nlive the fit continues without escalating
+    (result "multimodal": True). Offline on run pools (subsets of 32 runs): false triggers 0 % on C0, C7, K1, HH22,
+    KZ, KZR; detection 71 % (two modes, volume 1e-2, equal mass, 1000 live), 100 % at 4000 live. If the per-run
+    variance falls like 1/n_live, a doubled n_live needs half the runs, so a false trigger costs only the discarded runs.
+    Not detectable: a mode that every run misses (the lnZ scatter is then normal).
 
     accuracy: None (use the arguments) or a preset of ACCURACY (overrides nlive, lz_tol, ks_tol, min_runs):
     "high" (logZ +-0.1 statistical, KS 0.05, 1000 live), "medium" (+-0.2, KS 0.08, 500 live, >= 8 runs).
@@ -1142,6 +1155,10 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     nsteps = nsteps or 4 * ndim
     max_nsteps = max_nsteps or 64 * ndim
     min_runs = min_runs or max(threads, 4)
+    nlive0 = nlive
+    max_nlive = max_nlive or 4 * nlive
+    nlesc = 0
+    multimodal = [False]
     tc = time.perf_counter()
     make_sampler(ll_u, False, data is not None)  # compile once, outside the threads
     run(ll_u, ndim, wrapped=wrapped, nlive=max(40, 2 * ndim + 8), nsteps=2, k=1, max_iter=3, seed=seed + 999, data=data,
@@ -1158,12 +1175,16 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     if resume is not None:
         N = int(resume.get("N", nsteps))
         nesc = int(resume.get("nesc", 0))
+        nlive = int(resume.get("nlive") or nlive)
+        nlesc = int(resume.get("nlesc", 0))
         # indices of runs of dropped arms (and runs aborted with them) are not reused; indices of runs that were in
         # flight at a crash are (the same seeds as in the interrupted fit, Round 17)
         used |= set(int(i) for i in resume.get("skip", []))
         for ns_, idx_, r_ in resume.get("runs", []):
             used.add(int(idx_))
             r_["idx"] = int(idx_)
+            if int(r_.get("nlive", nlive)) != nlive:
+                continue
             if ns_ == N or (check and ns_ == max(1, N // 2)):
                 arms.setdefault(ns_, []).append(r_)
         for v_ in arms.values():
@@ -1241,6 +1262,28 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                                 and sC["sd"] >= 1.25 * sR["sd"])
                 sc_esc = bool(sR["M"] >= max(16, 2 * min_runs) and sR["sd"] > 3.5 * q_run and sc_falls)
                 h.update(scatter_ratio=float(sR["sd"] / q_run) if q_run > 0 else np.nan)
+                # mode problem (Round 20): heavy-tailed or nsteps-independent excess scatter in either arm
+                def mode_problem(st):
+                    if st["M"] < max(12, min_runs) or not np.isfinite(st.get("sd", np.nan)):
+                        return False
+                    q_ = float(np.mean([r["logzerr"] for r in st["good"]]))
+                    tail = st["sd"] > 3.0 * max(st["mad_sd"], 1e-12)
+                    big = st["M"] >= max(16, 2 * min_runs) and st["sd"] > 2.75 * q_ and not sc_falls
+                    return bool(tail or big)
+                mm = mode_problem(sR) or (len(C) >= 2 and mode_problem(sC))
+                h.update(mode_problem=mm, nlive=nlive)
+                if mm:
+                    multimodal[0] = True
+                    if nlive < max_nlive:
+                        hist.append(h)
+                        if verbose:
+                            print(f"  fit: nsteps {N}: per-run lnZ sd {sR['sd']:.3f} (MAD-sd {sR['mad_sd']:.3f}, quoted "
+                                  f"{q_run:.3f}), check arm sd {sC.get('sd', np.nan):.3f}: mode problem -> n_live "
+                                  f"{nlive} -> {2 * nlive}", flush=True)
+                        if log:
+                            log(h)
+                        return False, "nlive", sR["M_all"]
+                    dl_esc = ks_esc = sc_esc = False      # at max_nlive: no escalation by mode-noise
                 escalate = bool(enough and N < max_nsteps and (dl_esc or ks_esc or sc_esc))
             else:
                 # bias at N ~ dlnZ(N/2, N) if it falls at least like 1/nsteps (known-Z tests, SAMPLING.md Round 8):
@@ -1276,7 +1319,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 and h["ks_arms"] ** 2 - h.get("ks_null_med", 0.0) ** 2 > ks_tol ** 2
                 and min(h.get("runs_good", 0), h.get("check_runs", 0)) >= 2 * min_runs):
             grey_r16 = True
-        if check and own_ok and not ok_bias and N < max_nsteps and (grey_r8 or grey_r16):
+        if check and own_ok and not ok_bias and N < max_nsteps and (grey_r8 or grey_r16) and not h.get("mode_problem"):
             # grey zone (C0: dlnZ ~ 0.15-0.2 or KS arms ~ ks_tol for 50+ runs): the result arm is converged by
             # its own criteria but the nsteps check does not pass, and the check is precise enough to say so
             # (C7: escalated at dlnZ 0.10 +- 0.10 without the sigma condition) -> doubling nsteps is cheaper
@@ -1311,6 +1354,20 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                                    frac_remain=frac_remain, paxis=paxis, kpair=kpair, stop=flag, pglob=pglob,
                                    recluster=recluster, data=data, **(run_kw or {}))] = (ns, flag, idx)
 
+        def escalate_nlive():
+            nonlocal nlive, nlesc
+            dropped_idx = []
+            for ns_ in list(arms):
+                dropped_idx += [int(r.get("idx", -1)) for r in arms.pop(ns_)]
+            for f, (ns, flag, i_) in inflight.items():
+                flag[0] = 1
+                n_obsolete[0] += 1
+                dropped_idx.append(int(i_))
+            nlive *= 2
+            nlesc += 1
+            if callback is not None:
+                callback("state", N=N, nesc=nesc, nlive=nlive, nlesc=nlesc, dropped=None, dropped_idx=dropped_idx)
+
         def escalate_now():
             nonlocal N, nesc
             if verbose:
@@ -1326,7 +1383,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                     n_obsolete[0] += 1
                     dropped_idx.append(int(i_))
             if callback is not None:
-                callback("state", N=N, nesc=nesc, dropped=dropped, dropped_idx=dropped_idx)
+                callback("state", N=N, nesc=nesc, nlive=nlive, nlesc=nlesc, dropped=dropped, dropped_idx=dropped_idx)
 
         # When to evaluate (Round 13): the full evaluation (merges, KS) costs ~0.5-3 s, so up to Round 12 it ran
         # after every `threads` finished runs, and a fit passed on average ~half a run time after its criteria
@@ -1343,7 +1400,10 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                     break
                 if not escalate:
                     break
-                escalate_now()
+                if escalate == "nlive":
+                    escalate_nlive()
+                else:
+                    escalate_now()
                 if len(arms.get(N, [])) < 2:
                     break
         if not stop_now:
@@ -1360,7 +1420,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 if _flag[0] != 0:                # aborted (dropped arm): incomplete, never used
                     ndone += 1
                     continue
-                if ns == N or (check and ns == max(1, N // 2)):
+                if (ns == N or (check and ns == max(1, N // 2))) and r["nlive"] == nlive:
                     r["idx"] = int(idx)
                     if callback is not None:
                         callback("run", r=r, nsteps=ns, idx=idx)
@@ -1382,9 +1442,12 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 passed, escalate, M = evaluate(N)
                 t_eval[0] += time.perf_counter() - te
                 pre_last = pre
-                if passed or M >= max_runs:
+                if passed or (M >= max_runs and escalate != "nlive"):
                     break
-                if escalate:
+                if escalate == "nlive":
+                    escalate_nlive()
+                    pre_last = False
+                elif escalate:
                     escalate_now()
                     pre_last = False
             top_up()
@@ -1408,6 +1471,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     return dict(mix=mixm, logz=lzm, logzerr=hist[-1]["logz_err"], logzerr_boot=lzb, samples_u=samples, ess=ess,
                 runs=R, n_failed=len(bad), n_aborted=n_aborted[0], n_obsolete=n_obsolete[0], n_eval=n_eval[0],
                 n_eval_pre=n_eval[1], t_eval=t_eval[0], t_compile=t_compile, runs_check=arms.get(max(1, N // 2), []) if check else [], history=hist, passed=passed,
-                wall=time.perf_counter() - t0, ncall=hist[-1]["ncall"], nlive=nlive, nsteps=N, nsteps0=nsteps,
+                wall=time.perf_counter() - t0, ncall=hist[-1]["ncall"], nlive=nlive, nlive0=nlive0,
+                n_nlive_escalations=nlesc, multimodal=multimodal[0], nsteps=N, nsteps0=nsteps,
                 n_escalations=nesc, dlnz_check=hist[-1].get("dlnz"), dlnz_check_err=hist[-1].get("dlnz_err"),
                 ks_arms=hist[-1].get("ks_arms"), maxL=float(max(r["maxL"] for r in R)))

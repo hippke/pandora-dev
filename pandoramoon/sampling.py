@@ -716,7 +716,8 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max
                     runs.append((ns, idx, _load_run(path)))
                 except Exception:                 # e.g. a file cut by a crash: ignore it
                     pass
-            resume = dict(runs=runs, N=st.get("N"), nesc=st.get("nesc", 0), skip=st.get("skip", []))
+            resume = dict(runs=runs, N=st.get("N"), nesc=st.get("nesc", 0), skip=st.get("skip", []),
+                          nlive=st.get("nlive"), nlesc=st.get("nlesc", 0))
             if verbose:
                 print(f"  {label}: resuming with {len(runs)} stored runs (nsteps {st.get('N')})", flush=True)
         else:
@@ -729,11 +730,13 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max
                 _save_run(store.run_path(kw["nsteps"], kw["idx"]), kw["r"])
             elif event == "state":
                 st = store.read_state() or {}
-                st.update(hash=settings_hash, N=kw["N"], nesc=kw["nesc"],
+                st.update(hash=settings_hash, N=kw["N"], nesc=kw["nesc"], nlive=kw.get("nlive"),
+                          nlesc=kw.get("nlesc", 0),
                           skip=sorted(set(st.get("skip", [])) | set(kw.get("dropped_idx", []))))
                 store.write_state(st)
-                for ns, _idx, path in store.stored_runs():
-                    if ns == kw["dropped"]:
+                gone = set(kw.get("dropped_idx", []))
+                for ns, idx, path in store.stored_runs():
+                    if ns == kw["dropped"] or idx in gone:
                         os.remove(path)
         if resume is None or resume.get("N") is None:
             st = store.read_state() or {}
@@ -780,6 +783,7 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max
                                   p_fisher=hist.get("ins_fisher_p")),
         passed=bool(r["passed"]), nsteps=int(r["nsteps"]), nlive=int(r["nlive"]), runs=len(runs),
         runs_check=len(r["runs_check"]), n_escalations=int(r["n_escalations"]), n_failed=int(r["n_failed"]),
+        n_nlive_escalations=int(r.get("n_nlive_escalations", 0)), multimodal=bool(r.get("multimodal", False)),
         dlogz_check=r.get("dlnz_check"), ks_arms=r.get("ks_arms"), history=r["history"], wall=wall,
         t_compile=float(r["t_compile"]), model=m.model, moon_phase=bool(m.moon_phase),
         sampled_coordinates=list(m.cube_names), priors_truncated=dict(m.truncated),
@@ -957,6 +961,9 @@ class NestedSampler:
             print(f"{title}: logZ = {r['logz']:.3f} +- {r['logzerr']:.3f}   "
                   f"({'checks passed' if r['passed'] else 'checks NOT passed'}; {r['runs']} runs x {r['nlive']} live, "
                   f"nsteps {r['nsteps']}, {r['ncall'] / 1e6:.0f} M calls, {r['wall']:.0f} s)")
+            if r.get("multimodal"):
+                print(f"    WARNING: the runs disagree like runs that miss a mode (n_live escalated "
+                      f"{r.get('n_nlive_escalations', 0)}x); logZ may be too low. Check with a larger nlive / max_nlive.")
             p = r["posterior"]
             for j, n in enumerate(r["paramnames"]):
                 print(f"    {n:16s}: {p['median'][j]:.6g} -{p['median'][j] - p['errlo'][j]:.3g} "
