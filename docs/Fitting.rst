@@ -194,6 +194,11 @@ The results dictionary uses UltraNest's keys:
    stopped at ``max_runs``; the result is usable but its error is not guaranteed.
 :nsteps, runs, nlive, n_escalations, history: Final chain length, number of merged runs, live points
    per run, number of chain-length doublings, and the history of the checks.
+:multimodal, n_nlive_escalations: ``multimodal`` is ``True`` if the runs disagreed the way runs do that
+   miss a mode of the posterior (a few runs with a much higher ln Z, or a scatter that longer chains do
+   not reduce). The fit then doubles the live points per run (``n_nlive_escalations`` times, up to
+   ``max_nlive``, default 4 × ``nlive``). If it is still ``True`` at the end, ln Z may be too low:
+   check with a larger ``nlive`` and look at ``run_logz`` (ln Z of every run).
 
 For ``model="moon"`` with the planet comparison, the dictionary also has:
 
@@ -261,7 +266,9 @@ iteration. The sampler's own work costs about 0.25 µs per call, against 2–3 �
 
 **One run.**
 
-- n live points (1000 for ``accuracy="high"``, 500 for ``"medium"``) in the unit cube.
+- n live points (1000 for ``accuracy="high"``, 500 for ``"medium"``) in the unit cube, drawn only where
+  the prior is nonzero (rejection); the run starts at the volume fraction of that region (exact; regions
+  outside the prior, e.g. limb darkening outside the physical triangle, otherwise bias ln Z).
 - A new point comes from a slice-sampling chain of ``nsteps`` moves at the fixed threshold L*, started
   at a random surviving live point (Neal 2003):
 
