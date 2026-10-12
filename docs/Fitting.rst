@@ -48,10 +48,58 @@ A complete worked example is ``examples/injection_retrieval.ipynb``. With the no
 16 cores and the planet-only fit a few seconds.
 
 
+Searching for moons: detection
+------------------------------
+
+A search has two stages: a fast **detection** test for every light curve, and the full **fit** (this page's
+``NestedSampler``) for the candidates. Tutorials: ``examples/tutorial_detection.ipynb`` and
+``examples/tutorial_characterisation.ipynb``.
+
+::
+
+   lc = pandora.prepare_lightcurve(time, flux, t0=t0, period=P, duration=T14)   # needs wotan
+   like = pandora.Likelihood(lc["time"], lc["flux"], lc["flux_err"], epoch_distance=P)
+   priors = pandora.default_priors(t0_bary=t0, per_bary=P, r_planet=0.1)
+   det = pandora.detect(like, priors)            # seconds on one core
+   if det["candidate"]:
+       results = pandora.NestedSampler(like, priors).run()
+
+.. function:: prepare_lightcurve(time, flux, t0, period, duration, mask=1.0, window=4.0, method="biweight", fit_halfwidth=None, inflate_beta=True)
+
+   Detrends the light curve with ``wotan`` (``method``, window ``window`` × T14) with the transits masked over
+   ``mask`` × T14 (the defaults are the best setting of a study of 300 injected planet+moon systems in real Kepler
+   light curves, robust to T14 errors of −20 … +25 %). Points without a trend are dropped. Keeps the fit
+   windows (±(mask/2 + 1) × T14 around each transit, or ``fit_halfwidth`` days) and measures the noise on the
+   detrended data 1–11 T14 beyond them: ``sigma`` (robust scatter) and the red-noise factor ``beta`` (on bins of
+   T14/4; Pont, Zucker & Queloz 2006). Returns ``time, flux, flux_err`` (= σ × β) for the ``Likelihood``, and
+   ``sigma, beta, epochs`` and arrays for plots.
+
+.. function:: default_priors(t0_bary, per_bary, r_planet, per_bary_err=None, a_bary=None, R_star=R_sun, M_star=M_sun, M_planet=M_Jup, t0_halfwidth=0.05, per_moon_max=None)
+
+   Priors for a moon search around a known planet: narrow planet priors around the given values (a_bary from
+   Kepler's law) and wide moon priors (r_moon 0.1–0.7 × r_planet, per_moon up to the period at the Hill radius
+   ≈ 0.19 × per_bary, all orientations, M_moon up to half the planet's mass). The Bayes factor depends on the moon
+   priors; ``detect``'s threshold was calibrated with priors of this kind.
+
+.. function:: detect(likelihood, priors, recall=0.95, threshold=3.0, seed=1, jack_min=18, ld_correlation=0.0, verbose=False)
+
+   A first look: one short nested-sampling run of the planet-only model and a few of the planet+moon model
+   (one core, seconds). ``recall`` (0.90, 0.95, 0.99, 0.999) is the fraction of clearly detectable moons the
+   settings are calibrated to find (0.35 / 0.6 / 1.6 / 3.1 CPU-s per light curve in the calibration).
+   Returns a dict with ``dlnz`` (noisy, ±0.5), ``interesting`` (``dlnz > threshold``), ``jackknife``,
+   ``candidate`` (interesting and the jackknife passed), ``moon`` (rough median and 68 % range of the moon's
+   period, radius, mass ratio, inclination), ``best`` (best-fit parameters of both models), ``warnings``.
+
+   The **epoch jackknife** (``pandora.epoch_jackknife``) splits the χ² improvement of the moon model over the
+   planet-only model by transit. A moon must be seen in at least two transits: the improvement without the
+   strongest transit must be ≥ ``jack_min`` (18 ≈ 2 × (threshold 3 + Occam penalty ~6); provisional, being
+   calibrated on real Kepler light curves). Single-transit artefacts were the cause of all false moon signals in
+   our real-data tests.
+
 Interface
 ---------
 
-.. class:: NestedSampler(likelihood, priors, model="moon", compare_planet=True, moon_phase="auto", ld_correlation=0.0, log_dir=None, resume="subfolder", threads=None, seed=1, verbose=True)
+.. class:: NestedSampler(likelihood, priors, model="moon", compare_planet=True, moon_phase="auto", ld_correlation=0.0, log_dir=None, resume="subfolder", threads=None, seed=1, verbose=True, supersampling="auto")
 
    :likelihood: A :class:`pandoramoon.Likelihood`. It holds the data, the errors and Pandora's model
       settings (``supersampling_factor``, ``hill_sphere_threshold``, ``occult_small_threshold``,
@@ -81,6 +129,12 @@ Interface
    :threads: *(int)* Number of runs in parallel. Default: all cores available to the process.
    :seed: *(int)* Random seed. A fit is reproducible for a given seed and number of threads.
    :verbose: *(bool)* Print the progress of the checks.
+   :supersampling: ``"auto"`` (default), an integer, or ``None``. ``"auto"``: if the likelihood is not
+      supersampled and the cadence is ≥ 10 min, the fit computes each data point as the average of 5
+      sub-exposures (exposure = cadence). Without it, 30-min data bias the Bayes factor and the moon's
+      parameters. An integer: that many sub-exposures. ``None``: use the likelihood as given. The likelihood the fit
+      actually uses is ``sampler.likelihood`` (e.g. ``sampler.likelihood(**sampler.parameters())``
+      gives the ``logl`` of ``results["maxlikelihood"]``).
 
    .. method:: run(accuracy="high", max_weighted_samples=None, **kwargs)
 
@@ -194,8 +248,6 @@ The results dictionary uses UltraNest's keys:
    stopped at ``max_runs``; the result is usable but its error is not guaranteed.
 :nsteps, runs, nlive, n_escalations, history: Final chain length, number of merged runs, live points
    per run, number of chain-length doublings, and the history of the checks.
-:repartition: The proposals used by ``repartition`` (experimental option of :class:`NestedSampler`,
-   see its docstring), empty if not used.
 :multimodal, n_nlive_escalations: ``multimodal`` is ``True`` if the runs disagreed the way runs do that
    miss a mode of the posterior (a few runs with a much higher ln Z, or a scatter that longer chains do
    not reduce). The fit then doubles the live points per run (``n_nlive_escalations`` times, up to
@@ -203,6 +255,11 @@ The results dictionary uses UltraNest's keys:
    check with a larger ``nlive`` and look at ``run_logz`` (ln Z of every run).
 
 For ``model="moon"`` with the planet comparison, the dictionary also has:
+
+:jackknife: The epoch jackknife (see `Searching for moons: detection`_): the fit improvement of the moon
+   model per transit and whether the improvement without the strongest transit reaches 18 (``passed``).
+:warnings: Notes on the fit (supersampling used, checks not passed, one transit dominating, runs that
+   disagree). ``print_results()`` prints them.
 
 :planet: The planet-only results (the same keys).
 :dlogz, dlogzerr: The Bayes factor ln Z(moon) − ln Z(planet) and its error.
@@ -419,9 +476,12 @@ Limitations
 -----------
 
 - The noise model is white Gaussian noise with the given errors. There is no jitter term and no
-  correlated noise.
-- **Long-cadence data need supersampling** (set in the ``Likelihood``: ``supersampling_factor`` and a
-  supersampled time grid, as for ``pandora()``). On injected Kepler-like 30-min data (exposure smearing
+  correlated noise. ``prepare_lightcurve`` inflates the errors by the red-noise factor β, which corrects
+  the Bayes factor to first order; artefacts confined to one transit are caught by the epoch jackknife.
+- **Long-cadence data need supersampling.** ``NestedSampler(supersampling="auto")`` (default) uses 5
+  sub-exposures per data point when the cadence is ≥ 10 min (exposure = cadence); pass an already
+  supersampled ``Likelihood`` (``supersampling_factor`` and a supersampled time grid, as for ``pandora()``)
+  for other exposure times. On injected Kepler-like 30-min data (exposure smearing
   simulated at a factor of 30), fits without supersampling biased the limb darkening and transit shape
   by up to 1.5–2.5 standard deviations and overestimated the Bayes factor by 1.7 (3 transits, 500 ppm)
   to 12.6 nats (7 transits, 300 ppm). Use ``supersampling_factor=5`` for 30-min cadence (posterior

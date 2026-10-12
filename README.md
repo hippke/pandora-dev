@@ -73,6 +73,17 @@ See the [example workflow](https://github.com/hippke/Pandora/blob/main/examples/
 | `pandora_deficit()` | `1 - flux` for the three components, float32 (half the memory; 2^-24 relative precision of the deficit) | own likelihoods on dense arrays |
 | `pandora_window()` | `(idx, flux_planet, flux_moon, flux_total)` at the output cadences near transit only (flux is 1 elsewhere); `time_sorted=True` for ascending time | own likelihoods, sparse |
 
+### Searching for moons: detection and characterisation
+Two tutorials (synthetic data with stellar variability and red noise, detrending with wotan, injection and retrieval) show the whole workflow for first-time users: [detection](https://github.com/hippke/Pandora/blob/main/examples/tutorial_detection.ipynb) (a fast test, seconds per light curve) and [characterisation](https://github.com/hippke/Pandora/blob/main/examples/tutorial_characterisation.ipynb) (the full fit).
+
+```
+lc = pandora.prepare_lightcurve(time, flux, t0=t0, period=P, duration=T14)   # wotan biweight, mask 1.0 / window 4.0 T14; errors with the red-noise factor
+like = pandora.Likelihood(lc["time"], lc["flux"], lc["flux_err"], epoch_distance=P)
+priors = pandora.default_priors(t0_bary=t0, per_bary=P, r_planet=0.1)        # calibrated moon priors
+det = pandora.detect(like, priors)              # dlnz, candidate (dlnz > 3 and the moon seen in >= 2 transits)
+results = pandora.NestedSampler(like, priors).run()    # full fit; 30-min data are supersampled automatically
+```
+
 ### Fitting: evidence and posterior with the built-in nested sampler
 `NestedSampler` fits a `Likelihood` with priors, compares planet+moon with planet-only (Bayes factor) and checks its own convergence. Parameters are Pandora's (same names and units); give a prior or a fixed number for each. The limb darkening is set as `q1, q2` (Kipping) or `u1, u2` (e.g. `Normal` priors from stellar models, with `ld_correlation`). `w_bary`, `ecc_bary`, `ecc_moon` and `w_moon` default to 0.
 
@@ -91,7 +102,7 @@ results["logz"], results["logzerr"], results["dlogz"]      # dlogz = logZ(moon) 
 results["samples"], results["paramnames"]                  # equal-weight posterior samples
 results["planet"]                                           # the planet-only fit, same structure
 ```
-- **Results** follow UltraNest's result dictionary: `logz`, `logzerr`, `samples`, `weighted_samples`, `posterior` (mean, stdev, median, errlo, errup), `maxlikelihood`, `ncall`, `ess`, `H`, `paramnames`. In addition: `passed` (the self-checks), `history`, `nsteps`, `runs`, and for moon fits `planet`, `dlogz`, `dlogzerr`.
+- **Results** follow UltraNest's result dictionary: `logz`, `logzerr`, `samples`, `weighted_samples`, `posterior` (mean, stdev, median, errlo, errup), `maxlikelihood`, `ncall`, `ess`, `H`, `paramnames`. In addition: `passed` (the self-checks), `history`, `nsteps`, `runs`, `multimodal`, `warnings`, and for moon fits `planet`, `dlogz`, `dlogzerr`, `jackknife` (the moon's fit improvement per transit).
 - **Files** (`log_dir`) are laid out as in UltraNest: `info/results.json`, `info/post_summary.csv`, `chains/equal_weighted_post.txt`, `chains/weighted_post.npz`, `plots/corner.pdf` (`sampler.plot_corner()`, needs `corner`). The planet-only fit goes to `log_dir/planet/`. Every finished run is stored, so `resume="resume"` continues an interrupted fit; `"subfolder"` (default) or `"overwrite"` start a new one.
 - **Sampler:** `pandoramoon.nss` is a compiled nested slice sampler. It runs independent runs on all cores (`threads=`), merges them and adds runs and longer chains until its error and reproducibility checks pass. The likelihood is compiled once per process (~15 s) and reused for every fit.
 - **Moon orbit:** by default the moon's period and phase are sampled as phases at transit, which removes the comb of period aliases. An exact weight keeps your prior, evidence and posterior unchanged. This needs a `per_moon` prior with an upper bound ≤ the planet period and `tau_moon=Uniform(0, 1)`; otherwise the native parameters are sampled (`moon_phase=False` forces this).
