@@ -1371,16 +1371,33 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 sc_esc = bool(sR["M"] >= max(16, 2 * min_runs) and sR["sd"] > 3.5 * q_run and sc_falls)
                 h.update(scatter_ratio=float(sR["sd"] / q_run) if q_run > 0 else np.nan)
                 # mode problem (Round 20): heavy-tailed or nsteps-independent excess scatter in either arm
-                def mode_problem(st, scatter=True):
-                    if st["M"] < max(12, min_runs) or not np.isfinite(st.get("sd", np.nan)):
+                def mode_problem(st, runs, scatter=True):
+                    if st["M"] < max(4, min_runs // 2) or not np.isfinite(st.get("sd", np.nan)):
                         return False
                     q_ = float(np.mean([r["logzerr"] for r in st["good"]]))
+                    # runs that found a better solution than others (Round 21): a gap in the sorted lnZ of ALL runs of
+                    # the arm (failed_runs included) > max(6 x quoted, 2 nats) -- normal pools (67, up to 200 runs):
+                    # largest gap 3.2 x quoted, 0.81 nats -- or a gross scatter (sd > 10 x quoted; normal <= ~6 for 4
+                    # runs), AND the runs above the gap reach a higher maximum (median maxL > 2 nats higher). Chains
+                    # that are far too short also scatter grossly, but all runs reach about the same maxL; those keep
+                    # the nsteps escalation (T7)
+                    o = np.argsort([r["logz"] for r in runs])
+                    zs = np.array([runs[i]["logz"] for i in o])
+                    ms = np.array([runs[i]["maxL"] for i in o])
+                    if len(zs) >= 4:
+                        jg = int(np.argmax(np.diff(zs)))
+                        gap = float(zs[jg + 1] - zs[jg])
+                        higher = float(np.median(ms[jg + 1:]) - np.median(ms[:jg + 1])) > 2.0
+                        if higher and (gap > max(6.0 * q_, 2.0) or st["sd"] > 10.0 * q_):
+                            return True
+                    if st["M"] < max(12, min_runs):
+                        return False
                     tail = st["sd"] > 3.0 * max(st["mad_sd"], 1e-12)
                     big = scatter and st["M"] >= max(16, 2 * min_runs) and st["sd"] > 2.75 * q_ and not sc_falls
                     return bool(tail or big)
                 # the scatter criterion only on the result arm: the check arm (nsteps / 2) scatters more by itself
                 # (C0 at 32 steps: 2.5 x quoted; the Round 20 suite escalated C0 and C7 on it); heavy tails on both
-                mm = mode_problem(sR) or (len(C) >= 2 and mode_problem(sC, scatter=False))
+                mm = mode_problem(sR, R) or (len(C) >= 2 and mode_problem(sC, C, scatter=False))
                 h.update(mode_problem=mm, nlive=nlive)
                 if mm:
                     multimodal[0] = True
