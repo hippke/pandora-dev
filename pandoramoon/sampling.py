@@ -938,6 +938,10 @@ class NestedSampler:
     log_dir: output folder (None: no files). resume: "subfolder" (new run<k> folder each time, as UltraNest),
         "resume" (continue / reuse a stored fit), "overwrite".
     threads: parallel runs (default: all cores available to the process). seed: random seed.
+    supersampling: "auto" (default): if the likelihood is not supersampled and the cadence is >= 10 min, the fit
+        uses 5 sub-exposures per cadence (exposure = cadence; SAMPLING.md Round 16: without it the Bayes factor and the
+        moon parameters of 30-min data are biased); an integer: that many sub-exposures; None: the likelihood as given.
+        (To control the exposure time, pass a likelihood that is already supersampled.)
     repartition (Round 21, NEW_LEADS L1; opt-in): posterior repartitioning of 1-D priors. None (default); a dict
         {name: (mu, sigma)}: the prior of each named parameter is sampled from the mixture (1 - w) prior + w N(mu, sigma)
         (truncated to the prior) and the likelihood is weighted by prior / mixture, in both models -- Z and the
@@ -950,12 +954,25 @@ class NestedSampler:
     """
 
     def __init__(self, likelihood, priors, model="moon", compare_planet=True, moon_phase="auto", ld_correlation=0.0,
-                 log_dir=None, resume="subfolder", threads=None, seed=1, verbose=True, repartition=None,
-                 repartition_weight=0.8, repartition_widen=None):
+                 log_dir=None, resume="subfolder", threads=None, seed=1, verbose=True, supersampling="auto",
+                 repartition=None, repartition_weight=0.8, repartition_widen=None):
         if model not in ("moon", "planet"):
             raise ValueError('model must be "moon" or "planet"')
         if resume not in ("subfolder", "resume", "overwrite"):
             raise ValueError('resume must be "subfolder", "resume" or "overwrite"')
+        self.supersampling_note = None
+        if supersampling is not None:
+            from pandoramoon.search import cadence_of, resample_likelihood
+            k0 = likelihood.supersampling_factor
+            if supersampling == "auto":
+                cad = cadence_of(likelihood.time) if k0 == 1 else 0.0
+                if cad >= 10.0 / 1440:
+                    likelihood = resample_likelihood(likelihood, 5)
+                    self.supersampling_note = (f"supersampling: 5 sub-exposures per cadence (cadence {1440 * cad:.1f} "
+                                               "min; supersampling='auto')")
+            elif int(supersampling) != k0:
+                likelihood = resample_likelihood(likelihood, int(supersampling))
+                self.supersampling_note = f"supersampling: {int(supersampling)} sub-exposures per cadence"
         unknown = set(priors) - set(PARAMS) - {"q1", "q2"}
         if unknown:
             raise ValueError(f"unknown parameters: {sorted(unknown)} (known: {PARAMS} and q1, q2)")
@@ -1088,8 +1105,34 @@ class NestedSampler:
             for name in order:
                 path = self.log_dir if name == self.model else os.path.join(self.log_dir, name)
                 _write_results(path, out[name], pr)
+        self._add_checks(res)
         self.results = res
         return res
+
+    def _add_checks(self, res):
+        """epoch jackknife and warnings (Round 22)"""
+        warn = []
+        if self.supersampling_note:
+            warn.append(self.supersampling_note)
+        if self.model == "moon" and "planet" in res:
+            from pandoramoon.search import epoch_jackknife
+            self.results = res
+            jk = epoch_jackknife(self.likelihood, self.parameters(), self.parameters(model="planet"))
+            res["jackknife"] = jk
+            if len(jk["epochs"]) < 2:
+                warn.append("fewer than 2 transits with data: the moon signal cannot be checked across transits")
+            elif res["dlogz"] > 3 and not jk["passed"]:
+                warn.append(f"{100 * (jk['top_share'] or 1):.0f} % of the fit improvement of the moon model comes from "
+                            f"one transit (epoch {jk['top_epoch']}; without it Delta chi2 = {jk['dchi2_without_top']:.1f} "
+                            f"< {jk['jack_min']:.0f}): likely an artefact of that transit, not a moon")
+        for name, r in (("planet + moon" if self.model == "moon" else "planet", res), ("planet only", res.get("planet"))):
+            if r is None:
+                continue
+            if not r["passed"]:
+                warn.append(f"{name}: convergence checks not passed (result usable, error not guaranteed)")
+            if r.get("multimodal"):
+                warn.append(f"{name}: the runs disagree like runs that miss a mode; ln Z may be too low")
+        res["warnings"] = warn
 
     def print_results(self):
         """summary like UltraNest's print_results"""
@@ -1102,9 +1145,6 @@ class NestedSampler:
             print(f"{title}: logZ = {r['logz']:.3f} +- {r['logzerr']:.3f}   "
                   f"({'checks passed' if r['passed'] else 'checks NOT passed'}; {r['runs']} runs x {r['nlive']} live, "
                   f"nsteps {r['nsteps']}, {r['ncall'] / 1e6:.0f} M calls, {r['wall']:.0f} s)")
-            if r.get("multimodal"):
-                print(f"    WARNING: the runs disagree like runs that miss a mode (n_live escalated "
-                      f"{r.get('n_nlive_escalations', 0)}x); logZ may be too low. Check with a larger nlive / max_nlive.")
             p = r["posterior"]
             for j, n in enumerate(r["paramnames"]):
                 print(f"    {n:16s}: {p['median'][j]:.6g} -{p['median'][j] - p['errlo'][j]:.3g} "
@@ -1113,6 +1153,14 @@ class NestedSampler:
         if "planet" in r:
             block(r["planet"], "planet only")
             print(f"Bayes factor: dlogZ = logZ(moon) - logZ(planet) = {r['dlogz']:.3f} +- {r['dlogzerr']:.3f}")
+        jk = r.get("jackknife")
+        if jk:
+            print("Epoch jackknife (chi2 improvement of the moon fit per transit): " +
+                  ", ".join(f"epoch {e}: {d:.1f}" for e, d in zip(jk["epochs"], jk["dchi2_epochs"])) +
+                  f"; without the strongest transit {jk['dchi2_without_top']:.1f} "
+                  f"({'passed' if jk['passed'] else 'NOT passed'}, need >= {jk['jack_min']:.0f})")
+        for w in r.get("warnings", []):
+            print("Note: " + w)
 
     def parameters(self, point=None, model=None):
         """all 20 Pandora model parameters (dict, Pandora's names; limb darkening as u1, u2) for a point of
