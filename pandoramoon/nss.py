@@ -1367,14 +1367,16 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 sc_esc = bool(sR["M"] >= max(16, 2 * min_runs) and sR["sd"] > 3.5 * q_run and sc_falls)
                 h.update(scatter_ratio=float(sR["sd"] / q_run) if q_run > 0 else np.nan)
                 # mode problem (Round 20): heavy-tailed or nsteps-independent excess scatter in either arm
-                def mode_problem(st):
+                def mode_problem(st, scatter=True):
                     if st["M"] < max(12, min_runs) or not np.isfinite(st.get("sd", np.nan)):
                         return False
                     q_ = float(np.mean([r["logzerr"] for r in st["good"]]))
                     tail = st["sd"] > 3.0 * max(st["mad_sd"], 1e-12)
-                    big = st["M"] >= max(16, 2 * min_runs) and st["sd"] > 2.75 * q_ and not sc_falls
+                    big = scatter and st["M"] >= max(16, 2 * min_runs) and st["sd"] > 2.75 * q_ and not sc_falls
                     return bool(tail or big)
-                mm = mode_problem(sR) or (len(C) >= 2 and mode_problem(sC))
+                # the scatter criterion only on the result arm: the check arm (nsteps / 2) scatters more by itself
+                # (C0 at 32 steps: 2.5 x quoted; the Round 20 suite escalated C0 and C7 on it); heavy tails on both
+                mm = mode_problem(sR) or (len(C) >= 2 and mode_problem(sC, scatter=False))
                 h.update(mode_problem=mm, nlive=nlive)
                 if mm:
                     multimodal[0] = True
