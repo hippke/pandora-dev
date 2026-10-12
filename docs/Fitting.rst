@@ -194,6 +194,8 @@ The results dictionary uses UltraNest's keys:
    stopped at ``max_runs``; the result is usable but its error is not guaranteed.
 :nsteps, runs, nlive, n_escalations, history: Final chain length, number of merged runs, live points
    per run, number of chain-length doublings, and the history of the checks.
+:repartition: The proposals used by ``repartition`` (experimental option of :class:`NestedSampler`,
+   see its docstring), empty if not used.
 :multimodal, n_nlive_escalations: ``multimodal`` is ``True`` if the runs disagreed the way runs do that
    miss a mode of the posterior (a few runs with a much higher ln Z, or a scatter that longer chains do
    not reduce). The fit then doubles the live points per run (``n_nlive_escalations`` times, up to
