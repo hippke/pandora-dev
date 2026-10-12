@@ -923,9 +923,12 @@ def insertion_test(ranks, m, nlive, seed=0):
     for a in range(0, len(u) - nlive + 1, nlive):
         ps.append(_ks_p(ks(u[a:a + nlive]), nlive))
     ps = np.array(ps) if ps else np.array([1.0])
+    # signed U test (Buchner, "Nested sampling methods", arXiv:2101.09675; NEW_LEADS L6): z = (2 sum u - n) / sqrt(n / 3)
+    # ~ N(0, 1) for exact NS; z < 0: new points rank too low (too close to the threshold), z > 0: too high
+    z = float((2.0 * u.sum() - len(u)) / math.sqrt(len(u) / 3.0))
     return dict(n=int(len(u)), D=D, p=_ks_p(D, len(u)), chunk=int(nlive), nchunks=int(len(ps)),
                 chunk_p_min=float(ps.min()), chunk_frac_p01=float(np.mean(ps < 0.01)),
-                mean=float(u.mean()))
+                mean=float(u.mean()), z=z)
 
 
 def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_remain=0.01,
@@ -1169,18 +1172,19 @@ def pooled_insertion(rs):
     the Fisher combination of the per-run p-values. Returns (D, p_pooled, p_fisher)."""
     u = np.concatenate([r["ins_u"] for r in rs if "ins_u" in r]).astype(np.float64)
     if len(u) == 0:
-        return np.nan, np.nan, np.nan
+        return np.nan, np.nan, np.nan, np.nan
     u.sort()
     n = len(u)
     i = np.arange(1, n + 1)
     D = float(max(np.max(i / n - u), np.max(u - (i - 1) / n)))
+    z_u = float((2.0 * u.sum() - n) / math.sqrt(n / 3.0))           # signed U test, pooled (reported only)
     ps = np.array([max(r["insertion"]["p"], 1e-300) for r in rs])
     chi2 = -2.0 * np.sum(np.log(ps))
     # chi2 with 2M dof: Wilson-Hilferty normal approximation of the upper tail
     k = 2 * len(ps)
     z = ((chi2 / k) ** (1 / 3) - (1 - 2 / (9 * k))) / math.sqrt(2 / (9 * k))
     p_f = float(0.5 * math.erfc(z / math.sqrt(2)))
-    return D, _ks_p(D, n), p_f
+    return D, _ks_p(D, n), p_f, z_u
 
 
 def bootstrap_logz(rs, B=40, seed=0):
@@ -1327,12 +1331,12 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
         lzR, _ = merge_weights(Rg)
         ks, j = split_half_ks(Rg, seed=len(R), post_map=post_map)
         # the pooled insertion test is reported only (no power, Round 9): computed for the final evaluation only
-        insp = pooled_insertion(Rg) if final else (np.nan, np.nan, np.nan)
+        insp = pooled_insertion(Rg) if final else (np.nan, np.nan, np.nan, np.nan)
         h = dict(nsteps=N, runs=sR["M_all"], runs_good=sR["M"], n_failed=sR["n_failed"], wall=time.perf_counter() - t0,
                  logz=lzR, logz_meanlnz=sR["mean"], logz_err=sR["err"], logz_sd=sR["sd"], logz_mad_sd=sR["mad_sd"],
                  quoted=float(np.mean([r["logzerr"] for r in R]) / math.sqrt(sR["M"])), ks_split=ks, ks_param=j,
                  insertion_p_min=min(r["insertion"]["p"] for r in R), final=final,
-                 **dict(zip(("ins_pooled_D", "ins_pooled_p", "ins_fisher_p"), insp)),
+                 **dict(zip(("ins_pooled_D", "ins_pooled_p", "ins_fisher_p", "ins_pooled_z"), insp)),
                  ncall=int(ncall_tot[0]), ncall_result=int(sum(r["ncall"] for r in R)))
         ok_bias, escalate = True, False
         if check:
