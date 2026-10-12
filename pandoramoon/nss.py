@@ -659,7 +659,7 @@ def make_sampler(ll_u, parallel, with_data=False):
 
     @njit(parallel=parallel, nogil=True)
     def ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed, scale0, M, dirmode, recluster, paxis, kpair,
-           stop, pglob, D, logx0, scale_gain, freeze_after, minimg, ppca):
+           stop, pglob, D, logx0, scale_gain, freeze_after, minimg, ppca, exp_target):
         # dirmode: 1 = "cluster", 4 = "pairs", 5 = "lcov" (the numbers of the full version, nss_legacy)
         # Round 19 options (SAMPLING_REVIEW.md; defaults = the behaviour before): logx0 = ln X at the start (rejection
         # init, B1); scale_gain = factor of the scale adaptation per iteration (1.1; 1.0 = fixed scale), freeze_after =
@@ -860,7 +860,7 @@ def make_sampler(ll_u, parallel, with_data=False):
             nstep_tot += k * nsteps
             # scale adaptation: aim at ~1 expansion per step (interval comparable to the slice)
             if freeze_after < 0 or it < freeze_after:
-                if nexps.sum() > k * nsteps:
+                if nexps.sum() > exp_target * k * nsteps:
                     scale *= scale_gain
                 else:
                     scale /= scale_gain
@@ -931,7 +931,7 @@ def insertion_test(ranks, m, nlive, seed=0):
 def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_remain=0.01,
         max_iter=10_000_000, seed=1, scale0=1.0, threads=None, nbsub=2000, dirs="cluster",
         recluster=0.25, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None, init_reject=True,
-        init_min_draws=100_000, logx0=None, scale_gain=1.1, freeze_after=-1, minimg=False, ppca=0.0):
+        init_min_draws=100_000, logx0=None, scale_gain=1.1, freeze_after=-1, minimg=False, ppca=0.0, exp_target=1.0):
     """returns dict(logz, logzerr, ncall, niter, wall, samples_u (equal weight), dead_u, dead_L, logw).
     Round 19 options (SAMPLING_REVIEW.md):
     init_reject (default True since Round 20; False = the initial live set of Rounds 1-19): draw the initial live points only where logL > PLATEAU (the LOGZERO plateau, B1) and start at
@@ -942,6 +942,8 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     minimg: minimal image in wrapped dimensions for the pair metric, the pair directions and the spread (E2, X5).
     ppca (Round 21, NEW_LEADS L5, "de-mix"): fraction of slice steps along a random principal axis of the live points'
       covariance (sqrt(2 lam) e_k), recomputed at every neighbour-list refresh (dirs="pairs"); 0 = off.
+    exp_target (Round 21, NEW_LEADS L6): step-outs per slice step that the scale adaptation aims at (1.0 = Rounds 1-20;
+      Yallup et al. 2026: the expected calls per step are minimal at ~0.74 step-outs, i.e. an interval ~1.36 chords).
     data: None -> ll_u(u); a tuple D -> ll_u(u, D) (one compiled sampler for many data sets).
     dirs: "pairs" (fit's default), "cluster", "lcov". The superseded "knn", "knnmh", "localcov" and the mode jumps
     `pjump` were removed in Round 14; they are in pandoramoon.nss_legacy (same API) and git tag nss-all-dirs."""
@@ -987,7 +989,8 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
      nfallback, ins, mix, nstuck, nmaxexp) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0,
                                               nbsub, {"cluster": 1, "pairs": 4, "lcov": 5}[dirs], recluster, paxis, kpair,
                                               stop if stop is not None else np.zeros(1, dtype=np.int64), pglob, D,
-                                              lx0, float(scale_gain), int(freeze_after), bool(minimg), float(ppca))
+                                              lx0, float(scale_gain), int(freeze_after), bool(minimg), float(ppca),
+                                              float(exp_target))
     t2 = time.perf_counter()
     lw = dlogw + dL
     logz = float(np.logaddexp.reduce(lw))
