@@ -620,7 +620,7 @@ def _jsonable(x):
 
 _RUN_SCALARS = ("seed", "nlive", "logz", "logzerr", "H", "ncall", "niter", "wall", "wall_init", "ess", "maxL",
                 "final_scale", "expand_rate", "nclusters", "nclusters_max", "nrecluster", "nfallback", "dirs",
-                "insertion")
+                "insertion", "logx0", "init_acc", "init_draws", "n_plateau", "nstuck", "nmaxexp")
 
 
 def _save_run(path, r):
@@ -898,6 +898,7 @@ class NestedSampler:
         h.update(_data_hash(self.likelihood).encode())
         h.update(repr(sorted((k, repr(v)) for k, v in m.spec.items())).encode())
         h.update(repr((name, m.moon_phase, self.ld_correlation, self.seed, sorted(nss_kw.items()))).encode())
+        h.update(repr(("nss-init", nss.INIT_VERSION)).encode())   # runs stored before Round 20 are not mixed in
         return h.hexdigest()
 
     def run(self, accuracy="high", max_weighted_samples=None, **nss_kw):

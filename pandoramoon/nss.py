@@ -79,6 +79,7 @@ def _cholesky(C):
             L[i, j] = t / L[j, j]
     return L
 MAXEXP = 100     # max linear step-outs per side and slice
+INIT_VERSION = 2   # 2: rejection init above the LOGZERO plateau by default (Round 20); stored runs carry init_*
 PLATEAU = -1e299  # logL at or below this is the LOGZERO plateau (outside the prior; sampling.LOGZERO = -1e300)
 
 
@@ -830,11 +831,11 @@ def insertion_test(ranks, m, nlive, seed=0):
 
 def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_remain=0.01,
         max_iter=10_000_000, seed=1, scale0=1.0, threads=None, nbsub=2000, dirs="cluster",
-        recluster=0.25, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None, init_reject=False,
+        recluster=0.25, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None, init_reject=True,
         init_min_draws=100_000, logx0=None, scale_gain=1.1, freeze_after=-1, minimg=False):
     """returns dict(logz, logzerr, ncall, niter, wall, samples_u (equal weight), dead_u, dead_L, logw).
-    Round 19 options (SAMPLING_REVIEW.md; the defaults keep the behaviour before):
-    init_reject: draw the initial live points only where logL > PLATEAU (the LOGZERO plateau, B1) and start at
+    Round 19 options (SAMPLING_REVIEW.md):
+    init_reject (default True since Round 20; False = the initial live set of Rounds 1-19): draw the initial live points only where logL > PLATEAU (the LOGZERO plateau, B1) and start at
       ln X0 = ln(accepted / drawn) over >= init_min_draws draws (or the given logx0, e.g. an analytic 1 - f);
       the draws are counted in ncall. Without it, plateau points enter the live set (n_plateau in the result).
     scale_gain, freeze_after: scale adaptation per iteration (x/: scale_gain; 1.0 = fixed scale0) and the iteration
@@ -1144,7 +1145,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     tc = time.perf_counter()
     make_sampler(ll_u, False, data is not None)  # compile once, outside the threads
     run(ll_u, ndim, wrapped=wrapped, nlive=max(40, 2 * ndim + 8), nsteps=2, k=1, max_iter=3, seed=seed + 999, data=data,
-        dirs=dirs, kpair=min(kpair, 4))
+        dirs=dirs, kpair=min(kpair, 4), init_reject=False)
     t_compile = time.perf_counter() - tc         # numba compile (first call per process); not in `wall`
     arms = {}                                    # nsteps -> list of runs
     hist = []
