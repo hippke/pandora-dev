@@ -187,9 +187,17 @@ def prepare_lightcurve(time, flux, t0, period, duration, mask=None, window=None,
         binned = np.bincount(inv, weights=r)[mb] / cnt[mb]
         beta = max(1.0, float(np.sqrt(np.mean(binned ** 2 / (sig ** 2 / cnt[mb])))))
     err = sig * beta if inflate_beta else sig
+    warn = []
+    if beta > _PREP["beta_warn"]:
+        warn.append(f"red-noise factor beta = {beta:.2f} (> {_PREP['beta_warn']}): strong correlated noise (active or "
+                    f"noisy star, or poor detrending). With inflate_beta the errors grow by beta, which lowers a moon's "
+                    f"dlnZ by ~beta^2 = {beta ** 2:.1f}x: weak moons may be missed. Check the detrended light curve "
+                    "(e.g. a shorter window for fast variability) before trusting a non-detection.")
+        import warnings
+        warnings.warn(warn[-1], stacklevel=2)
     epochs = np.unique(np.round((t[win] - t0) / period).astype(int))
     return dict(time=t[win], flux=flat[win], flux_err=np.full(int(win.sum()), err), sigma=sig, beta=beta,
-                epochs=epochs.tolist(), time_all=t, flux_all=f, trend=trend, flat=flat, in_window=win,
+                epochs=epochs.tolist(), time_all=t, flux_all=f, trend=trend, flat=flat, in_window=win, warnings=warn,
                 settings=dict(mask=mask, window=window, method=method, fit_halfwidth=half, duration=duration,
                               inflate_beta=inflate_beta))
 

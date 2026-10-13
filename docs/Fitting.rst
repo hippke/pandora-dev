@@ -72,7 +72,9 @@ A search has two stages: a fast **detection** test for every light curve, and th
    windows (±(mask/2 + 1) × T14 around each transit, or ``fit_halfwidth`` days) and measures the noise on the
    detrended data 1–11 T14 beyond them: ``sigma`` (robust scatter) and the red-noise factor ``beta`` (on bins of
    T14/4; Pont, Zucker & Queloz 2006). Returns ``time, flux, flux_err`` (= σ × β) for the ``Likelihood``, and
-   ``sigma, beta, epochs`` and arrays for plots.
+   ``sigma, beta, epochs``, ``warnings`` and arrays for plots. If β > 2 it warns: the inflated errors lower a
+   moon's Δln Z by about β², so weak moons around active or noisy stars may be missed (in our Kepler tests β = 3.8
+   turned a clear moon, Δln Z 129 with white errors, into a non-detection).
 
 .. function:: default_priors(t0_bary, per_bary, r_planet, per_bary_err=None, a_bary=None, R_star=R_sun, M_star=M_sun, M_planet=M_Jup, t0_halfwidth=0.05, per_moon_max=None)
 
@@ -81,7 +83,7 @@ A search has two stages: a fast **detection** test for every light curve, and th
    ≈ 0.19 × per_bary, all orientations, M_moon up to half the planet's mass). The Bayes factor depends on the moon
    priors; ``detect``'s threshold was calibrated with priors of this kind.
 
-.. function:: detect(likelihood, priors, recall=0.95, threshold=3.0, seed=1, jack_min=18, ld_correlation=0.0, verbose=False)
+.. function:: detect(likelihood, priors, recall=0.95, threshold=3.0, seed=1, jack_min=18, ld_correlation=0.0, verbose=False, threads=None)
 
    A first look: one short nested-sampling run of the planet-only model and a few of the planet+moon model
    (seconds). ``recall`` (0.90, 0.95, 0.99, 0.999) is the fraction of clearly detectable moons the
@@ -94,9 +96,11 @@ A search has two stages: a fast **detection** test for every light curve, and th
 
    The **epoch jackknife** (``pandora.epoch_jackknife``) splits the χ² improvement of the moon model over the
    planet-only model by transit. A moon must be seen in at least two transits: the improvement without the
-   strongest transit must be ≥ ``jack_min`` (18 ≈ 2 × (threshold 3 + Occam penalty ~6); provisional, being
-   calibrated on real Kepler light curves). Single-transit artefacts were the cause of all false moon signals in
-   our real-data tests.
+   strongest transit must be ≥ ``jack_min`` (18 ≈ 2 × (threshold 3 + Occam penalty ~6)). Single-transit
+   artefacts were the cause of all false moon signals in our real-data tests. On real Kepler light curves
+   (injected moons and no-moon controls, with β-inflated errors from ``prepare_lightcurve``): moons reached
+   ≥ 32 (24 of 25), controls and planet-only systems ≤ 26 (70); "Δln Z > 3 and jackknife ≥ 18" gave 0 false
+   candidates in 50 controls, Δln Z alone 2 (both on one star).
 
 Interface
 ---------
