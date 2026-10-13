@@ -77,46 +77,6 @@ def _cholesky(C):
                 t -= L[i, k] * L[j, k]
             L[i, j] = t / L[j, j]
     return L
-@njit(cache=True)
-def _eigh_jacobi(A, tol=1e-12, max_sweeps=60):
-    """eigenvalues / eigenvectors (columns) of a symmetric matrix, cyclic Jacobi (no scipy / LAPACK needed)"""
-    n = A.shape[0]
-    a = A.copy()
-    V = np.eye(n)
-    for _sw in range(max_sweeps):
-        off = 0.0
-        for p in range(n):
-            for q in range(p + 1, n):
-                off += a[p, q] * a[p, q]
-        if off < tol * tol:
-            break
-        for p in range(n):
-            for q in range(p + 1, n):
-                if abs(a[p, q]) < 1e-300:
-                    continue
-                th = 0.5 * (a[q, q] - a[p, p]) / a[p, q]
-                t = (1.0 if th >= 0 else -1.0) / (abs(th) + math.sqrt(th * th + 1.0))
-                c = 1.0 / math.sqrt(t * t + 1.0)
-                sn = t * c
-                for k in range(n):
-                    akp = a[k, p]
-                    akq = a[k, q]
-                    a[k, p] = c * akp - sn * akq
-                    a[k, q] = sn * akp + c * akq
-                for k in range(n):
-                    apk = a[p, k]
-                    aqk = a[q, k]
-                    a[p, k] = c * apk - sn * aqk
-                    a[q, k] = sn * apk + c * aqk
-                for k in range(n):
-                    vkp = V[k, p]
-                    vkq = V[k, q]
-                    V[k, p] = c * vkp - sn * vkq
-                    V[k, q] = sn * vkp + c * vkq
-    lam = np.empty(n)
-    for i in range(n):
-        lam[i] = a[i, i]
-    return lam, V
 
 
 MAXEXP = 100     # max linear step-outs per side and slice
@@ -460,52 +420,8 @@ def make_sampler(ll_u, parallel, with_data=False):
                     Lp[q, i, i2] = Lq[i, i2]
 
     @njit
-    def principal_axes(U, alive, wmi, PA):
-        """PA[k] = sqrt(2 lam_k) e_k of the alive points' covariance (minimal image about the circular mean in the
-        dimensions with wmi; plain otherwise)"""
-        n, ndim = U.shape
-        ref = np.zeros(ndim)
-        for i in range(ndim):
-            if wmi[i]:
-                cs = 0.0
-                sn = 0.0
-                for a in range(n):
-                    if alive[a]:
-                        cs += math.cos(2.0 * math.pi * U[a, i])
-                        sn += math.sin(2.0 * math.pi * U[a, i])
-                ref[i] = math.atan2(sn, cs) / (2.0 * math.pi)
-        m = 0
-        mu = np.zeros(ndim)
-        C = np.zeros((ndim, ndim))
-        d = np.empty(ndim)
-        for a in range(n):
-            if not alive[a]:
-                continue
-            m += 1
-            for i in range(ndim):
-                t = U[a, i] - ref[i]
-                if wmi[i]:
-                    t -= math.floor(t + 0.5)
-                d[i] = t
-            for i in range(ndim):
-                mu[i] += d[i]
-                for i2 in range(i + 1):
-                    C[i, i2] += d[i] * d[i2]
-        for i in range(ndim):
-            mu[i] /= m
-        for i in range(ndim):
-            for i2 in range(i + 1):
-                C[i, i2] = C[i, i2] / m - mu[i] * mu[i2]
-                C[i2, i] = C[i, i2]
-        lam, V = _eigh_jacobi(C)
-        for k in range(ndim):
-            sc = math.sqrt(2.0 * max(lam[k], 1e-300))
-            for i in range(ndim):
-                PA[k, i] = sc * V[i, k]
-
-    @njit
     def chain(U, j, L0, nb, Lmin, nsteps, scale, wrapped, x, xn, alive, dmode, paxis, sdv, nbr, kpair, pglob, D, Lp,
-              ppca, PA):
+              ):
         """slice chain at fixed Lmin from U[j] (logL L0); directions by dmode: 0 = differences of members of nb
         ("cluster"), 2 = local pairs ("pairs"), 6 = local pairs with the minimal image in wrapped dimensions
         (Round 19, SAMPLING_REVIEW.md E2), 3 = local covariance ("lcov"); optional axis / global-pair steps.
@@ -528,7 +444,7 @@ def make_sampler(ll_u, parallel, with_data=False):
             if b >= a:
                 b += 1
             vv = 0.0
-            ur = np.random.uniform(0.0, 1.0) if (paxis > 0.0 or pglob > 0.0 or ppca > 0.0) else 2.0
+            ur = np.random.uniform(0.0, 1.0) if (paxis > 0.0 or pglob > 0.0) else 2.0
             if ur < paxis:
                 # coordinate-axis slice (Gibbs-like), length ~ the live points' spread in that axis
                 for i in range(ndim):
@@ -536,13 +452,6 @@ def make_sampler(ll_u, parallel, with_data=False):
                 ka = np.random.randint(ndim)
                 v[ka] = 1.4142135623730951 * sdv[ka]
                 vv = v[ka] * v[ka]
-            elif ur < paxis + pglob + ppca and ur >= paxis + pglob:
-                # principal axis of the live points' covariance (L5 / "de-mix", Buchner 2022): PA[k] = sqrt(2 lam_k) e_k,
-                # computed at the last neighbour-list refresh from the frozen live set (independent of the chain: exact)
-                ka = np.random.randint(ndim)
-                for i in range(ndim):
-                    v[i] = PA[ka, i]
-                    vv += v[i] * v[i]
             elif ur < paxis + pglob:
                 # global pair difference (two random live points): large moves along the global shape
                 while True:
@@ -658,7 +567,7 @@ def make_sampler(ll_u, parallel, with_data=False):
 
     @njit(parallel=parallel, nogil=True)
     def ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed, scale0, M, dirmode, recluster, paxis, kpair,
-           stop, pglob, D, logx0, scale_gain, freeze_after, minimg, ppca, exp_target):
+           stop, pglob, D, logx0, scale_gain, freeze_after, minimg, exp_target):
         # dirmode: 1 = "cluster", 4 = "pairs", 5 = "lcov" (the numbers of the full version, nss_legacy)
         # Round 19 options (SAMPLING_REVIEW.md; defaults = the behaviour before): logx0 = ln X at the start (rejection
         # init, B1); scale_gain = factor of the scale adaptation per iteration (1.1; 1.0 = fixed scale), freeze_after =
@@ -702,9 +611,6 @@ def make_sampler(ll_u, parallel, with_data=False):
         labels = np.zeros(n, dtype=np.int64)
         nbr = np.empty((n, K), dtype=np.int64)
         Lp = np.zeros((n if dirmode == 5 else 1, ndim, ndim))
-        PA = np.zeros((ndim, ndim))
-        for i in range(ndim):
-            PA[i, i] = 0.1
         for q0 in range(n):
             for t0 in range(K):
                 nbr[q0, t0] = q0
@@ -768,8 +674,6 @@ def make_sampler(ll_u, parallel, with_data=False):
                 alive[sel[jj]] = False
             if dirmode == 4 and repl_since >= recluster * n:
                 pair_lists(U, alive, sd, kpair, M, nbr, ref, wmi)
-                if ppca > 0.0:
-                    principal_axes(U, alive, wmi, PA)
                 nrecl += 1
                 repl_since = 0
             if (dirmode == 1 or dirmode == 5) and repl_since >= recluster * n:
@@ -808,7 +712,7 @@ def make_sampler(ll_u, parallel, with_data=False):
                     mcount[c] = 1 if dirmode == 1 else 0
                 Lc, nc, ne, nst, nmx = chain(U, starts[c], L[starts[c]], mem, Lmin, nsteps, scale, wrapped, xs[c], xns[c],
                                              alive, (6 if minimg else 2) if dirmode == 4 else (3 if dirmode == 5 else 0),
-                                             paxis, sd, nbr, kpair, pglob, D, Lp, ppca, PA)
+                                             paxis, sd, nbr, kpair, pglob, D, Lp)
                 newL[c] = Lc
                 ncs[c] = nc
                 nexps[c] = ne
@@ -932,7 +836,7 @@ def insertion_test(ranks, m, nlive, seed=0):
 def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_remain=0.01,
         max_iter=10_000_000, seed=1, scale0=1.0, threads=None, nbsub=2000, dirs="cluster",
         recluster=0.25, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None, init_reject=True,
-        init_min_draws=None, logx0=None, scale_gain=1.1, freeze_after=-1, minimg=False, ppca=0.0, exp_target=1.0):
+        init_min_draws=None, logx0=None, scale_gain=1.1, freeze_after=-1, minimg=False, exp_target=1.0):
     """returns dict(logz, logzerr, ncall, niter, wall, samples_u (equal weight), dead_u, dead_L, logw).
     Round 19 options (SAMPLING_REVIEW.md):
     init_reject (default True since Round 20; False = the initial live set of Rounds 1-19): draw the initial live points only where logL > PLATEAU (the LOGZERO plateau, B1) and start at
@@ -941,8 +845,6 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     scale_gain, freeze_after: scale adaptation per iteration (x/: scale_gain; 1.0 = fixed scale0) and the iteration
       after which it is frozen (-1: never) (E1, experiment X3).
     minimg: minimal image in wrapped dimensions for the pair metric, the pair directions and the spread (E2, X5).
-    ppca (Round 21, NEW_LEADS L5, "de-mix"): fraction of slice steps along a random principal axis of the live points'
-      covariance (sqrt(2 lam) e_k), recomputed at every neighbour-list refresh (dirs="pairs"); 0 = off.
     exp_target (Round 21, NEW_LEADS L6): step-outs per slice step that the scale adaptation aims at (1.0 = Rounds 1-20;
       Yallup et al. 2026: the expected calls per step are minimal at ~0.74 step-outs, i.e. an interval ~1.36 chords).
     data: None -> ll_u(u); a tuple D -> ll_u(u, D) (one compiled sampler for many data sets).
@@ -991,7 +893,7 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
      nfallback, ins, mix, nstuck, nmaxexp) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0,
                                               nbsub, {"cluster": 1, "pairs": 4, "lcov": 5}[dirs], recluster, paxis, kpair,
                                               stop if stop is not None else np.zeros(1, dtype=np.int64), pglob, D,
-                                              lx0, float(scale_gain), int(freeze_after), bool(minimg), float(ppca),
+                                              lx0, float(scale_gain), int(freeze_after), bool(minimg),
                                               float(exp_target))
     t2 = time.perf_counter()
     lw = dlogw + dL
