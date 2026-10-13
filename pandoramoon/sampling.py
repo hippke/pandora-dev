@@ -231,23 +231,6 @@ def _logpdf(kind, a, b, c, d, x):
 
 
 @njit(cache=True)
-def _tab_ppf(TX, TC, u):
-    """repartitioned coordinate (Round 21, NEW_LEADS L1): piecewise-linear inverse of the tabulated CDF (TC at the
-    nodes TX); returns (x, log q(x)) with q the density this map induces (piecewise constant, exact)"""
-    lo = 0
-    hi = TC.shape[0] - 1
-    while hi - lo > 1:
-        mid = (lo + hi) // 2
-        if TC[mid] <= u:
-            lo = mid
-        else:
-            hi = mid
-    dc = TC[hi] - TC[lo]
-    dx = TX[hi] - TX[lo]
-    return TX[lo] + (u - TC[lo]) * dx / dc, math.log(dc / dx)
-
-
-@njit(cache=True)
 def _to_native(per_bary, t0_bary, t0_off, phi_c, delta, u_m, e_c, CDF, M_MIN, Q, P_MAX):
     """phase-at-transit coordinates -> (per_moon, tau, log w); as reparam.Reparam.to_native, with the
     constants as arguments (one compiled function for every prior)"""
@@ -275,8 +258,7 @@ def _to_native(per_bary, t0_bary, t0_off, phi_c, delta, u_m, e_c, CDF, M_MIN, Q,
 #   13 nat_k, 14 nat_par (k, 4), 15 ld_mode (0: q1/q2 -> u1/u2, 1: u1/u2 with the triangle cut, 2: correlated
 #   normal u1/u2, 3: fixed u), 16 ld_c[2] (cube indices, mode 2), 17 ld_par[6] (m1, m2, L11, L21, L22, log norm),
 #   18 mp (moon-phase coordinates on/off), 19 mp_c[3] (cube indices of phi_c, delta, u_m), 20 CDF,
-#   21 mp_f[6] (M_MIN, Q, P_MAX, e_c, p_lo, log P_MAX), 22 pm_k (per_moon prior kind), 23 pm_par[4],
-#   24-26 repartition tables (tab, TX, TC) )
+#   21 mp_f[6] (M_MIN, Q, P_MAX, e_c, p_lo, log P_MAX), 22 pm_k (per_moon prior kind), 23 pm_par[4] )
 
 @njit(cache=True)
 def _theta(u, D):
@@ -284,15 +266,8 @@ def _theta(u, D):
     th = D[10].copy()
     lw = 0.0
     nat_p, nat_c, nat_k, nat_par = D[11], D[12], D[13], D[14]
-    tab, TX, TC = D[24], D[25], D[26]
     for j in range(nat_p.shape[0]):
-        if tab[j] < 0:
-            th[nat_p[j]] = _ppf(nat_k[j], nat_par[j, 0], nat_par[j, 1], nat_par[j, 2], nat_par[j, 3], u[nat_c[j]])
-        else:
-            # posterior repartitioning: sample from the tabulated mixture q, weight pi(x) / q(x) (Z, posterior exact)
-            x, lq = _tab_ppf(TX[tab[j]], TC[tab[j]], u[nat_c[j]])
-            th[nat_p[j]] = x
-            lw += _logpdf(nat_k[j], nat_par[j, 0], nat_par[j, 1], nat_par[j, 2], nat_par[j, 3], x) - lq
+        th[nat_p[j]] = _ppf(nat_k[j], nat_par[j, 0], nat_par[j, 1], nat_par[j, 2], nat_par[j, 3], u[nat_c[j]])
     ld_mode = D[15]
     if ld_mode == 0:
         q1 = th[0]
@@ -361,7 +336,7 @@ def _thetas(U, D):
 class _Model:
     """the compiled likelihood's constants for one model ("moon" or "planet") of a Likelihood and priors"""
 
-    def __init__(self, like, priors, model, moon_phase, ld_correlation, repartition=None, repartition_weight=0.8):
+    def __init__(self, like, priors, model, moon_phase, ld_correlation):
         if like.cache is not None:
             raise ValueError("NestedSampler: Likelihood(cache=...) is not supported; use cache=None")
         self.model = model
@@ -531,40 +506,7 @@ class _Model:
                   np.array(nat_par, dtype=np.float64).reshape(-1, 4),
                   int(ld_mode), np.array(ld_c, dtype=np.int64), np.array(ld_par, dtype=np.float64),
                   int(mp), np.array(mp_c, dtype=np.int64), np.ascontiguousarray(CDF, dtype=np.float64),
-                  np.array(mp_f, dtype=np.float64), int(pm_k), np.array(pm_par, dtype=np.float64),
-                  *self._tables(cube, nat_c, repartition, repartition_weight))
-
-    def _tables(self, cube, nat_c, repartition, beta, K=4096):
-        """posterior repartitioning (Round 21, NEW_LEADS L1): for each parameter in repartition = {name: (mu, sigma)},
-        the inverse CDF of q = (1 - beta) pi + beta N(mu, sigma) (truncated to pi's support) tabulated at K + 1
-        quantile nodes. The map is the piecewise-linear interpolant of the table and its density is used in the
-        weight, so Z and the posterior are exact for any table; the table only sets the efficiency."""
-        self.repartition = {}
-        tab = np.full(len(nat_c), -1, dtype=np.int64)
-        TXs, TCs = [], []
-        for j, c in enumerate(nat_c):
-            name = cube[c]
-            if not repartition or name not in repartition:
-                continue
-            p = self.spec[name]
-            mu, sg = map(float, repartition[name])
-            TX, TC = _mixture_table(p, mu, sg, float(beta), K)
-            if TX is None:
-                import warnings
-                warnings.warn(f"repartition {name}: proposal N({mu}, {sg}) has no mass in the prior support; not used")
-                continue
-            tab[j] = len(TXs)
-            TXs.append(TX)
-            TCs.append(TC)
-            self.repartition[name] = (mu, sg, float(beta))
-        if TXs:
-            n = max(len(x) for x in TXs)
-            TX = np.array([np.pad(x, (0, n - len(x)), mode="edge") for x in TXs])
-            TC = np.array([np.pad(x, (0, n - len(x)), mode="edge") for x in TCs])
-        else:
-            TX = np.zeros((1, 2))
-            TC = np.array([[0.0, 1.0]])
-        return tab, np.ascontiguousarray(TX), np.ascontiguousarray(TC)
+                  np.array(mp_f, dtype=np.float64), int(pm_k), np.array(pm_par, dtype=np.float64))
 
     @staticmethod
     def _ld_p_inside(spec, ld_mode, ld_par, n=4_000_000):
@@ -636,49 +578,6 @@ def _logcdf_np(p, x):
         return math.log(min(max(math.log(x / p.lo) / math.log(p.hi / p.lo), 1e-300), 1.0)) if x > p.lo else -np.inf
     a, b, c, d = p.par()
     return math.log(max((_norm_cdf((x - a) / b) - c) / (d - c), 1e-300))
-
-
-def _cdf_np(p, x):
-    """prior CDF at an array x (Uniform / LogUniform / truncated Normal)"""
-    x = np.asarray(x, dtype=float)
-    if isinstance(p, Uniform):
-        return np.clip((x - p.lo) / (p.hi - p.lo), 0.0, 1.0)
-    if isinstance(p, LogUniform):
-        return np.clip(np.log(np.maximum(x, 1e-300) / p.lo) / math.log(p.hi / p.lo), 0.0, 1.0)
-    a, b, c, d = p.par()
-    return np.clip((_phi_np((x - a) / b) - c) / (d - c), 0.0, 1.0)
-
-
-def _phi_np(z):
-    """standard normal CDF at an array z (math.erfc; numpy has no erf)"""
-    return 0.5 * np.vectorize(math.erfc)(-np.asarray(z, dtype=float) / math.sqrt(2.0))
-
-
-def _mixture_table(p, mu, sg, beta, K):
-    """nodes (x, CDF) of q = (1 - beta) p + beta N(mu, sg) truncated to p's support; (None, None) if the normal has
-    no mass there. Note: an untruncated Normal prior is cut at +-12 sigma (mass ~1e-32 dropped)."""
-    lo, hi = p.support()
-    Phi = _phi_np
-    glo, ghi = float(Phi((lo - mu) / sg)), float(Phi((hi - mu) / sg))
-    if not ghi - glo > 1e-12 or not sg > 0:
-        return None, None
-    if isinstance(p, LogUniform):
-        g1 = np.geomspace(lo, hi, 200_001)
-    else:
-        g1 = np.linspace(lo, hi, 200_001)
-    g2 = mu + sg * np.linspace(-12, 12, 40_001)
-    xg = np.unique(np.concatenate([g1, g2[(g2 > lo) & (g2 < hi)]]))
-    F = (1 - beta) * _cdf_np(p, xg) + beta * (Phi((xg - mu) / sg) - glo) / (ghi - glo)
-    F = (F - F[0]) / (F[-1] - F[0])
-    t = np.linspace(0.0, 1.0, K + 1)
-    X = np.interp(t, F, xg)
-    X[0], X[-1] = lo, hi
-    C = (1 - beta) * _cdf_np(p, X) + beta * (Phi((X - mu) / sg) - glo) / (ghi - glo)
-    C = (C - C[0]) / (C[-1] - C[0])
-    keep = np.r_[True, (np.diff(X) > 0) & (np.diff(C) > 0)]
-    X, C = X[keep], C[keep]
-    C[0], C[-1] = 0.0, 1.0
-    return X, C
 
 
 def _ref_epoch(like, spec):
@@ -945,20 +844,10 @@ class NestedSampler:
         uses 5 sub-exposures per cadence (exposure = cadence; SAMPLING.md Round 16: without it the Bayes factor and the
         moon parameters of 30-min data are biased); an integer: that many sub-exposures; None: the likelihood as given.
         (To control the exposure time, pass a likelihood that is already supersampled.)
-    repartition (Round 21, NEW_LEADS L1; opt-in): posterior repartitioning of 1-D priors. None (default); a dict
-        {name: (mu, sigma)}: the prior of each named parameter is sampled from the mixture (1 - w) prior + w N(mu, sigma)
-        (truncated to the prior) and the likelihood is weighted by prior / mixture, in both models -- Z and the
-        posterior are unchanged exactly, the run is shorter if the mixture is closer to the posterior; or "auto": the
-        moon model's planet parameters get mu, sigma from the planet-only fit, sigma widened by repartition_widen
-        (default x20 for per_bary and t0_bary_offset, which massive moons shift, x4 otherwise).
-    repartition_weight: w, the weight of the proposal N(mu, sigma) in the mixture (default 0.8): the original prior
-        keeps weight 1 - w, so a misplaced proposal costs efficiency (at most ln(1 / (1 - w)) nats of H per
-        parameter), never correctness. Results carry results["repartition"].
     """
 
     def __init__(self, likelihood, priors, model="moon", compare_planet=True, moon_phase="auto", ld_correlation=0.0,
-                 log_dir=None, resume="subfolder", threads=None, seed=1, verbose=True, supersampling="auto",
-                 repartition=None, repartition_weight=0.8, repartition_widen=None):
+                 log_dir=None, resume="subfolder", threads=None, seed=1, verbose=True, supersampling="auto"):
         if model not in ("moon", "planet"):
             raise ValueError('model must be "moon" or "planet"')
         if resume not in ("subfolder", "resume", "overwrite"):
@@ -993,22 +882,11 @@ class NestedSampler:
                 threads = os.cpu_count() or 1
         self.threads = int(threads)
         self.models = {}
-        if repartition is not None and repartition != "auto" and not isinstance(repartition, dict):
-            raise ValueError('repartition must be None, "auto" or a dict {name: (mu, sigma)}')
-        if repartition == "auto" and not (model == "moon" and compare_planet):
-            raise ValueError('repartition="auto" needs model="moon" with the planet comparison')
-        self.repartition = repartition
-        self.repartition_weight = float(repartition_weight)
-        self.repartition_widen = dict(per_bary=20.0, t0_bary_offset=20.0)
-        self.repartition_widen.update(repartition_widen or {})
         self._moon_phase = moon_phase
-        rp = repartition if isinstance(repartition, dict) else None
         if model == "moon":
-            self.models["moon"] = _Model(likelihood, self.priors, "moon", moon_phase, ld_correlation, rp,
-                                         self.repartition_weight)
+            self.models["moon"] = _Model(likelihood, self.priors, "moon", moon_phase, ld_correlation)
         if model == "planet" or compare_planet:
-            self.models["planet"] = _Model(likelihood, self.priors, "planet", False, ld_correlation, rp,
-                                           self.repartition_weight)
+            self.models["planet"] = _Model(likelihood, self.priors, "planet", False, ld_correlation)
         self.ld_correlation = float(ld_correlation)
         self.log_dir = None
         self.resume = resume
@@ -1039,17 +917,6 @@ class NestedSampler:
                 raise ValueError(f"{name} model: only {100 * valid.mean():.0f} % of the prior is valid for Pandora "
                                  "(check the prior ranges, e.g. positive radii, periods and masses)")
 
-    def _auto_repartition(self, planet_result):
-        """repartition="auto": proposals for the moon model's planet parameters from the planet-only posterior"""
-        post = planet_result["posterior"]
-        spec = {}
-        for j, n in enumerate(planet_result["paramnames"]):
-            if n in self.models["moon"].free:
-                f = float(self.repartition_widen.get(n, 4.0))
-                spec[n] = (float(post["mean"][j]), f * max(float(post["stdev"][j]), 1e-300))
-        self.models["moon"] = _Model(self.likelihood, self.priors, "moon", self._moon_phase, self.ld_correlation, spec,
-                                     self.repartition_weight)
-
     def _settings_hash(self, name, nss_kw):
         m = self.models[name]
         h = hashlib.sha1()
@@ -1057,8 +924,6 @@ class NestedSampler:
         h.update(repr(sorted((k, repr(v)) for k, v in m.spec.items())).encode())
         h.update(repr((name, m.moon_phase, self.ld_correlation, self.seed, sorted(nss_kw.items()))).encode())
         h.update(repr(("nss-init", nss.INIT_VERSION)).encode())   # runs stored before Round 20 are not mixed in
-        if getattr(m, "repartition", None):
-            h.update(repr(sorted(m.repartition.items())).encode())
         return h.hexdigest()
 
     def run(self, accuracy="high", max_weighted_samples=None, **nss_kw):
@@ -1080,16 +945,9 @@ class NestedSampler:
             if self.verbose:
                 print(f"NestedSampler: {name} model, {m.ndim} sampled coordinates "
                       f"({', '.join(m.cube_names)})", flush=True)
-            if name == "moon" and self.repartition == "auto":
-                self._auto_repartition(out["planet"])
-                m = self.models["moon"]
-                if self.verbose:
-                    print("  repartition (auto, weight %.2f): " % self.repartition_weight + ", ".join(
-                        f"{k} N({v[0]:.6g}, {v[1]:.3g})" for k, v in m.repartition.items()), flush=True)
             mode = self.resume if self.resume == "resume" else "fresh"
             hs = self._settings_hash(name, {k: v for k, v in kw.items() if k != "threads"})
             out[name] = _fit_model(m, kw, store, mode, hs, self.verbose, name, max_weighted=max_weighted_samples)
-            out[name]["repartition"] = dict(getattr(m, "repartition", {}) or {})
         res = out[self.model]
         if self.model == "moon" and "planet" in out:
             pl = out["planet"]
