@@ -31,7 +31,7 @@ PolyChord / UltraNest's slice samplers, Neal 2003):
   excluded). Clusters with < 2 other points fall back to the start point's K nearest neighbours.
 - Directions, dirs="lcov" (Round 12): v = sqrt(2) L_a z with L_a the Cholesky factor of the covariance of
   a random live point's neighbour list (exact; no gain over "pairs").
-- Optional extra steps: a fraction `paxis` along coordinate axes, `pglob` along global pair differences.
+- Optional extra steps: a fraction `paxis` along coordinate axes.
 - Removed in Round 14 (superseded, user-approved cleanup): dirs="knn" (biased), "knnmh", "localcov" and the
   differential-evolution mode jumps `pjump`. They are archived in scratch_r8/archive/nss_legacy.py of the development repository (same API, frozen)
   and in git (tag nss-all-dirs).
@@ -420,8 +420,7 @@ def make_sampler(ll_u, parallel, with_data=False):
                     Lp[q, i, i2] = Lq[i, i2]
 
     @njit
-    def chain(U, j, L0, nb, Lmin, nsteps, scale, wrapped, x, xn, alive, dmode, paxis, sdv, nbr, kpair, pglob, D, Lp,
-              ):
+    def chain(U, j, L0, nb, Lmin, nsteps, scale, wrapped, x, xn, alive, dmode, paxis, sdv, nbr, kpair, D, Lp):
         """slice chain at fixed Lmin from U[j] (logL L0); directions by dmode: 0 = differences of members of nb
         ("cluster"), 2 = local pairs ("pairs"), 6 = local pairs with the minimal image in wrapped dimensions
         (Round 19, SAMPLING_REVIEW.md E2), 3 = local covariance ("lcov"); optional axis / global-pair steps.
@@ -444,7 +443,7 @@ def make_sampler(ll_u, parallel, with_data=False):
             if b >= a:
                 b += 1
             vv = 0.0
-            ur = np.random.uniform(0.0, 1.0) if (paxis > 0.0 or pglob > 0.0) else 2.0
+            ur = np.random.uniform(0.0, 1.0) if paxis > 0.0 else 2.0
             if ur < paxis:
                 # coordinate-axis slice (Gibbs-like), length ~ the live points' spread in that axis
                 for i in range(ndim):
@@ -452,19 +451,6 @@ def make_sampler(ll_u, parallel, with_data=False):
                 ka = np.random.randint(ndim)
                 v[ka] = 1.4142135623730951 * sdv[ka]
                 vv = v[ka] * v[ka]
-            elif ur < paxis + pglob:
-                # global pair difference (two random live points): large moves along the global shape
-                while True:
-                    pa = np.random.randint(n)
-                    if alive[pa]:
-                        break
-                while True:
-                    pb = np.random.randint(n)
-                    if alive[pb] and pb != pa:
-                        break
-                for i in range(ndim):
-                    v[i] = U[pa, i] - U[pb, i]
-                    vv += v[i] * v[i]
             elif dmode == 3:
                 # local covariance of a random live point's neighbourhood (dirs="lcov"): v = sqrt(2) L_a z
                 # (sqrt 2: the scale of a difference of two points); L_a from the last reclustering, inherited
@@ -567,7 +553,7 @@ def make_sampler(ll_u, parallel, with_data=False):
 
     @njit(parallel=parallel, nogil=True)
     def ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed, scale0, M, dirmode, recluster, paxis, kpair,
-           stop, pglob, D, logx0, minimg):
+           stop, D, logx0, minimg):
         # dirmode: 1 = "cluster", 4 = "pairs", 5 = "lcov" (the numbers of the full version, nss_legacy)
         # Round 19 options (SAMPLING_REVIEW.md; defaults = the behaviour before): logx0 = ln X at the start (rejection
         # init, B1); minimg = minimal image in wrapped dimensions
@@ -711,7 +697,7 @@ def make_sampler(ll_u, parallel, with_data=False):
                     mcount[c] = 1 if dirmode == 1 else 0
                 Lc, nc, ne, nst, nmx = chain(U, starts[c], L[starts[c]], mem, Lmin, nsteps, scale, wrapped, xs[c], xns[c],
                                              alive, (6 if minimg else 2) if dirmode == 4 else (3 if dirmode == 5 else 0),
-                                             paxis, sd, nbr, kpair, pglob, D, Lp)
+                                             paxis, sd, nbr, kpair, D, Lp)
                 newL[c] = Lc
                 ncs[c] = nc
                 nexps[c] = ne
@@ -833,7 +819,7 @@ def insertion_test(ranks, m, nlive, seed=0):
 
 def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_remain=0.01,
         max_iter=10_000_000, seed=1, scale0=1.0, threads=None, nbsub=2000, dirs="cluster",
-        recluster=0.25, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None, init_reject=True,
+        recluster=0.25, paxis=0.0, kpair=4, stop=None, data=None, init_reject=True,
         init_min_draws=None, logx0=None, minimg=False):
     """returns dict(logz, logzerr, ncall, niter, wall, samples_u (equal weight), dead_u, dead_L, logw).
     Round 19 options (SAMPLING_REVIEW.md):
@@ -886,7 +872,7 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     (dU, dL, dlogw, ncall, it, scale, exp_rate, nclus, nclus_max, nrecl,
      nfallback, ins, mix, nstuck, nmaxexp) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0,
                                               nbsub, {"cluster": 1, "pairs": 4, "lcov": 5}[dirs], recluster, paxis, kpair,
-                                              stop if stop is not None else np.zeros(1, dtype=np.int64), pglob, D,
+                                              stop if stop is not None else np.zeros(1, dtype=np.int64), D,
                                               lx0, bool(minimg))
     t2 = time.perf_counter()
     lw = dlogw + dL
@@ -1112,7 +1098,7 @@ ACCURACY = {a: dict(nlive=_FIT[f"{a}_nlive"], lz_tol=_FIT[f"{a}_lz_tol"], ks_tol
 
 def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=None,
         max_runs=None, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True,
-        post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25, data=None,
+        post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, recluster=0.25, data=None,
         accuracy=None, resume=None, callback=None, max_nlive=None):
     """Nested sampling with built-in convergence checks.
 
@@ -1336,7 +1322,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
                 sd = seed + 1000 * idx
                 flag = np.zeros(1, dtype=np.int64)
                 inflight[ex.submit(run, ll_u, ndim, wrapped=wrapped, nlive=nlive, nsteps=ns, k=1, seed=sd, dirs=dirs,
-                                   frac_remain=frac_remain, paxis=paxis, kpair=kpair, stop=flag, pglob=pglob,
+                                   frac_remain=frac_remain, paxis=paxis, kpair=kpair, stop=flag,
                                    recluster=recluster, data=data)] = (ns, flag, idx)
 
         def escalate_nlive():
