@@ -486,6 +486,9 @@ see ``SAMPLING.md`` and ``NSS_SAMPLER.md`` in the project directory. In summary:
 Limitations
 -----------
 
+- **Evidence systematic of the sampler:** against long-chain reference fits, the default chain length (64
+  steps) biases ln Z by −0.02 … +0.13 nats on our test cases (high side). Treat ±0.13 as a systematic when
+  comparing evidences at the 0.1-nat level; it does not matter for detection (threshold 3).
 - The noise model is white Gaussian noise with the given errors. There is no jitter term and no
   correlated noise. ``prepare_lightcurve`` inflates the errors by the red-noise factor β, which corrects
   the Bayes factor to first order; artefacts confined to one transit are caught by the epoch jackknife.
