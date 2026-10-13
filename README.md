@@ -108,7 +108,7 @@ results["planet"]                                           # the planet-only fi
 - **Moon orbit:** by default the moon's period and phase are sampled as phases at transit, which removes the comb of period aliases. An exact weight keeps your prior, evidence and posterior unchanged. This needs a `per_moon` prior with an upper bound ≤ the planet period and `tau_moon=Uniform(0, 1)`; otherwise the native parameters are sampled (`moon_phase=False` forces this).
 
 ### Installation
-Install with `pip install pandoramoon`. Compatibility has been tested for the latest Python 3.14 (January 2026):
+Install with `pip install pandoramoon` (videos and plots: `pip install pandoramoon[plots]`; light-curve preparation with wotan: `pip install pandoramoon[search]`). Compatibility has been tested for the latest Python 3.14 (January 2026):
 
 ```
 conda create -n pandora_env python=3.14

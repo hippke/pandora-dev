@@ -1,10 +1,6 @@
 import numpy as np
 from numpy import sqrt, pi, arcsin, cos, degrees
 from numba import jit
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from os import path
 
 # Pandora
 from pandoramoon.eclipse import eclipse, eclipse_possible, eclipse_impossible_circular
@@ -224,200 +220,35 @@ class moon_model(object):
             'eclipse_method must be "analytic" or "pixelmap", got %r' % (self.eclipse_method,)
         )
 
-    def video(
-        self,
-        time,
-        limb_darkening=True,
-        teff=6000,
-        planet_color="black",
-        moon_color="black",
-        ld_circles=100,
-    ):
-        (
-            self.flux_planet,
-            self.flux_moon,
-            self.flux_total,
-            self.px,
-            self.py,
-            self.mx,
-            self.my
-        ) = pandora(
-            self.u1,
-            self.u2,
-            self.R_star,
-
-            # Planet parameters
-            self.per_bary,
-            self.a_bary,
-            self.r_planet,
-            self.b_bary,
-            self.w_bary,
-            self.ecc_bary,
-            self.t0_bary,
-            self.t0_bary_offset,
-            self.M_planet,
-
-            # Moon parameters
-            self.r_moon,
-            self.per_moon,
-            self.tau_moon,
-            self.Omega_moon,
-            self.i_moon,
-            self.ecc_moon,
-            self.w_moon,
+    def _evaluate(self, time, cache=None):
+        """pandora() for this model at the given (supersampled) time grid"""
+        return pandora(
+            self.u1, self.u2, self.R_star,
+            self.per_bary, self.a_bary, self.r_planet, self.b_bary, self.w_bary, self.ecc_bary, self.t0_bary,
+            self.t0_bary_offset, self.M_planet,
+            self.r_moon, self.per_moon, self.tau_moon, self.Omega_moon, self.i_moon, self.ecc_moon, self.w_moon,
             self.M_moon,
+            self.epoch_distance, self.supersampling_factor, self.occult_small_threshold, self.hill_sphere_threshold,
+            self.numerical_grid, time, cache, eclipse_pixelmap=self._eclipse_pixelmap())
 
-            # Other model parameters
-            self.epoch_distance,
-            self.supersampling_factor,
-            self.occult_small_threshold,
-            self.hill_sphere_threshold,
-            self.numerical_grid,
-            time,
-            eclipse_pixelmap=self._eclipse_pixelmap()
-        )
-        # Build video with matplotlib
-        fig = plt.figure(figsize=(5, 5))
-        axes = fig.add_subplot(111)
-        plt.axis("off")
-        plt.style.use("dark_background")
-        plt.gcf().gca().add_artist(plt.Circle((0, 0), 5, color="black"))
-        if limb_darkening:
-            if teff > 12000:
-                teff = 12000
-            if teff < 2300:
-                teff = 2300
-            data_dir = path.join(path.join(path.dirname(__file__)), "star_colors.csv")
-            star_colors = np.genfromtxt(data_dir, delimiter=",")
-            row = np.argmax(star_colors[:, 0] >= teff)
-            r_star = star_colors[row, 1]
-            g_star = star_colors[row, 2]
-            b_star = star_colors[row, 3]
-            for i in reversed(range(ld_circles)):
-                impact = (i + 1) / ld_circles
-                r_mid = (i + 0.5) / ld_circles
-                m = sqrt(1 - min(r_mid ** 2, 1))
-                ld = 1 - self.u1 * (1 - m) - self.u2 * (1 - m) ** 2
-                r = r_star * ld
-                g = g_star * ld
-                b = b_star * ld
-                sun = plt.Circle((0, 0), impact, color=(r, g, b))
-                plt.gcf().gca().add_artist(sun)
-        else:
-            plt.gcf().gca().add_artist(plt.Circle((0, 0), 1, color="yellow"))
-
-        axes.set_xlim(-1.05, 1.05)
-        axes.set_ylim(-1.05, 1.05)
-        (moon,) = axes.plot(
-            self.mx[0],
-            self.my[0],
-            "o",
-            color=planet_color,
-            markerfacecolor=moon_color,
-            markeredgecolor=moon_color,
-            markersize=260 * self.r_moon,
-        )
-        (planet,) = axes.plot(
-            self.px[0],
-            self.py[0],
-            "o",
-            color=planet_color,
-            markeredgecolor=planet_color,
-            markerfacecolor=planet_color,
-            markersize=260 * self.r_planet,
-        )
-
-        def ani(coords):
-            mx, my, px, py = coords
-            moon.set_data([mx], [my])
-            planet.set_data([px], [py])
-            pbar.update(1)
-            return moon, planet
-
-        def frames():
-            for mx, my, px, py in zip(self.mx, self.my, self.px, self.py):
-                yield mx, my, px, py
-
-        pbar = tqdm(total=len(self.mx))
-        ani = FuncAnimation(fig, ani, frames=frames, save_count=int(1e15), blit=True)
-        return ani
-
+    def video(self, time, limb_darkening=True, teff=6000, planet_color="black", moon_color="black", ld_circles=100):
+        """matplotlib animation of the transit (pandoramoon.video.transit_video); save it with
+        video.save("video.mp4", fps=25, dpi=200). Also sets self.flux_planet, flux_moon, flux_total, px, py, mx, my."""
+        from pandoramoon.video import transit_video
+        (self.flux_planet, self.flux_moon, self.flux_total,
+         self.px, self.py, self.mx, self.my) = self._evaluate(time)
+        return transit_video(self.px, self.py, self.mx, self.my, self.u1, self.u2, self.r_planet, self.r_moon,
+                             limb_darkening=limb_darkening, teff=teff, planet_color=planet_color,
+                             moon_color=moon_color, ld_circles=ld_circles)
 
     def light_curve(self, time):
-        flux_planet, flux_moon, flux_total, px, py, mx, my = pandora(
-            self.u1,
-            self.u2,
-            self.R_star,
-
-            # Planet parameters
-            self.per_bary,
-            self.a_bary,
-            self.r_planet,
-            self.b_bary,
-            self.w_bary,
-            self.ecc_bary,
-            self.t0_bary,
-            self.t0_bary_offset,
-            self.M_planet,
-
-            # Moon parameters
-            self.r_moon,
-            self.per_moon,
-            self.tau_moon,
-            self.Omega_moon,
-            self.i_moon,
-            self.ecc_moon,
-            self.w_moon,
-            self.M_moon,
-
-            # Other model parameters
-            self.epoch_distance,
-            self.supersampling_factor,
-            self.occult_small_threshold,
-            self.hill_sphere_threshold,
-            self.numerical_grid,
-            time,
-            self.cache,
-            eclipse_pixelmap=self._eclipse_pixelmap()
-        )
+        """total, planet and moon flux at the output cadences"""
+        flux_planet, flux_moon, flux_total, px, py, mx, my = self._evaluate(time, self.cache)
         return flux_total, flux_planet, flux_moon
 
     def coordinates(self, time):
-        flux_planet, flux_moon, flux_total, px, py, mx, my = pandora(
-            self.u1,
-            self.u2,
-            self.R_star,
-
-            # Planet parameters
-            self.per_bary,
-            self.a_bary,
-            self.r_planet,
-            self.b_bary,
-            self.w_bary,
-            self.ecc_bary,
-            self.t0_bary,
-            self.t0_bary_offset,
-            self.M_planet,
-
-            # Moon parameters
-            self.r_moon,
-            self.per_moon,
-            self.tau_moon,
-            self.Omega_moon,
-            self.i_moon,
-            self.ecc_moon,
-            self.w_moon,
-            self.M_moon,
-
-            # Other model parameters
-            self.epoch_distance,
-            self.supersampling_factor,
-            self.occult_small_threshold,
-            self.hill_sphere_threshold,
-            self.numerical_grid,
-            time,
-            eclipse_pixelmap=self._eclipse_pixelmap()
-        )
+        """sky positions of the planet (px, py) and the moon (mx, my) [R_star] at every (supersampled) time"""
+        flux_planet, flux_moon, flux_total, px, py, mx, my = self._evaluate(time)
         return px, py, mx, my
 
 
