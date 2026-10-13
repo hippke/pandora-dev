@@ -1116,16 +1116,64 @@ def split_half_ks(rs, sub=40_000, seed=0, post_map=None):
     return float(d[j]), j
 
 
-def failed_runs(rs, dl_max=5.0, dz_min=2.0):
+# ---------------------------------------------------------------------------------------------
+# The decision rules of fit() (Round 23: consolidated from Rounds 8-21). Four rules, one per question:
+#   1 done?            the result arm's lnZ error <= lz_tol, split-half KS <= ks_tol, >= min_runs runs, and at most
+#                      failed_max of the runs failed (failed_runs) -- plus rule 2 passed
+#   2 chains long?     the arms at N and N / 2 agree (dlnZ, KS with a permutation null); else nsteps x 2
+#   3 excess scatter?  per-run lnZ sd > scatter_ratio x quoted: nsteps x 2 if the N / 2 arm scatters more, else n_live x 2
+#   4 better solution? a gap in the runs' lnZ with higher maxL above it: n_live x 2
+# Once rule 3 / 4 sent a fit to more live points, nsteps is never doubled again. Each value: where it came from.
+FIT_RULES = dict(
+    runs_gate=4,          # min runs per arm before an arm statistic is used (also max(4, min_runs / 2))
+    bias_pass=2.0,        # rule 2 pass: |dlnZ| + sigma <= 2 lz_tol (Round 8, known-Z tests: bias(N) <~ dlnZ)
+    bias_esc=2.0,         # rule 2 escalate (imprecise tier): |dlnZ| - k sigma > 2 lz_tol (Round 16) ...
+    k_sig=2.0,            # ... with k = 2 ...
+    k_sig_few=3.0,        # ... or 3 while an arm has < min_runs runs (sd from few runs is unreliable; Round 16)
+    precise_sigma=0.6,    # rule 2 escalate (precise tier, result arm converged and sigma <= 0.6 lz_tol):
+    precise_esc=1.0,      #   |dlnZ| - sigma > 1 lz_tol (Round 16; one threshold cannot do both: Round 23 pool scan)
+    ks_runs=2,            # rule 2 KS escalation on the median null only with >= 2 min_runs runs per arm (Round 16)
+    scatter_ratio=2.75,   # rule 3: normal 1.1-2.1 x quoted at nsteps 64 (67 pools); 0 % false at 32 runs (Round 21)
+    scatter_runs_min=16,  # rule 3 needs >= max(16, 2 min_runs) runs (heavy-tailed sd of few runs; Round 16)
+    scatter_runs_x=2,
+    scatter_falls=1.25,   # rule 3 routing: the N / 2 arm scatters >= 1.25 x more -> nsteps (Round 18)
+    gap_quoted=6.0,       # rule 4: gap > max(6 x quoted, 2 nats); normal pools: largest 3.2 x / 0.81 nats (Round 21)
+    gap_nats=2.0,
+    gap_maxl=2.0,         # rule 4: median maxL above the gap > 2 nats higher than below it
+    failed_dl=5.0,        # failed run: maxL > 5 below the best AND lnZ > max(5 MAD, 2) below the median (Round 6b)
+    failed_mad=5.0,
+    failed_dz=2.0,
+    failed_max=0.1,       # more failed runs than 10 %: not passed
+)
+
+
+def _better_solution_gap(runs, q):
+    """rule 4: the largest gap in the sorted lnZ of the runs exceeds max(gap_quoted x q, gap_nats) and the runs above
+    it reach a higher maximum likelihood (median maxL > gap_maxl higher)"""
+    FR = FIT_RULES
+    o = np.argsort([r["logz"] for r in runs])
+    zs = np.array([runs[i]["logz"] for i in o])
+    ms = np.array([runs[i]["maxL"] for i in o])
+    if len(zs) < 4:
+        return False
+    jg = int(np.argmax(np.diff(zs)))
+    gap = float(zs[jg + 1] - zs[jg])
+    higher = float(np.median(ms[jg + 1:]) - np.median(ms[:jg + 1])) > FR["gap_maxl"]
+    return bool(higher and gap > max(FR["gap_quoted"] * q, FR["gap_nats"]))
+
+
+def failed_runs(rs, dl_max=None, dz_min=None):
     """indices of runs that never found the best mode: maxL more than dl_max below the best run's AND lnZ
     more than max(5 MAD-sd, dz_min) below the median (C0 at 150 live: 2 of 10 runs at lnZ -204 vs -186)"""
+    dl_max = FIT_RULES["failed_dl"] if dl_max is None else dl_max
+    dz_min = FIT_RULES["failed_dz"] if dz_min is None else dz_min
     if len(rs) < 3:
         return []
     z = np.array([r["logz"] for r in rs])
     mL = np.array([r["maxL"] for r in rs])
     med = np.median(z)
     mad = 1.4826 * np.median(np.abs(z - med))
-    return [i for i in range(len(rs)) if mL[i] < mL.max() - dl_max and z[i] < med - max(5 * mad, dz_min)]
+    return [i for i in range(len(rs)) if mL[i] < mL.max() - dl_max and z[i] < med - max(FIT_RULES["failed_mad"] * mad, dz_min)]
 
 
 def _lnz_stats(rs):
@@ -1202,50 +1250,34 @@ ACCURACY = {"high": dict(nlive=1000, lz_tol=0.1, ks_tol=0.05, min_runs=16),
 def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=None, min_runs=None,
         max_runs=96, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True, log=None,
         post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25, data=None,
-        accuracy=None, resume=None, callback=None, check_rule="r16", run_kw=None, max_nlive=None):
-    """Nested sampling with built-in convergence checks (SAMPLING.md Rounds 6b, 8).
+        accuracy=None, resume=None, callback=None, check_rule=None, run_kw=None, max_nlive=None):
+    """Nested sampling with built-in convergence checks.
 
-    n_live escalation (Round 20, SAMPLING_REVIEW.md B3 / X4): runs that miss a compact mode bias lnZ low by up to the
-    mode's mass; longer chains do not help, more live points do. If an arm with >= max(12, min_runs) runs shows a
-    mode problem -- a heavy-tailed per-run lnZ distribution (sd > 3 x MAD-sd: a minority of runs found a better
-    mode; >= max(12, min_runs) runs) or a large scatter (sd > 2.75 x the quoted sqrt(H/n); >= max(16, 2 min_runs) runs;
-    normal at nsteps 64: 1.1-2.1) that does not fall with the chain length -- n_live is
-    doubled at the same nsteps and both arms restart (up to max_nlive, default 4 nlive); the nsteps escalation is
-    blocked in that evaluation (its dlnZ / KS tests compare which arm got the lucky runs; Round 18: a Kepler no-moon
-    fit escalated 4x to nsteps 1024 that way). At max_nlive the fit continues without escalating
-    (result "multimodal": True). Offline on run pools (subsets of 32 runs): false triggers 0 % on C0, C7, K1, HH22,
-    KZ, KZR; detection 71 % (two modes, volume 1e-2, equal mass, 1000 live), 100 % at 4000 live. If the per-run
-    variance falls like 1/n_live, a doubled n_live needs half the runs, so a false trigger costs only the discarded runs.
-    Not detectable: a mode that every run misses (the lnZ scatter is then normal).
+    Independent serial nss runs (n_live = nlive each) run in parallel threads and are merged as one run
+    (merge_weights). Two arms: the result arm at `nsteps` (default 4 ndim) and, if check=True, a check arm at
+    nsteps / 2 (a new run goes to the arm with fewer runs). After every `threads` finished runs (or earlier, when a
+    cheap scalar precheck says a decision is possible) the four rules of FIT_RULES decide:
+
+      1 done?            the result arm's lnZ error (sd / sqrt(M)) <= lz_tol, its split-half KS <= ks_tol, >= min_runs
+                         runs, rule 2 passed, and at most 10 % failed runs  ->  stop, passed=True
+      2 chains long?     pass if |dlnZ(N/2, N)| + sigma <= 2 lz_tol and the KS between the arms (noise-corrected by a
+                         permutation null) <= ks_tol; nsteps x 2 if |dlnZ| - 2 sigma > 2 lz_tol (3 sigma with few
+                         runs), or -- once the result arm meets rule 1 and sigma <= 0.6 lz_tol -- |dlnZ| - sigma > lz_tol;
+                         or if the KS clearly exceeds ks_tol
+      3 excess scatter?  per-run lnZ sd > 2.75 x the quoted sqrt(H/n): nsteps x 2 if the N / 2 arm scatters >= 1.25 x
+                         more (longer chains help), else n_live x 2
+      4 better solution? a gap in the runs' lnZ (> max(6 x quoted, 2 nats)) with a higher maxL above it: n_live x 2
+
+    On nsteps x 2 the old result arm becomes the check arm; on n_live x 2 both arms restart. Once rule 3 or 4 sent the
+    fit to more live points (result "multimodal": True), nsteps is not doubled again (the arms then differ by which
+    got the runs that found the better solution). Caps: max_nsteps (64 ndim), max_nlive (4 nlive), max_runs; at a cap
+    the fit continues to max_runs and returns passed=False if rule 1 is not met.
 
     accuracy: None (use the arguments) or a preset of ACCURACY (overrides nlive, lz_tol, ks_tol, min_runs):
-    "high" (logZ +-0.1 statistical, KS 0.05, 1000 live), "medium" (+-0.2, KS 0.08, 500 live, >= 8 runs).
-
-    Independent serial nss runs (n_live = nlive each) run in parallel threads; they are merged as one
-    run (merge_weights). Two arms: the result arm at `nsteps` (default 4 ndim) and, if check=True, a
-    check arm at nsteps / 2. Batches are added until, for the result arm,
-      - the empirical logZ error sd(lnZ_i) / sqrt(M) <= lz_tol,
-      - the split-half KS of the merged posterior <= ks_tol (max over parameters, post_map coords),
-    and, for the nsteps check, the arms agree: |lnZ(N/2) - lnZ(N)| <= max(lz_tol, 2 sigma) and
-    KS(arm N/2, arm N) <= ks_tol. If the arms disagree significantly (|dlnZ| > lz_tol and > 3 sigma,
-    or KS between the arms > max(ks_tol, 2 x the split-half KS); 1.5x triggered on noise at 6 runs, 2 ks_tol left
-    a grey zone in which C0 ran to max_runs), the chains are too short: nsteps is
-    doubled, the old result arm becomes the check arm (no runs are lost except the old check arm), and
-    sampling continues. With a bias that falls at least like 1/nsteps, dlnZ(N/2, N) bounds the
-    remaining bias at N. Stops at max_runs (result arm) with passed=False if the checks fail.
-    Returns dict(logz (merged result arm), logzerr (empirical), logzerr_boot, samples_u, runs, history,
-    passed, nsteps, dlnz_check, ...).
-
-    check_rule: "r16" (default since Round 16) or "r8" (the rule of Rounds 8-15). "r16" judges the SIZE of the
-    difference between the arms against the tolerances, not its significance (SAMPLING.md Round 16): the KS
-    distance between the arms is compared with ks_tol after removing its noise (permutation null of the arms'
-    KS, ks_null): pass the KS part if ksa^2 - median(null)^2 <= ks_tol^2, escalate if ksa^2 - max(null)^2 >
-    ks_tol^2, otherwise add runs. dlnZ: pass if |d| + sigma <= 2 lz_tol, escalate if |d| - 2 sigma > 2 lz_tol
-    (3 sigma while an arm has fewer than min_runs runs: the sd of lnZ from few runs is unreliable), grey zone
-    (own criteria met): escalate if sigma <= 0.6 lz_tol and |d| - sigma > lz_tol, or if both arms have >= 2 min_runs
-    runs and the noise-corrected KS (median null) still exceeds ks_tol; and escalate if the per-run lnZ sd exceeds
-    3.5 x the quoted sqrt(H/n) (>= max(16, 2 min_runs) runs): the chains do not mix. Offline simulations on pools of real
-    runs: false escalations C0 25 % -> 2 %, C7 47 % -> 0 % (cost -13 %), logZ unchanged.
+    "high" (lnZ +-0.1, KS 0.05, 1000 live, >= 16 runs), "medium" (+-0.2, KS 0.08, 500 live, >= 8 runs).
+    Returns dict(logz, logzerr (empirical), logzerr_boot, samples_u, runs, history, passed, nsteps, nlive,
+    multimodal, n_escalations, n_nlive_escalations, ...). Known blind spots: a chain-length bias that barely changes
+    between N / 2 and N (C7: +0.12 at 64 steps), and a mode that every run misses.
 
     Resume (Round 15, used by pandoramoon.sampling): callback(event, **kw) is called in the main thread with
     event "run" (r=run dict, nsteps=arm, idx=run index) for every finished run that enters an arm, and "state"
@@ -1256,6 +1288,9 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     flight at a crash are redone with their original seeds), and
     the checks are evaluated before any new run is started (a fit that had passed passes again at once)."""
     from concurrent.futures import ThreadPoolExecutor
+    if check_rule not in (None, "r23"):
+        raise ValueError(f"check_rule={check_rule!r}: the rules of Rounds 8-21 were consolidated in Round 23 "
+                         "(FIT_RULES); the old rules are in nss_legacy / git history")
     if accuracy is not None:
         a = ACCURACY[accuracy]
         nlive, lz_tol, ks_tol = a["nlive"], a["lz_tol"], a["ks_tol"]
@@ -1308,7 +1343,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
             return False
         sR = _lnz_stats(R)
         if sR["M"] >= min_runs and sR["err"] <= lz_tol:
-            return True                          # pass or grey-zone escalation possible
+            return True                          # pass possible
         if not check:
             return False
         C = arms.get(Nc, [])
@@ -1317,10 +1352,10 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
         sC = _lnz_stats(C)
         d = sC["mean"] - sR["mean"]
         sig = math.hypot(sR["err"], sC["err"])
-        enough = sC["M"] >= max(4, min_runs // 2) and sR["M"] >= max(4, min_runs // 2)
-        if check_rule == "r16":
-            return bool(enough and N < max_nsteps and abs(d) - 2 * sig > 2 * lz_tol)
-        return bool(enough and N < max_nsteps and abs(d) > 2 * lz_tol and abs(d) > 2.5 * sig)
+        gate = max(FIT_RULES["runs_gate"], min_runs // 2)
+        enough = sC["M"] >= gate and sR["M"] >= gate
+        return bool(enough and N < max_nsteps and not multimodal[0]
+                    and abs(d) - FIT_RULES["k_sig"] * sig > FIT_RULES["bias_esc"] * lz_tol)   # imprecise tier
 
     def evaluate(N, final=False):
         Nc = max(1, N // 2)
@@ -1338,119 +1373,83 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                  insertion_p_min=min(r["insertion"]["p"] for r in R), final=final,
                  **dict(zip(("ins_pooled_D", "ins_pooled_p", "ins_fisher_p", "ins_pooled_z"), insp)),
                  ncall=int(ncall_tot[0]), ncall_result=int(sum(r["ncall"] for r in R)))
-        ok_bias, escalate = True, False
+        FR = FIT_RULES
+        gate = max(FR["runs_gate"], min_runs // 2)            # runs per arm before an arm statistic is trusted
+        q_run = float(np.mean([r["logzerr"] for r in Rg]))
+        h.update(scatter_ratio=float(sR["sd"] / q_run) if q_run > 0 and np.isfinite(sR["sd"]) else np.nan,
+                 nlive=nlive)
+        ok_bias, esc_nsteps, esc_nlive, why = True, False, False, ""
+        sC = None
         if check:
-            sC = _lnz_stats(C) if len(C) >= 2 else dict(M=len(C), mean=np.nan, err=np.inf, good=C, n_failed=0)
+            sC = _lnz_stats(C) if len(C) >= 2 else dict(M=len(C), mean=np.nan, err=np.inf, sd=np.nan, good=C, n_failed=0)
             d = sC["mean"] - sR["mean"]
             sig = math.hypot(sR["err"], sC["err"])
             ksa, ja = _ks_sets(sC["good"], Rg, post_map, seed=len(R) + 7) if len(sC["good"]) >= 2 else (np.nan, -1)
             h.update(check_nsteps=Nc, check_runs=sC["M"], dlnz=d, dlnz_err=sig, ks_arms=ksa, ks_arms_param=ja)
-            enough = sC["M"] >= max(4, min_runs // 2) and sR["M"] >= max(4, min_runs // 2)
-            if check_rule == "r16":
-                need = bool(np.isfinite(ksa) and ksa > ks_tol)
-                if need:
-                    nl = ks_null(sC["good"], Rg, post_map, seed=len(R) + 101)
-                    med, hi = float(np.median(nl)), float(nl.max())
-                else:
-                    med = hi = 0.0
-                h.update(ks_null_med=med, ks_null_hi=hi)
-                ks_pass = (not need) or (ksa * ksa - med * med <= ks_tol * ks_tol)
-                ks_esc = need and (ksa * ksa - hi * hi > ks_tol * ks_tol)
-                k_sig = 3.0 if min(sR["M"], sC["M"]) < min_runs else 2.0
-                dl_esc = abs(d) - k_sig * sig > 2 * lz_tol
-                ok_bias = bool(abs(d) + sig <= 2 * lz_tol and ks_pass)
-                # excess scatter: per-run lnZ sd > 3.5 x the quoted sqrt(H/n) -> the chains do not mix (e.g. runs that
-                # miss modes); longer chains help (SBC draw 73: ratio ~5, logZ 1.2 too low at 64 steps; Pandora suite
-                # 1.2-2.5). Needs >= max(16, 2 min_runs) runs (the sd of lnZ from few runs is heavy-tailed).
-                q_run = float(np.mean([r["logzerr"] for r in Rg]))
-                # only if the scatter falls with the chain length (the check arm at N/2 scatters >= 1.25x more):
-                # scatter from multimodality (e.g. a moon model fitted to a light curve without a moon, Round 18:
-                # 4 escalations to nsteps 1024 without effect) is not cured by longer chains
-                sc_falls = bool(sC["M"] >= max(4, min_runs // 2) and np.isfinite(sC.get("sd", np.nan))
-                                and sC["sd"] >= 1.25 * sR["sd"])
-                sc_esc = bool(sR["M"] >= max(16, 2 * min_runs) and sR["sd"] > 3.5 * q_run and sc_falls)
-                h.update(scatter_ratio=float(sR["sd"] / q_run) if q_run > 0 else np.nan)
-                # mode problem (Round 20): heavy-tailed or nsteps-independent excess scatter in either arm
-                def mode_problem(st, runs, scatter=True):
-                    if st["M"] < max(4, min_runs // 2) or not np.isfinite(st.get("sd", np.nan)):
-                        return False
-                    q_ = float(np.mean([r["logzerr"] for r in st["good"]]))
-                    # runs that found a better solution than others (Round 21): a gap in the sorted lnZ of ALL runs of
-                    # the arm (failed_runs included) > max(6 x quoted, 2 nats) -- normal pools (67, up to 200 runs):
-                    # largest gap 3.2 x quoted, 0.81 nats -- or a gross scatter (sd > 10 x quoted; normal <= ~6 for 4
-                    # runs), AND the runs above the gap reach a higher maximum (median maxL > 2 nats higher). Chains
-                    # that are far too short also scatter grossly, but all runs reach about the same maxL; those keep
-                    # the nsteps escalation (T7)
-                    o = np.argsort([r["logz"] for r in runs])
-                    zs = np.array([runs[i]["logz"] for i in o])
-                    ms = np.array([runs[i]["maxL"] for i in o])
-                    if len(zs) >= 4:
-                        jg = int(np.argmax(np.diff(zs)))
-                        gap = float(zs[jg + 1] - zs[jg])
-                        higher = float(np.median(ms[jg + 1:]) - np.median(ms[:jg + 1])) > 2.0
-                        if higher and (gap > max(6.0 * q_, 2.0) or st["sd"] > 10.0 * q_):
-                            return True
-                    if st["M"] < max(12, min_runs):
-                        return False
-                    tail = st["sd"] > 3.0 * max(st["mad_sd"], 1e-12)
-                    big = scatter and st["M"] >= max(16, 2 * min_runs) and st["sd"] > 2.75 * q_ and not sc_falls
-                    return bool(tail or big)
-                # the scatter criterion only on the result arm: the check arm (nsteps / 2) scatters more by itself
-                # (C0 at 32 steps: 2.5 x quoted; the Round 20 suite escalated C0 and C7 on it); heavy tails on both
-                mm = mode_problem(sR, R) or (len(C) >= 2 and mode_problem(sC, C, scatter=False))
-                h.update(mode_problem=mm, nlive=nlive)
-                if mm:
-                    multimodal[0] = True
-                    if nlive < max_nlive:
-                        hist.append(h)
-                        if verbose:
-                            print(f"  fit: nsteps {N}: per-run lnZ sd {sR['sd']:.3f} (MAD-sd {sR['mad_sd']:.3f}, quoted "
-                                  f"{q_run:.3f}), check arm sd {sC.get('sd', np.nan):.3f}: mode problem -> n_live "
-                                  f"{nlive} -> {2 * nlive}", flush=True)
-                        if log:
-                            log(h)
-                        return False, "nlive", sR["M_all"]
-                    dl_esc = ks_esc = sc_esc = False      # at max_nlive: no escalation by mode-noise
-                escalate = bool(enough and N < max_nsteps and (dl_esc or ks_esc or sc_esc))
+            # rule 2 (chain length): the arms at N and N / 2 must agree. lnZ: the bias at N is bounded by
+            # dlnZ(N / 2, N) if it falls at least like 1 / nsteps (known-Z tests); KS: noise-corrected by a permutation
+            # null of the runs (Round 16)
+            need = bool(np.isfinite(ksa) and ksa > ks_tol)
+            if need:
+                nl = ks_null(sC["good"], Rg, post_map, seed=len(R) + 101)
+                med, hi = float(np.median(nl)), float(nl.max())
             else:
-                # bias at N ~ dlnZ(N/2, N) if it falls at least like 1/nsteps (known-Z tests, SAMPLING.md Round 8):
-                # pass if its ~1 sigma upper bound is <= 2 lz_tol; escalate if it is significantly above that
-                ok_bias = bool(abs(d) + sig <= 2 * lz_tol and ksa <= ks_tol)
-                escalate = bool(enough and N < max_nsteps and
-                                ((abs(d) > 2 * lz_tol and abs(d) > 2.5 * sig) or ksa > max(ks_tol, 2 * ks)))
+                med = hi = 0.0
+            h.update(ks_null_med=med, ks_null_hi=hi)
+            ks_ok = (not need) or (ksa * ksa - med * med <= ks_tol * ks_tol)
+            ok_bias = bool(abs(d) + sig <= FR["bias_pass"] * lz_tol and ks_ok)
+            enough = sC["M"] >= gate and sR["M"] >= gate
+            k_sig = FR["k_sig_few"] if min(sR["M"], sC["M"]) < min_runs else FR["k_sig"]
+            own_ok_ = bool(sR["M"] >= min_runs and ks <= ks_tol and sR["err"] <= lz_tol)
+            ks_esc = need and (ksa * ksa - hi * hi > ks_tol * ks_tol or
+                               (own_ok_ and ksa * ksa - med * med > ks_tol * ks_tol
+                                and min(sR["M"], sC["M"]) >= FR["ks_runs"] * min_runs))
+            dl_esc = (abs(d) - k_sig * sig > FR["bias_esc"] * lz_tol or
+                      (own_ok_ and sig <= FR["precise_sigma"] * lz_tol and abs(d) - sig > FR["precise_esc"] * lz_tol))
+            if enough and (dl_esc or ks_esc):
+                esc_nsteps, why = True, ("dlnZ" if dl_esc else "KS") + " between the arms"
+        # rule 3 (excess scatter): the per-run lnZ scatter far above the quoted sqrt(H/n) -> the runs do not sample
+        # alike. If the check arm (N / 2) scatters clearly more, longer chains help (nsteps); else more live points
+        if (sR["M"] >= max(FR["scatter_runs_min"], FR["scatter_runs_x"] * min_runs) and q_run > 0
+                and sR["sd"] > FR["scatter_ratio"] * q_run):
+            falls = bool(sC is not None and sC["M"] >= gate and np.isfinite(sC.get("sd", np.nan))
+                         and sC["sd"] >= FR["scatter_falls"] * sR["sd"])
+            if falls:
+                esc_nsteps, why = True, "excess scatter that falls with nsteps"
+            else:
+                esc_nlive, why = True, "excess scatter that does not fall with nsteps"
+        # rule 4 (runs that found a better solution): a gap in the sorted lnZ of all runs of an arm with the runs
+        # above it reaching a higher maximum likelihood (far-too-short chains scatter too, but reach the same maxL)
+        for runs_ in ((R, C) if check else (R,)):
+            if len(runs_) >= gate and _better_solution_gap(runs_, q_run):
+                esc_nlive, why = True, "some runs found a better solution"
+        h.update(mode_problem=bool(esc_nlive), escalation_reason=why)
+        if esc_nlive:
+            multimodal[0] = True
+        if multimodal[0]:
+            # once runs disagree like runs that miss modes, the comparison of the arms only shows which arm got the
+            # lucky runs (Kepler artefact fits escalated nsteps to 1024 on that): no nsteps escalation any more
+            esc_nsteps = False
         hist.append(h)
         if verbose:
             s = (f"  fit: nsteps {N:4d}: {sR['M']:3d} runs x {nlive} live: logZ {lzR:.3f} +- {sR['err']:.3f} "
                  f"(per-run sd {sR['sd']:.3f}, MAD-sd {sR['mad_sd']:.3f}, quoted {h['quoted']:.3f}; mean lnZ {sR['mean']:.3f}, "
-                 f"log-mean-Z {sR['zmean']:.3f}, failed runs {sR['n_failed']}), "
-                 f"split KS {ks:.3f} (p{j})")
+                 f"failed runs {sR['n_failed']}), split KS {ks:.3f} (p{j})")
             if check:
                 s += (f" | check nsteps {Nc}: {h['check_runs']} runs, dlnZ {h['dlnz']:+.3f} +- {h['dlnz_err']:.3f}, "
                       f"KS arms {h['ks_arms']:.3f} (p{h['ks_arms_param']})")
-            print(s + f", insertion p min {h['insertion_p_min']:.2g} (pooled D {h['ins_pooled_D']:.4f} p {h['ins_pooled_p']:.2g}, "
-                  f"Fisher p {h['ins_fisher_p']:.2g}), {h['wall']:.1f} s" + (" [final]" if final else ""),
-                  flush=True)
+            print(s + f", {h['wall']:.1f} s" + (" [final]" if final else ""), flush=True)
         if log:
             log(h)
-        # more than 10 % failed runs: n_live per run too small to find the best mode reliably
         own_ok = bool(sR["M"] >= min_runs and ks <= ks_tol and sR["err"] <= lz_tol)
-        passed = bool(own_ok and ok_bias and sR["n_failed"] <= 0.1 * sR["M_all"])
-        grey_r8 = check_rule != "r16" and (h.get("dlnz_err", np.inf) <= 0.6 * lz_tol or h.get("ks_arms", 0) > ks_tol)
-        grey_r16 = (check_rule == "r16" and h.get("dlnz_err", np.inf) <= 0.6 * lz_tol
-                    and abs(h.get("dlnz", 0.0)) - h.get("dlnz_err", np.inf) > lz_tol)
-        # r16 grey zone for the KS: the result arm meets its own criteria, both arms have >= 2 min_runs runs, and
-        # the noise-corrected KS (median null) still exceeds ks_tol -> by the point estimate the arms differ by more
-        # than the tolerance; doubling nsteps is cheaper than running to max_runs (SBC draws of Round 12 that
-        # needed long chains stayed undecided without it, SAMPLING.md Round 16)
-        if (check_rule == "r16" and check and h.get("ks_arms", 0) > ks_tol
-                and h["ks_arms"] ** 2 - h.get("ks_null_med", 0.0) ** 2 > ks_tol ** 2
-                and min(h.get("runs_good", 0), h.get("check_runs", 0)) >= 2 * min_runs):
-            grey_r16 = True
-        if check and own_ok and not ok_bias and N < max_nsteps and (grey_r8 or grey_r16) and not h.get("mode_problem"):
-            # grey zone (C0: dlnZ ~ 0.15-0.2 or KS arms ~ ks_tol for 50+ runs): the result arm is converged by
-            # its own criteria but the nsteps check does not pass, and the check is precise enough to say so
-            # (C7: escalated at dlnZ 0.10 +- 0.10 without the sigma condition) -> doubling nsteps is cheaper
-            escalate = True
+        passed = bool(own_ok and ok_bias and sR["n_failed"] <= FR["failed_max"] * sR["M_all"])
+        if esc_nlive and nlive < max_nlive and not final:
+            if verbose:
+                print(f"  fit: {why} -> n_live {nlive} -> {2 * nlive}", flush=True)
+            return False, "nlive", sR["M_all"]
+        escalate = bool(esc_nsteps and N < max_nsteps and not passed)
+        if escalate and verbose:
+            print(f"  fit: {why}", flush=True)
         return passed, escalate, sR["M_all"]
 
     # continuous scheduling: the pool is kept full (no batch barrier); a new run goes to the arm with fewer

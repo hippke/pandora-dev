@@ -376,19 +376,24 @@ It adds runs until all of these hold:
 - at least ``min_runs`` runs (16 / 8) and at most 10 % failed runs.
 
 The two arms always differ a little (by noise, and by small real differences well below the
-tolerances), so the check judges the *size* of their difference against the tolerances:
+tolerances), so the check judges the *size* of their difference against the tolerances: the KS distance
+between the arms is corrected for its noise (measured by randomly re-splitting the runs of both arms), and
+the ln Z difference must exceed the tolerance by a clear margin.
 
-- the KS distance between the arms is corrected for its noise, measured by randomly re-splitting the
-  runs of both arms;
-- the ln Z difference must exceed twice the tolerance by more than two standard errors (three while an
-  arm has fewer than ``min_runs`` runs).
+Four rules decide (all constants in ``pandoramoon.nss.FIT_RULES``):
 
-If the arms disagree by more than the tolerances, ``nsteps`` is doubled: the old result arm becomes the
-check arm and sampling continues. ``nsteps`` is also doubled if ln Z scatters between the runs by more
-than 3.5 times the single-run error. The chains then do not mix (e.g. runs miss modes), and both arms
-can be equally wrong. Data that need longer chains are detected and handled automatically. The checks
-are evaluated after every finished run, as soon as a pass is possible, and the fit stops at once. A fit
-that does not pass within ``max_runs`` runs is returned with ``passed=False``.
+1. **Done?** The conditions above hold: stop.
+2. **Chains long enough?** If the two arms disagree by more than the tolerances, ``nsteps`` is doubled: the
+   old result arm becomes the check arm and sampling continues.
+3. **Excess scatter?** If ln Z scatters between the runs by more than 2.75 times the single-run error, the
+   runs do not sample alike. If the shorter arm scatters clearly more, longer chains help (``nsteps``
+   doubled); otherwise the number of live points per run is doubled.
+4. **Did some runs find a better solution?** If a few runs have a clearly higher ln Z and likelihood than the
+   others, the others missed part of the posterior: the number of live points is doubled (up to
+   ``max_nlive``), and the result is flagged ``multimodal``. Chain lengths are then not increased any further.
+
+The checks are evaluated after every finished run, as soon as a decision is possible. A fit that does not
+pass within ``max_runs`` runs is returned with ``passed=False``.
 
 **What the error means.** ``logzerr`` is the statistical error of this fit; ten C0 fits with different
 seeds scattered by 0.06, against a quoted 0.07. Different sampler settings (live points, chain length)
