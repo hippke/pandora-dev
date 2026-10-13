@@ -13,7 +13,6 @@ development repository; docs/Fitting.rst.
 """
 import math
 import time as _time
-import warnings
 
 import numpy as np
 
@@ -24,25 +23,31 @@ from pandoramoon.sampling import LOGZERO, LogUniform, Normal, Prior, Uniform, _l
 
 from pandoramoon.constants import R_SUN, M_SUN, M_JUP, G, DAY  # noqa: E402  (physics.cfg)
 
-# first-look presets (SAMPLING.md Round 12, examples/firstlook/README.md): target recall of well-detectable moons
-# (reference dlnZ >= 8) -> planet run, moon runs; repeated small moon runs are cheaper than one large run
-_PLANET = dict(nlive_planet=50, nsteps_planet=12)
-RECALL_PRESETS = {0.90: dict(_PLANET, nlive_moon=50, nsteps_moon=8, repeats=1),
-                  0.95: dict(_PLANET, nlive_moon=50, nsteps_moon=8, repeats=2),
-                  0.99: dict(_PLANET, nlive_moon=50, nsteps_moon=16, repeats=3),
-                  0.999: dict(_PLANET, nlive_moon=50, nsteps_moon=16, repeats=6)}
-RETRY_BELOW, RETRY_MAX = -15.0, 2
+from pandoramoon._config import settings as _settings  # noqa: E402
+
+# settings.cfg [detect], [prepare], [priors] (the values and their sources are documented there)
+_DET = _settings()["detect"]
+_PREP = _settings()["prepare"]
+_PRI = _settings()["priors"]
+# first-look presets: target recall of well-detectable moons (reference dlnZ >= 8) -> planet run, moon runs
+# (SAMPLING.md Round 12; repeated small moon runs are cheaper than one large run)
+RECALL_PRESETS = {}
+for _k, _v in _DET.items():
+    if _k.startswith("recall_"):
+        _nl, _ns, _rep = (int(x) for x in str(_v).split())
+        RECALL_PRESETS[float(_k[7:])] = dict(nlive_planet=int(_DET["nlive_planet"]),
+                                             nsteps_planet=int(_DET["nsteps_planet"]),
+                                             nlive_moon=_nl, nsteps_moon=_ns, repeats=_rep)
+RETRY_BELOW, RETRY_MAX = float(_DET["retry_below"]), int(_DET["retry_max"])
 # epoch jackknife: a moon must not rest on one transit. Delta chi^2 (planet-only vs planet+moon, at their best
 # fits, with the likelihood's errors) without the epoch that carries most of it; >= JACK_MIN for a candidate.
-# 18 ~ 2 x (threshold 3 + Occam penalty ~6). Provisional: Kepler controls (SAMPLING.md Rounds 20-21) reached 19 in
-# one of 15 nulls; the full set of 45 nulls recalibrates it.
-JACK_MIN = 18.0
+JACK_MIN = float(_DET["jack_min"])
 
 
 # ------------------------------------------------------------------------------------------------ priors
 
 def default_priors(t0_bary, per_bary, r_planet, per_bary_err=None, a_bary=None, R_star=R_SUN, M_star=M_SUN,
-                   M_planet=M_JUP, t0_halfwidth=0.05, per_moon_max=None):
+                   M_planet=M_JUP, t0_halfwidth=None, per_moon_max=None):
     """Standard priors for a moon search around a known planet (the priors of the first-look calibration,
     scaled to the planet). Returns a dict for NestedSampler / detect; change any entry as needed.
 
@@ -55,30 +60,32 @@ def default_priors(t0_bary, per_bary, r_planet, per_bary_err=None, a_bary=None, 
     planet's Hill radius), tau 0 ... 1, Omega 0 ... 180 deg, i 0 ... 180 deg, M_moon 0 ... 0.5 M_planet.
 
     The Bayes factor depends on the moon priors (their volume sets the Occam penalty); the detection threshold of
-    detect() was calibrated with priors of this kind."""
+    detect() was calibrated with priors of this kind. The factors are in settings.cfg [priors]."""
+    Q = _PRI
     P = float(per_bary)
-    dP = max(5.0 * float(per_bary_err or 0.0), 0.002 * P)
+    dP = max(Q["per_bary_err_sigmas"] * float(per_bary_err or 0.0), Q["per_bary_min_frac"] * P)
     if a_bary is None:
         a = (G * (M_star + M_planet) * (P * DAY) ** 2 / (4 * math.pi ** 2)) ** (1 / 3) / R_star
-        a_bary = (0.977 * a, 1.023 * a)
+        a_bary = ((1 - Q["a_bary_frac"]) * a, (1 + Q["a_bary_frac"]) * a)
     k = float(r_planet)
-    pm_max = float(per_moon_max) if per_moon_max is not None else round(0.19 * P, 3)
+    pm_max = float(per_moon_max) if per_moon_max is not None else round(Q["per_moon_hill"] * P, 3)
+    th = float(t0_halfwidth) if t0_halfwidth is not None else Q["t0_halfwidth"]
     return dict(
         q1=Uniform(0, 1), q2=Uniform(0, 1),
-        R_star=Uniform(0.8 * R_star, 1.2 * R_star),
+        R_star=Uniform(Q["R_star_lo"] * R_star, Q["R_star_hi"] * R_star),
         per_bary=Uniform(P - dP, P + dP),
         a_bary=Uniform(*a_bary),
-        r_planet=Uniform(0.5 * k, 1.5 * k),
+        r_planet=Uniform(Q["r_planet_lo"] * k, Q["r_planet_hi"] * k),
         b_bary=Uniform(0, 1),
         t0_bary=float(t0_bary),
-        t0_bary_offset=Uniform(-t0_halfwidth, t0_halfwidth),
-        M_planet=Uniform(0.5 * M_planet, 1.5 * M_planet),
-        r_moon=Uniform(0.1 * k, 0.7 * k),
+        t0_bary_offset=Uniform(-th, th),
+        M_planet=Uniform(Q["M_planet_lo"] * M_planet, Q["M_planet_hi"] * M_planet),
+        r_moon=Uniform(Q["r_moon_lo"] * k, Q["r_moon_hi"] * k),
         per_moon=Uniform(0, pm_max),
         tau_moon=Uniform(0, 1),
         Omega_moon=Uniform(0, 180),
         i_moon=Uniform(0, 180),
-        M_moon=Uniform(0, 0.5 * M_planet),
+        M_moon=Uniform(0, Q["M_moon_max"] * M_planet),
     )
 
 
@@ -125,7 +132,7 @@ def cadence_times(like):
     return like.time[: n * k].reshape(n, k).mean(axis=1)
 
 
-def prepare_lightcurve(time, flux, t0, period, duration, mask=1.0, window=4.0, method="biweight",
+def prepare_lightcurve(time, flux, t0, period, duration, mask=None, window=None, method=None,
                        fit_halfwidth=None, inflate_beta=True):
     """Detrend a light curve around known transits and estimate its noise (needs wotan, ``pip install wotan``).
 
@@ -142,7 +149,11 @@ def prepare_lightcurve(time, flux, t0, period, duration, mask=1.0, window=4.0, m
     flux_err = sigma x beta if inflate_beta else sigma.
 
     Returns a dict: time, flux, flux_err (the fit windows, for Likelihood), sigma, beta, epochs (transit numbers
-    with data), and for plots: time_all, flux_all (input), trend, flat (detrended), in_window (boolean)."""
+    with data), and for plots: time_all, flux_all (input), trend, flat (detrended), in_window (boolean).
+    Defaults (mask, window, method, noise windows, beta bins): settings.cfg [prepare]."""
+    mask = float(_PREP["mask"]) if mask is None else float(mask)
+    window = float(_PREP["window"]) if window is None else float(window)
+    method = str(_PREP["method"]) if method is None else method
     try:
         from wotan import flatten
     except ImportError:
@@ -161,13 +172,14 @@ def prepare_lightcurve(time, flux, t0, period, duration, mask=1.0, window=4.0, m
     flat, trend = flatten(t, f, **kw)
     half = float(fit_halfwidth) if fit_halfwidth is not None else (0.5 * mask + 1.0) * duration
     win = (np.abs(ph) < half) & np.isfinite(flat)
-    far = np.isfinite(flat) & (np.abs(ph) > half + duration) & (np.abs(ph) < half + 11 * duration)
+    g0, g1 = _PREP["noise_gap"] * duration, (_PREP["noise_gap"] + _PREP["noise_span"]) * duration
+    far = np.isfinite(flat) & (np.abs(ph) > half + g0) & (np.abs(ph) < half + g1)
     if far.sum() < 50:
         far = np.isfinite(flat) & (np.abs(ph) > half)
     r = flat[far] - np.median(flat[far])
     sig = 1.4826 * float(np.median(np.abs(r)))
     beta = 1.0
-    key = np.floor((t[far] - t[far].min()) / (duration / 4)).astype(np.int64)
+    key = np.floor((t[far] - t[far].min()) / (duration / _PREP["beta_bins_per_t14"])).astype(np.int64)
     _, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
     mb = cnt >= 3
     if mb.sum() > 10:
@@ -231,7 +243,7 @@ def _best_params(m, U, L):
 
 # ----------------------------------------------------------------------------------------- detection
 
-def detect(likelihood, priors, recall=0.95, threshold=3.0, seed=1, jack_min=JACK_MIN, ld_correlation=0.0,
+def detect(likelihood, priors, recall=0.95, threshold=None, seed=1, jack_min=None, ld_correlation=0.0,
            verbose=False):
     """Fast moon detection test ("first look"; one core, seconds per light curve).
 
@@ -250,7 +262,9 @@ def detect(likelihood, priors, recall=0.95, threshold=3.0, seed=1, jack_min=JACK
     Returns a dict: dlnz, dlnz_err, logz_planet, logz_moon, interesting (dlnz > threshold), jackknife (see
     epoch_jackknife), candidate (interesting and the jackknife passed), moon (median and 16 / 84 % of per_moon,
     r_moon, M_moon / M_planet, i_moon from the best moon run), best (best-fit parameters of both models), warnings,
-    calls, cpu seconds, settings."""
+    calls, cpu seconds, settings. Defaults of threshold, jack_min and the presets: settings.cfg [detect]."""
+    threshold = float(_DET["threshold"]) if threshold is None else float(threshold)
+    jack_min = JACK_MIN if jack_min is None else float(jack_min)
     if recall not in RECALL_PRESETS:
         raise ValueError(f"recall must be one of {sorted(RECALL_PRESETS)}")
     st = dict(RECALL_PRESETS[recall], threshold=float(threshold))

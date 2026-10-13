@@ -380,7 +380,7 @@ tolerances), so the check judges the *size* of their difference against the tole
 between the arms is corrected for its noise (measured by randomly re-splitting the runs of both arms), and
 the ln Z difference must exceed the tolerance by a clear margin.
 
-Four rules decide (all constants in ``pandoramoon/fit_rules.cfg``, available as ``pandoramoon.nss.FIT_RULES``):
+Four rules decide (all constants in ``pandoramoon/settings.cfg``, section ``[fit_rules]``, available as ``pandoramoon.nss.FIT_RULES``):
 
 1. **Done?** The conditions above hold: stop.
 2. **Chains long enough?** If the two arms disagree by more than the tolerances, ``nsteps`` is doubled: the

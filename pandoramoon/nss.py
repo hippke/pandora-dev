@@ -932,7 +932,7 @@ def insertion_test(ranks, m, nlive, seed=0):
 def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_remain=0.01,
         max_iter=10_000_000, seed=1, scale0=1.0, threads=None, nbsub=2000, dirs="cluster",
         recluster=0.25, paxis=0.0, kpair=4, stop=None, pglob=0.0, data=None, init_reject=True,
-        init_min_draws=100_000, logx0=None, scale_gain=1.1, freeze_after=-1, minimg=False, ppca=0.0, exp_target=1.0):
+        init_min_draws=None, logx0=None, scale_gain=1.1, freeze_after=-1, minimg=False, ppca=0.0, exp_target=1.0):
     """returns dict(logz, logzerr, ncall, niter, wall, samples_u (equal weight), dead_u, dead_L, logw).
     Round 19 options (SAMPLING_REVIEW.md):
     init_reject (default True since Round 20; False = the initial live set of Rounds 1-19): draw the initial live points only where logL > PLATEAU (the LOGZERO plateau, B1) and start at
@@ -956,10 +956,11 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     ns, init = make_sampler(ll_u, parallel, data is not None)
     D = data if data is not None else (0,)
     wrapped = np.array(wrapped if wrapped is not None else [False] * ndim, dtype=np.bool_)
-    nsteps = nsteps or 4 * ndim
+    nsteps = nsteps or _FIT["nsteps_per_dim"] * ndim
     K = K or 2 * ndim
     t0 = time.perf_counter()
     ninit = nlive
+    init_min_draws = init_min_draws or _FIT["init_min_draws"]
     if init_reject:
         Us, Ls, nacc, ndraw, j = [], [], 0, 0, 0
         while nacc < nlive or ndraw < init_min_draws:
@@ -1114,22 +1115,11 @@ def split_half_ks(rs, sub=40_000, seed=0, post_map=None):
 #   3 excess scatter?  per-run lnZ sd > scatter_ratio x quoted: nsteps x 2 if the N / 2 arm scatters more, else n_live x 2
 #   4 better solution? a gap in the runs' lnZ with higher maxL above it: n_live x 2
 # Once rule 3 / 4 sent a fit to more live points, nsteps is never doubled again. The constants are in
-# fit_rules.cfg (each with its source), read once at import.
-def _load_fit_rules():
-    """FIT_RULES from fit_rules.cfg next to this file (values and their sources are documented there)"""
-    import configparser
-    import os
-    cp = configparser.ConfigParser()
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fit_rules.cfg")
-    if not cp.read(path):
-        raise FileNotFoundError(f"pandoramoon: {path} is missing (the decision rules of nss.fit)")
-    out = {}
-    for k, v in cp["fit_rules"].items():
-        out[k] = int(v) if v.strip().lstrip("-").isdigit() else float(v)
-    return out
+# settings.cfg [fit_rules] (each with its source), read once at import.
+from pandoramoon._config import settings as _settings  # noqa: E402
 
-
-FIT_RULES = _load_fit_rules()
+FIT_RULES = dict(_settings()["fit_rules"])          # settings.cfg [fit_rules] (each value with its source there)
+_FIT = _settings()["fit"]
 
 
 def _better_solution_gap(runs, q):
@@ -1221,12 +1211,12 @@ def pooled_insertion(rs):
 
 
 # accuracy presets of fit() (SAMPLING.md Round 12)
-ACCURACY = {"high": dict(nlive=1000, lz_tol=0.1, ks_tol=0.05, min_runs=16),
-            "medium": dict(nlive=500, lz_tol=0.2, ks_tol=0.08, min_runs=8)}
+ACCURACY = {a: dict(nlive=_FIT[f"{a}_nlive"], lz_tol=_FIT[f"{a}_lz_tol"], ks_tol=_FIT[f"{a}_ks_tol"],
+                    min_runs=_FIT[f"{a}_min_runs"]) for a in ("high", "medium")}    # settings.cfg [fit]
 
 
 def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=None,
-        max_runs=96, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True,
+        max_runs=None, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True,
         post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25, data=None,
         accuracy=None, resume=None, callback=None, max_nlive=None):
     """Nested sampling with built-in convergence checks.
@@ -1270,11 +1260,12 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
         a = ACCURACY[accuracy]
         nlive, lz_tol, ks_tol = a["nlive"], a["lz_tol"], a["ks_tol"]
         min_runs = min_runs or a["min_runs"]
-    nsteps = nsteps or 4 * ndim
-    max_nsteps = max_nsteps or 64 * ndim
+    max_runs = max_runs or _FIT["max_runs"]
+    nsteps = nsteps or _FIT["nsteps_per_dim"] * ndim
+    max_nsteps = max_nsteps or _FIT["max_nsteps_per_dim"] * ndim
     min_runs = min_runs or max(threads, 4)
     nlive0 = nlive
-    max_nlive = max_nlive or 4 * nlive
+    max_nlive = max_nlive or _FIT["max_nlive_factor"] * nlive
     nlesc = 0
     multimodal = [False]
     tc = time.perf_counter()

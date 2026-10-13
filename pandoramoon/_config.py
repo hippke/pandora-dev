@@ -75,6 +75,16 @@ def cache_guard():
         pass                                              # read-only installation: numba uses its own cache dir
 
 
+_SETTINGS = {}
+
+
+def settings():
+    """settings.cfg as {section: {key: value}} (read once)"""
+    if not _SETTINGS:
+        _SETTINGS.update(read_cfg("settings.cfg"))
+    return _SETTINGS
+
+
 _last_notice = [0.0]
 
 

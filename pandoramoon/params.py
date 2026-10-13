@@ -4,6 +4,9 @@ import numpy as np
 from numba import jit
 
 from pandoramoon.grids import timegrid
+from pandoramoon._config import settings
+
+_MODEL = settings()["model"]
 
 
 # Physical parameter ranges (checked before any computation). The model
@@ -125,10 +128,10 @@ class model_params(object):
         # Moons with r_moon below this use the small-body approximation
         # occult_small (bug #9: 4 ppm off at k = 0.01, 105 ppm at 0.035);
         # 0 = exact Mandel-Agol for every moon (default since bug #9 was fixed)
-        self.occult_small_threshold = 0.0
+        self.occult_small_threshold = _MODEL["occult_small_threshold"]       # settings.cfg [model]
         # moons beyond this fraction of the Hill radius are unphysical (planet-only model); the same default as
         # Likelihood and the fits (was 1.1 here until 2026-10, while docs and fits used 1.0)
-        self.hill_sphere_threshold = 1.0
+        self.hill_sphere_threshold = _MODEL["hill_sphere_threshold"]
 
 
 class time(object):

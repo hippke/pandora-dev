@@ -45,14 +45,19 @@ class Likelihood(object):
         yerr,
         epoch_distance,
         supersampling_factor=1,
-        occult_small_threshold=0.0,
-        hill_sphere_threshold=1.0,
+        occult_small_threshold=None,
+        hill_sphere_threshold=None,
         numerical_grid=None,
         cache=None,
         eclipse_method="analytic",
     ):
         # numerical_grid and eclipse_method="pixelmap" (the legacy pixel raster for limb eclipses) were removed in
         # 2026-10; the names stay so that positional calls keep working
+        from pandoramoon._config import settings
+        if occult_small_threshold is None:
+            occult_small_threshold = settings()["model"]["occult_small_threshold"]
+        if hill_sphere_threshold is None:
+            hill_sphere_threshold = settings()["model"]["hill_sphere_threshold"]
         if eclipse_method != "analytic":
             raise ValueError('eclipse_method: only "analytic" (the pixel raster "pixelmap" was removed in 2026-10)')
         if numerical_grid is not None:
