@@ -27,7 +27,7 @@ PolyChord / UltraNest's slice samplers, Neal 2003):
 - Removed: in Round 14 dirs="knn" (biased), "knnmh", "localcov" and the differential-evolution mode jumps `pjump`
   (archived in scratch_r8/archive/nss_legacy.py of the development repository, git tag nss-all-dirs); in Round 23
   (not adopted) dirs="cluster" (K-nearest-neighbour clusters, run()'s old default) and "lcov" (local covariance),
-  and the extra step types / adaptation options paxis, pglob, ppca, exp_target, scale_gain, freeze_after (git).
+  and the extra step types / adaptation options paxis, pglob, ppca, exp_target, scale_gain, freeze_after, minimg (git).
 - Slice (Neal 2003): an interval of width w = `scale` (in units of v)
   placed at random around the point, linear stepping-out by w per side
   (exact; doubling would need Neal's extra acceptance test), then
@@ -107,14 +107,13 @@ def make_sampler(ll_u, parallel, with_data=False):
         return bi[:m]
 
     @njit
-    def pair_lists(U, alive, sd, kk, M, nbr, ref, wmi):
+    def pair_lists(U, alive, sd, kk, M, nbr, ref):
         """dirs="pairs" (Round 13): nbr[q, :kk] = the kk nearest alive points to U[q] (metric scaled by sd) among
         the reference set (all alive points if n <= M, else M distinct random ones), ascending. The same lists as
         the first kk columns of the removed cluster()'s K-nearest graph (checked: test_knnfast.py), faster: scaled
         reference coordinates stored transposed, so the
         squared distances of one point to all references are summed dimension by dimension over contiguous
-        arrays (SIMD), then one selection pass keeps the kk smallest; no allocation per point.
-        wmi[i] True: minimal-image difference in dimension i (wrapped dimensions with minimg=True, Round 19 / E2)."""
+        arrays (SIMD), then one selection pass keeps the kk smallest; no allocation per point."""
         n, ndim = U.shape
         nref = refset(alive, -1, M, ref)
         inv = np.empty(ndim)
@@ -136,15 +135,9 @@ def make_sampler(ll_u, parallel, with_data=False):
             for i in range(ndim):
                 xi = U[q, i] * inv[i]
                 row = VT[i]
-                if wmi[i]:
-                    for a in range(nref):
-                        t = U[ref[a], i] - U[q, i]
-                        t = (t - math.floor(t + 0.5)) * inv[i]
-                        d[a] += t * t
-                else:
-                    for a in range(nref):
-                        t = row[a] - xi
-                        d[a] += t * t
+                for a in range(nref):
+                    t = row[a] - xi
+                    d[a] += t * t
             m = 0
             worst = np.inf
             for a in range(nref):
@@ -196,9 +189,8 @@ def make_sampler(ll_u, parallel, with_data=False):
         return nR
 
     @njit
-    def chain(U, j, L0, Lmin, nsteps, scale, wrapped, x, xn, alive, dmode, nbr, kpair, D):
-        """slice chain at fixed Lmin from U[j] (logL L0); directions: local pairs (dmode 2), with the minimal image in
-        wrapped dimensions (dmode 6; Round 19, SAMPLING_REVIEW.md E2).
+    def chain(U, j, L0, Lmin, nsteps, scale, wrapped, x, xn, alive, nbr, kpair, D):
+        """slice chain at fixed Lmin from U[j] (logL L0); directions: local pairs.
         Returns (L, ncalls, nexpand, nstuck, nmaxexp) with the end point in x; nstuck = steps whose shrink collapsed
         without an accepted point (the chain did not move), nmaxexp = step-outs that hit MAXEXP (B7)"""
         ndim = U.shape[1]
@@ -226,10 +218,7 @@ def make_sampler(ll_u, parallel, with_data=False):
             pb = nbr[pa, np.random.randint(kpair)]
             sg = 1.0 if np.random.uniform(0.0, 1.0) < 0.5 else -1.0
             for i in range(ndim):
-                dv = U[pa, i] - U[pb, i]
-                if dmode == 6 and wrapped[i]:
-                    dv -= math.floor(dv + 0.5)     # minimal image (still independent of the chain's position)
-                v[i] = sg * dv
+                v[i] = sg * (U[pa, i] - U[pb, i])
                 vv += v[i] * v[i]
             if vv == 0.0:          # duplicate points (should not happen): no direction
                 continue
@@ -299,10 +288,9 @@ def make_sampler(ll_u, parallel, with_data=False):
 
     @njit(parallel=parallel, nogil=True)
     def ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed, scale0, M, recluster, kpair,
-           stop, D, logx0, minimg):
+           stop, D, logx0):
         # Round 19 options (SAMPLING_REVIEW.md; defaults = the behaviour before): logx0 = ln X at the start (rejection
-        # init, B1); minimg = minimal image in wrapped dimensions
-        # for the pair metric, the pair directions and the metric's spread (circular sd) (E2 / X5)
+        # init, B1)
         n, ndim = U.shape
         # seeds (per thread in parallel mode: numba seeds each thread's state)
         np.random.seed(seed)
@@ -316,10 +304,6 @@ def make_sampler(ll_u, parallel, with_data=False):
         ncall = 0
         nstuck_tot = 0
         nmaxexp_tot = 0
-        wmi = np.zeros(ndim, dtype=np.bool_)
-        if minimg:
-            for i in range(ndim):
-                wmi[i] = wrapped[i]
         scale = scale0
         it = 0
         nexp_tot = 0
@@ -373,17 +357,6 @@ def make_sampler(ll_u, parallel, with_data=False):
             # spread of the live points (for the neighbour metric), every n/10 replacements
             if it % sd_every == 0:
                 for i in range(ndim):
-                    if wmi[i]:
-                        # circular spread: sqrt(-2 ln R) / (2 pi), R = |mean exp(2 pi i u)| (a seam-split clump is one clump)
-                        cs = 0.0
-                        sn = 0.0
-                        for a in range(n):
-                            cs += math.cos(2.0 * math.pi * U[a, i])
-                            sn += math.sin(2.0 * math.pi * U[a, i])
-                        R = math.sqrt(cs * cs + sn * sn) / n
-                        sd[i] = min(math.sqrt(-2.0 * math.log(max(R, 1e-300))) / (2.0 * math.pi),
-                                    0.28867513459481287) + 1e-300
-                        continue
                     mu = 0.0
                     for a in range(n):
                         mu += U[a, i]
@@ -395,7 +368,7 @@ def make_sampler(ll_u, parallel, with_data=False):
             for jj in range(k):
                 alive[sel[jj]] = False
             if repl_since >= recluster * n:
-                pair_lists(U, alive, sd, kpair, M, nbr, ref, wmi)
+                pair_lists(U, alive, sd, kpair, M, nbr, ref)
                 nrecl += 1
                 repl_since = 0
             repl_since += k
@@ -414,7 +387,7 @@ def make_sampler(ll_u, parallel, with_data=False):
                 if k > 1:
                     np.random.seed((seed * 2654435761 + it * k + c) % 4294967296)
                 Lc, nc, ne, nst, nmx = chain(U, starts[c], L[starts[c]], Lmin, nsteps, scale, wrapped, xs[c], xns[c],
-                                             alive, 6 if minimg else 2, nbr, kpair, D)
+                                             alive, nbr, kpair, D)
                 newL[c] = Lc
                 ncs[c] = nc
                 nexps[c] = ne
@@ -531,13 +504,12 @@ def insertion_test(ranks, m, nlive, seed=0):
 def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_remain=0.01,
         max_iter=10_000_000, seed=1, scale0=1.0, threads=None, nbsub=2000, dirs="pairs",
         recluster=0.25, kpair=4, stop=None, data=None, init_reject=True,
-        init_min_draws=None, logx0=None, minimg=False):
+        init_min_draws=None, logx0=None):
     """returns dict(logz, logzerr, ncall, niter, wall, samples_u (equal weight), dead_u, dead_L, logw).
     Round 19 options (SAMPLING_REVIEW.md):
     init_reject (default True since Round 20; False = the initial live set of Rounds 1-19): draw the initial live points only where logL > PLATEAU (the LOGZERO plateau, B1) and start at
       ln X0 = ln(accepted / drawn) over >= init_min_draws draws (or the given logx0, e.g. an analytic 1 - f);
       the draws are counted in ncall. Without it, plateau points enter the live set (n_plateau in the result).
-    minimg: minimal image in wrapped dimensions for the pair metric, the pair directions and the spread (E2, X5).
     data: None -> ll_u(u); a tuple D -> ll_u(u, D) (one compiled sampler for many data sets).
     dirs: "pairs" (the only direction scheme; the others were removed in Rounds 14 and 23, see the module docstring)."""
     import numba
@@ -583,7 +555,7 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
      ins, mix, nstuck, nmaxexp) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0,
                                               nbsub, recluster, kpair,
                                               stop if stop is not None else np.zeros(1, dtype=np.int64), D,
-                                              lx0, bool(minimg))
+                                              lx0)
     t2 = time.perf_counter()
     lw = dlogw + dL
     logz = float(np.logaddexp.reduce(lw))
