@@ -721,7 +721,7 @@ def _jsonable(x):
 
 
 _RUN_SCALARS = ("seed", "nlive", "logz", "logzerr", "H", "ncall", "niter", "wall", "wall_init", "ess", "maxL",
-                "final_scale", "expand_rate", "nclusters", "nclusters_max", "nrecluster", "nfallback", "dirs",
+                "final_scale", "expand_rate", "nrecluster", "dirs",
                 "insertion", "logx0", "init_acc", "init_draws", "n_plateau", "nstuck", "nmaxexp")
 
 
