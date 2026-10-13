@@ -5,13 +5,14 @@ epoch jackknife. The characterisation is ``pandoramoon.NestedSampler``.
     lc = pandora.prepare_lightcurve(time, flux, t0=..., period=..., duration=...)       # needs wotan
     like = pandora.Likelihood(lc["time"], lc["flux"], lc["flux_err"], epoch_distance=period)
     priors = pandora.default_priors(t0_bary=..., per_bary=period, r_planet=0.1)
-    det = pandora.detect(like, priors)            # seconds on one core: det["dlnz"], det["candidate"]
+    det = pandora.detect(like, priors)            # seconds: det["dlnz"], det["candidate"]
     res = pandora.NestedSampler(like, priors).run()   # minutes to hours on all cores (characterisation)
 
 Background and the calibration of the defaults: SAMPLING.md (Rounds 11-21) and DETRENDING_STUDY.md in the
 development repository; docs/Fitting.rst.
 """
 import math
+import os
 import time as _time
 
 import numpy as np
@@ -244,8 +245,8 @@ def _best_params(m, U, L):
 # ----------------------------------------------------------------------------------------- detection
 
 def detect(likelihood, priors, recall=0.95, threshold=None, seed=1, jack_min=None, ld_correlation=0.0,
-           verbose=False):
-    """Fast moon detection test ("first look"; one core, seconds per light curve).
+           verbose=False, threads=None):
+    """Fast moon detection test ("first look"; seconds of CPU time per light curve).
 
     One short nested-sampling run of the planet-only model and a few short runs of the planet+moon model (same
     priors for the shared parameters), giving the Bayes factor dlnz = ln Z(planet+moon) - ln Z(planet only), and the
@@ -256,6 +257,10 @@ def detect(likelihood, priors, recall=0.95, threshold=None, seed=1, jack_min=Non
     threshold: dlnz above which the light curve is "interesting" (3: calibrated on white-noise injections with
     priors like default_priors(): 0 false passes in 720 no-moon light curves at recall 0.95; for real light curves
     use errors with the red-noise factor, see prepare_lightcurve).
+    threads: the planet run and the moon runs are independent and run in parallel threads: None (default) = as many
+    as there are runs (1 + repeats: 3 at recall 0.95, 7 at 0.999), at most the number of cores; 1 = one after the
+    other (e.g. when you already run one detect per core). The result does not depend on it (fixed seed per run);
+    retries, if any, run after them.
     The evidences of a first look are noisy (+-0.5) and slightly biased; a candidate must be confirmed with the full
     fit (NestedSampler).
 
@@ -276,8 +281,17 @@ def detect(likelihood, priors, recall=0.95, threshold=None, seed=1, jack_min=Non
     def run(m, nlive, nsteps, sd):
         return nss.run(_loglike, m.ndim, wrapped=m.wrapped, nlive=nlive, nsteps=nsteps, seed=sd, dirs="pairs",
                        kpair=4, data=m.D)
-    rp = run(mp, st["nlive_planet"], st["nsteps_planet"], seed)
-    rms = [run(mm, st["nlive_moon"], st["nsteps_moon"], seed + 7 + 101 * j) for j in range(st["repeats"])]
+    jobs = [(mp, st["nlive_planet"], st["nsteps_planet"], seed)]
+    jobs += [(mm, st["nlive_moon"], st["nsteps_moon"], seed + 7 + 101 * j) for j in range(st["repeats"])]
+    nth = max(1, min(len(jobs), int(threads) if threads else (os.cpu_count() or 1)))
+    if nth > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        nss.make_sampler(_loglike, False, True)      # one sampler for all threads (numba releases the GIL in it)
+        with ThreadPoolExecutor(max_workers=nth) as ex:
+            res = list(ex.map(lambda a: run(*a), jobs))
+    else:
+        res = [run(*a) for a in jobs]
+    rp, rms = res[0], res[1:]
 
     def lz_moon(rs):
         lz = float(np.logaddexp.reduce([r["logz"] for r in rs]) - math.log(len(rs)))
@@ -318,7 +332,7 @@ def detect(likelihood, priors, recall=0.95, threshold=None, seed=1, jack_min=Non
                logz_moon=lzm, logz_moon_runs=[r["logz"] for r in rms], interesting=interesting, jackknife=jk,
                candidate=bool(interesting and jk["passed"]), moon=summ, best=dict(moon=bm, planet=bp), warnings=warn,
                calls=int(rp["ncall"] + sum(r["ncall"] for r in rms)), cpu=_time.process_time() - c0,
-               wall=_time.perf_counter() - w0, retries=nretry, settings=dict(st, recall=recall, jack_min=jack_min))
+               wall=_time.perf_counter() - w0, retries=nretry, settings=dict(st, recall=recall, jack_min=jack_min, threads=nth))
     if verbose:
         print(f"detect: dlnZ = {dl:+.2f} +- {out['dlnz_err']:.2f} (threshold {threshold}); jackknife: "
               f"{jk['dchi2_without_top']:.1f} without the strongest transit (need >= {jack_min}); "

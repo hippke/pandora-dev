@@ -60,7 +60,7 @@ A search has two stages: a fast **detection** test for every light curve, and th
    lc = pandora.prepare_lightcurve(time, flux, t0=t0, period=P, duration=T14)   # needs wotan
    like = pandora.Likelihood(lc["time"], lc["flux"], lc["flux_err"], epoch_distance=P)
    priors = pandora.default_priors(t0_bary=t0, per_bary=P, r_planet=0.1)
-   det = pandora.detect(like, priors)            # seconds on one core
+   det = pandora.detect(like, priors)            # seconds
    if det["candidate"]:
        results = pandora.NestedSampler(like, priors).run()
 
@@ -84,8 +84,10 @@ A search has two stages: a fast **detection** test for every light curve, and th
 .. function:: detect(likelihood, priors, recall=0.95, threshold=3.0, seed=1, jack_min=18, ld_correlation=0.0, verbose=False)
 
    A first look: one short nested-sampling run of the planet-only model and a few of the planet+moon model
-   (one core, seconds). ``recall`` (0.90, 0.95, 0.99, 0.999) is the fraction of clearly detectable moons the
-   settings are calibrated to find (0.35 / 0.6 / 1.6 / 3.1 CPU-s per light curve in the calibration).
+   (seconds). ``recall`` (0.90, 0.95, 0.99, 0.999) is the fraction of clearly detectable moons the
+   settings are calibrated to find (0.35 / 0.6 / 1.6 / 3.1 CPU-s per light curve in the calibration). The runs are
+   independent and run in parallel threads (``threads=None``: one per run, at most the number of cores; the result
+   does not depend on it); use ``threads=1`` when you already run one ``detect`` per core.
    Returns a dict with ``dlnz`` (noisy, ±0.5), ``interesting`` (``dlnz > threshold``), ``jackknife``,
    ``candidate`` (interesting and the jackknife passed), ``moon`` (rough median and 68 % range of the moon's
    period, radius, mass ratio, inclination), ``best`` (best-fit parameters of both models), ``warnings``.
