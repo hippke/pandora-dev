@@ -1,5 +1,5 @@
 import numpy as np
-from numpy import sqrt, pi, arcsin, cos, degrees
+from numpy import sqrt, pi
 from numba import jit
 
 # Pandora
@@ -9,11 +9,11 @@ from pandoramoon.ellipse import (
     ellipse_subruns,
     subrun_cell_dt, subruns_pay, ellipse_ecc_z_runs
 )
-from pandoramoon.occult import occult, occult_small, occult_hybrid, occult_hybrid_z2, create_occult_cache, read_occult_cache
+from pandoramoon.occult import occult_small, occult_hybrid_z2, create_occult_cache, read_occult_cache
 from pandoramoon.helpers import resample
 from pandoramoon.constants import G as G_GRAV, DAY
 from pandoramoon.grids import (
-    timegrid, x_bary_grid, x_bary_window, x_bary_window_sorted, x_bary_window_sorted_t,
+    timegrid, x_bary_grid, x_bary_window, x_bary_window_sorted_t,
     x_bary_runs_sorted, runs_x_t
 )
 

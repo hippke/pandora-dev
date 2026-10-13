@@ -988,12 +988,6 @@ def _gap_pass(a1, x1, y1, a2, x2, y2, ox, oy, r, c1x, c1y, mm1, c2x, c2y, mm2):
 
 
 @njit(cache=True)
-def area3_pandora_fast(xp, yp, rp, xm, ym, rm):
-    """A(star & planet & moon) in Pandora's convention, numba-jitted."""
-    return area3_fast_core(0.0, 0.0, 1.0, xp, yp, rp, xm, ym, rm)
-
-
-@njit(cache=True)
 def er_fast(xp, yp, rp, xm, ym, rm):
     """Analytic replacement for Pandora's pixelart() (optimized):
         er = min(1, A(star & planet & moon) / A(star & moon)),

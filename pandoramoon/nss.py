@@ -33,7 +33,7 @@ PolyChord / UltraNest's slice samplers, Neal 2003):
   a random live point's neighbour list (exact; no gain over "pairs").
 - Optional extra steps: a fraction `paxis` along coordinate axes, `pglob` along global pair differences.
 - Removed in Round 14 (superseded, user-approved cleanup): dirs="knn" (biased), "knnmh", "localcov" and the
-  differential-evolution mode jumps `pjump`. They are kept in pandoramoon/nss_legacy.py (same API, frozen)
+  differential-evolution mode jumps `pjump`. They are archived in scratch_r8/archive/nss_legacy.py of the development repository (same API, frozen)
   and in git (tag nss-all-dirs).
 - Slice (Neal 2003): an interval of width w = `scale` (in units of v)
   placed at random around the point, linear stepping-out by w per side
@@ -58,7 +58,6 @@ import numpy as np
 from numba import njit, prange
 
 _SAMPLERS = {}
-_HELPERS = {}
 
 
 @njit(cache=True)
@@ -888,7 +887,6 @@ def make_sampler(ll_u, parallel, with_data=False):
         return U, L
 
     _SAMPLERS[key] = (ns, init)
-    _HELPERS[key] = dict(pair_lists=pair_lists, cluster=cluster)      # for tests (test_knnfast.py)
     return ns, init
 
 
@@ -949,7 +947,7 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
       Yallup et al. 2026: the expected calls per step are minimal at ~0.74 step-outs, i.e. an interval ~1.36 chords).
     data: None -> ll_u(u); a tuple D -> ll_u(u, D) (one compiled sampler for many data sets).
     dirs: "pairs" (fit's default), "cluster", "lcov". The superseded "knn", "knnmh", "localcov" and the mode jumps
-    `pjump` were removed in Round 14; they are in pandoramoon.nss_legacy (same API) and git tag nss-all-dirs."""
+    `pjump` were removed in Round 14 (git tag nss-all-dirs; the archived module nss_legacy.py is in the development repository's scratch_r8/archive)."""
     import numba
     parallel = k > 1
     assert 1 <= k <= nlive // 4, "k (points replaced per iteration) must be <= nlive / 4"
@@ -987,7 +985,7 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     n_plateau = int(np.sum(L <= PLATEAU))
     t1 = time.perf_counter()
     if dirs not in ("cluster", "pairs", "lcov"):
-        raise ValueError(f"dirs={dirs!r}: removed in Round 14 (superseded); use pandoramoon.nss_legacy")
+        raise ValueError(f"dirs={dirs!r}: removed in Round 14 (superseded; git tag nss-all-dirs)")
     (dU, dL, dlogw, ncall, it, scale, exp_rate, nclus, nclus_max, nrecl,
      nfallback, ins, mix, nstuck, nmaxexp) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0,
                                               nbsub, {"cluster": 1, "pairs": 4, "lcov": 5}[dirs], recluster, paxis, kpair,
@@ -1067,20 +1065,12 @@ def merge_weights(rs):
     return float(np.logaddexp.reduce(lwl)), lwl
 
 
-def merge(rs, nsamp=None, seed=0, method="run"):
-    """Merge of independent runs (SAMPLING.md Round 8).
-    method="run" (default): as ONE run with sum n_i live points (merge_weights); logZ ~ mean of the runs'
-    lnZ, which is centred on the truth in the known-Z tests (test_fit_known.py). Not robust to runs that
-    never found the best mode: fit() excludes those first (failed_runs).
-    method="zmean" (Round 6b/7): each run's normalised posterior x Z_i / sum Z, logZ = log mean Z_i;
-    biased high by ~ var(lnZ_i) / 2 (Jensen; +0.1..+0.4 nats in the tests, +1.2 on C0 at nsteps 16).
-    Returns (logZ, equal-weight samples_u, ESS)."""
-    if method == "run":
-        lzm, lw = merge_weights(rs)
-    else:
-        lz = np.array([r["logz"] for r in rs])
-        lzm = np.logaddexp.reduce(lz) - math.log(len(rs))
-        lw = np.concatenate([r["logw"] + r["dead_L"] - r["logz"] + (r["logz"] - lzm) - math.log(len(rs)) for r in rs])
+def merge(rs, nsamp=None, seed=0):
+    """Merge of independent runs as ONE run with sum n_i live points (merge_weights; SAMPLING.md Round 8); lnZ ~
+    the mean of the runs' lnZ, centred on the truth in the known-Z tests. Not robust to runs that never found the
+    best mode: fit() excludes those first (failed_runs). (The log-mean-Z merge of Rounds 6b-7 was biased high by
+    ~var(lnZ_i) / 2 and was removed in the 2026-10-13 cleanup.) Returns (logZ, equal-weight samples_u, ESS)."""
+    lzm, lw = merge_weights(rs)
     w = np.exp(lw - np.logaddexp.reduce(lw))
     ess = float(1.0 / np.sum(w ** 2))
     n = nsamp or int(min(ess, 200_000))
@@ -1173,14 +1163,14 @@ def failed_runs(rs, dl_max=None, dz_min=None):
 
 def _lnz_stats(rs):
     """per-arm statistics over the good runs: mean / sd / MAD-sd of lnZ, err = sd / sqrt(M); also the
-    log-mean-Z (for comparison) and the number of failed runs"""
+    number of failed runs"""
     bad = set(failed_runs(rs))
     z = np.array([r["logz"] for i, r in enumerate(rs) if i not in bad])
     M = len(z)
     sd = float(z.std(ddof=1)) if M > 1 else np.nan
     mad = float(1.4826 * np.median(np.abs(z - np.median(z)))) if M > 1 else np.nan
     return dict(M=M, mean=float(z.mean()), sd=sd, err=sd / math.sqrt(M) if M > 1 else np.inf, mad_sd=mad,
-                zmean=float(np.logaddexp.reduce(z) - math.log(M)), n_failed=len(bad), M_all=len(rs),
+                n_failed=len(bad), M_all=len(rs),
                 good=[r for i, r in enumerate(rs) if i not in bad])
 
 
@@ -1230,22 +1220,15 @@ def pooled_insertion(rs):
     return D, _ks_p(D, n), p_f, z_u
 
 
-def bootstrap_logz(rs, B=40, seed=0):
-    """sd of the merged logZ over bootstrap resamples of the runs (Higson et al. 2018)"""
-    rng = np.random.default_rng(seed)
-    v = [merge_weights([rs[q] for q in rng.integers(0, len(rs), len(rs))])[0] for _ in range(B)]
-    return float(np.std(v, ddof=1))
-
-
 # accuracy presets of fit() (SAMPLING.md Round 12)
 ACCURACY = {"high": dict(nlive=1000, lz_tol=0.1, ks_tol=0.05, min_runs=16),
             "medium": dict(nlive=500, lz_tol=0.2, ks_tol=0.08, min_runs=8)}
 
 
-def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=None, min_runs=None,
-        max_runs=96, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True, log=None,
+def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=None,
+        max_runs=96, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True,
         post_map=None, paxis=0.0, kpair=4, check=True, max_nsteps=None, pglob=0.0, recluster=0.25, data=None,
-        accuracy=None, resume=None, callback=None, check_rule=None, run_kw=None, max_nlive=None):
+        accuracy=None, resume=None, callback=None, max_nlive=None):
     """Nested sampling with built-in convergence checks.
 
     Independent serial nss runs (n_live = nlive each) run in parallel threads and are merged as one run
@@ -1283,9 +1266,6 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
     flight at a crash are redone with their original seeds), and
     the checks are evaluated before any new run is started (a fit that had passed passes again at once)."""
     from concurrent.futures import ThreadPoolExecutor
-    if check_rule not in (None, "r23"):
-        raise ValueError(f"check_rule={check_rule!r}: the rules of Rounds 8-21 were consolidated in Round 23 "
-                         "(FIT_RULES); the old rules are in nss_legacy / git history")
     if accuracy is not None:
         a = ACCURACY[accuracy]
         nlive, lz_tol, ks_tol = a["nlive"], a["lz_tol"], a["ks_tol"]
@@ -1434,8 +1414,6 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 s += (f" | check nsteps {Nc}: {h['check_runs']} runs, dlnZ {h['dlnz']:+.3f} +- {h['dlnz_err']:.3f}, "
                       f"KS arms {h['ks_arms']:.3f} (p{h['ks_arms_param']})")
             print(s + f", {h['wall']:.1f} s" + (" [final]" if final else ""), flush=True)
-        if log:
-            log(h)
         own_ok = bool(sR["M"] >= min_runs and ks <= ks_tol and sR["err"] <= lz_tol)
         passed = bool(own_ok and ok_bias and sR["n_failed"] <= FR["failed_max"] * sR["M_all"])
         if esc_nlive and nlive < max_nlive and not final:
@@ -1473,7 +1451,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, batch=Non
                 flag = np.zeros(1, dtype=np.int64)
                 inflight[ex.submit(run, ll_u, ndim, wrapped=wrapped, nlive=nlive, nsteps=ns, k=1, seed=sd, dirs=dirs,
                                    frac_remain=frac_remain, paxis=paxis, kpair=kpair, stop=flag, pglob=pglob,
-                                   recluster=recluster, data=data, **(run_kw or {}))] = (ns, flag, idx)
+                                   recluster=recluster, data=data)] = (ns, flag, idx)
 
         def escalate_nlive():
             nonlocal nlive, nlesc

@@ -139,25 +139,3 @@ class Reparam:
     def __repr__(self):
         return (f"Reparam(pb {self.pb_min}..{self.pb_max} d, p_max {self.P_MAX} d, p_lo {self.P_LO} d: "
                 f"m {self.M_MIN}..{self.M_MAX})")
-
-
-# ---- the notebook's default instance (module-level API used by the existing scripts) ----
-DEFAULT = Reparam(360.25, 370.25, p_max=50.0, p_lo=0.05, e_c=1)
-P_MAX, P_LO = DEFAULT.P_MAX, DEFAULT.P_LO
-PB_MIN, PB_MAX = DEFAULT.pb_min, DEFAULT.pb_max
-M_MIN, M_MAX, Q, CDF = DEFAULT.M_MIN, DEFAULT.M_MAX, DEFAULT.Q, DEFAULT.CDF
-E_C = DEFAULT.e_c
-m_of_u = DEFAULT.m_of_u
-to_native = DEFAULT.to_native
-
-
-def to_native_vec(per_bary, t0_bary, t0_off, phi_c, delta, u_m, e_c=E_C):
-    return DEFAULT.to_native_vec(per_bary, t0_bary, t0_off, phi_c, delta, u_m, e_c)
-
-
-def from_native_vec(per_bary, t0_bary, t0_off, per_moon, tau, e_c=E_C):
-    return DEFAULT.from_native_vec(per_bary, t0_bary, t0_off, per_moon, tau, e_c)
-
-
-def new_to_native_samples(samples, t0_bary=11.0, e_c=E_C):
-    return DEFAULT.new_to_native_samples(samples, t0_bary, e_c)

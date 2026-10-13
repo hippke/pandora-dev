@@ -1,5 +1,5 @@
 import numpy as np
-from numpy import sqrt, pi, arccos, abs, log, ceil
+from numpy import sqrt, pi, arccos, abs, log
 from numba import jit
 
 from pandoramoon.trig import acos_poly
@@ -117,24 +117,6 @@ def occult_small(zs, k, u1, u2):
             if f[j] > 1:
                 f[j] = 1
     return f
-
-
-@jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def occult_small_single_value(z, k, u1, u2):
-    """Small body approximation by Mandel-Agol. Adequate for k<~0.01
-    This version does not calculate an entire array, but just one value.
-    (Until P3 it was used by occult_hybrid's small-body interpolation zone,
-    bug #28; kept for API compatibility.)"""
-    s = 2 * pi * 1 / 12 * (-2 * u1 - u2 + 6)
-    m = sqrt(1 - min(z**2, 1))
-    limb_darkening = 1 - u1 * (1 - m) - u2 * (1 - m) ** 2
-    area = cci(1, k, z)
-    flux = (s - limb_darkening * area) * (1 / s)
-
-    # Some combinations of (u1,u2) cause flux>1 which is unphysical
-    if flux > 1:
-        flux = 1
-    return flux
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
@@ -285,8 +267,9 @@ def occult(zs, k, u1, u2):
     -------
     Transit model evaluated at `z`.
     """
-    # No k -> 0.5 snap for |k - 0.5| < 1e-4 any more (bug #30: up to 150 ppm);
-    # the Case V/VI values below are overwritten by Case III/IV anyway
+    # No k -> 0.5 snap for |k - 0.5| < 1e-4 any more (bug #30: up to 150 ppm). The Case V/VI branch (edge of the
+    # body at the disk centre) was removed in the 2026-10-13 cleanup: its values were always overwritten by
+    # Case III/IV
     INV_PI = 1 / pi
     k2 = k**2
     lzs = len(zs)
@@ -334,32 +317,6 @@ def occult(zs, k, u1, u2):
         # Occulting object transits the source star (but doesn't completely cover it):
         if z <= 1 - k:
             le[i] = k2
-
-        # Edge of occulting body lies at the origin: special expressions in this case:
-        if abs(z - k) <= 1e-4 * (z + k):
-            # ! Table 3, Case V.:
-            if k == 0.5:
-                ld[i] = 1 / 3 - 4 * INV_PI / 9
-                ed[i] = 3 / 32
-            elif z > 0.5:
-                ld[i] = (
-                    1 / 3
-                    + 16 * k / 9 * INV_PI * (2 * k2 - 1) * ellec(0.5 / k)
-                    - (32 * k**4 - 20 * k2 + 3) / 9 * INV_PI / k * ellk(0.5 / k)
-                )
-                dist = sqrt((1 - x1) * (x2 - 1))
-                ed[i] = (
-                    1
-                    / 2
-                    * INV_PI
-                    * (kap1 + k2 * (k2 + 2 * z2) * kap0 - (1 + 5 * k2 + z2) / 4 * dist)
-                )
-            elif z < 0.5 and 2 * k < 1:
-                # ! Table 3, Case VI. (needs modulus 2k < 1):
-                ld[i] = 1 / 3 + 2 / 9 * INV_PI * (
-                    4 * (2 * k2 - 1) * ellec(2 * k) + (1 - 4 * k2) * ellk(2 * k)
-                )
-                ed[i] = k2 / 2 * (k2 + 2 * z2)
 
         # Occulting body partly occults the source and crosses the limb:
         # Table 3, Case III. Written as the complement of Case IV below
@@ -446,192 +403,11 @@ KC_MIN = 1e-150
 Z_K_MIN = 1e-150
 
 
-# ---------------------------------------------------------------------------
-# P14: interior series for bodies fully on the star (z + k < 1)
-#
-# With quadratic limb darkening I(mu) = (1 - u1 - u2) + (u1 + 2 u2) mu - u2 mu^2,
-# mu = sqrt(1 - r^2), the blocked flux of a disk of radius k fully on the star
-# needs only the disk means <mu^2> = 1 - z^2 - k^2 / 2 (exact) and <mu>:
-#   F = 1 - k^2 Omega [(1 - u1 - u2) + (u1 + 2 u2) <mu> - u2 <mu^2>].
-# For <mu>, write a point of the disk as z + rho (cos phi, sin phi), rho <= k:
-#   mu = sqrt(w) sqrt(1 - eps),  w = 1 - z^2,  eps = (2 z rho cos phi + rho^2) / w,
-#   sqrt(1 - eps) = 1 - sum_{m>=1} b_m eps^m,  b_m = |binom(1/2, m)| > 0,
-#   <eps^m> = v^m sum_{l even <= m} G_{m,l} z^l k^(2m-l),  v = 1 / w,
-#   G_{m,l} = binom(m, l) binom(l, l/2) 2 / (2m - l + 2) >= 0
-# (disk average: <cos^l phi> = binom(l, l/2) / 2^l for even l, 0 for odd l;
-# <rho^n> = 2 k^n / (n + 2)). On the star |eps| <= e = (2 z k + k^2) / w < 1,
-# so the series converges uniformly and every averaged term is >= 0.
-# Truncated after m = M (M odd), S_M = sqrt(w) P_M(v) with P_M a polynomial of
-# degree M in v (z^l = (1 - 1/v)^(l/2) expanded), and
-#   0 <= S_M - <mu> <= sqrt(w) sum_{m>M} b_m <eps^m>
-#                   <= sqrt(w) b_{M+1} <eps^(M+1)> / (1 - e) =: bound(z)
-# (|eps|^m <= |eps|^(M+1) e^(m-M-1), b_m non-increasing, M + 1 even so
-# <|eps|^(M+1)> = <eps^(M+1)>). bound(z) increases with z (sqrt(w) v^(M+1),
-# z^l and 1 / (1 - e) all do), so checking it at a single cut z_c covers all
-# z < z_c: occult_hybrid uses the series for 0 <= z < z_c, where
-# k^2 |Omega (u1 + 2 u2)| bound(z_c) <= SERIES_TOL, and the exact kernel
-# elsewhere. Independent check (mpmath disk quadrature) in the unit tests.
-# ---------------------------------------------------------------------------
-SERIES_M = 11          # truncation order (odd); P_M has degree 11 in v
-SERIES_TOL = 1e-8      # max. flux error of the series (0.01 ppm)
-SERIES_E_MAX = 0.99    # cap of e = (2 z k + k^2) / (1 - z^2) at the cut
-
-
-def _series_tables(M):
-    """(alpha, b_{M+1}, G_{M+1, l} for l = 0, 2, ..., M+1) of the P14 series,
-    exact rational arithmetic. alpha[j, p] is the coefficient of v^j k^(2p)
-    in P_M(v) = 1 - sum_{m=1}^{M} b_m v^m sum_l G_{m,l} z^l k^(2m-l)."""
-    from fractions import Fraction
-    from math import comb, factorial
-
-    def b(m):
-        r = Fraction(1)
-        for i in range(m):
-            r *= Fraction(1, 2) - i
-        return abs(r / factorial(m))
-
-    def G(m, l):
-        return Fraction(comb(m, l) * comb(l, l // 2) * 2, 2 * m - l + 2)
-
-    A = [[Fraction(0)] * (M + 1) for _ in range(M + 1)]
-    A[0][0] = Fraction(1)
-    for m in range(1, M + 1):
-        for l in range(0, m + 1, 2):
-            g = b(m) * G(m, l)
-            p = m - l // 2                      # k^(2m - l) = k^(2p)
-            for i in range(l // 2 + 1):         # z^l = (1 - 1/v)^(l/2)
-                A[m - i][p] -= g * comb(l // 2, i) * (-1) ** i
-    alpha = np.array([[float(x) for x in row] for row in A])
-    g_next = np.array([float(G(M + 1, l)) for l in range(0, M + 2, 2)])
-    return alpha, float(b(M + 1)), g_next
-
-
-SERIES_ALPHA, SERIES_B_NEXT, SERIES_G_NEXT = _series_tables(SERIES_M)
-# <eps^(M+1)> / e^(M+1) at z >> k (lambda = 1, see _series_bound)
-SERIES_GAMMA_1 = SERIES_G_NEXT[-1] * 0.5 ** (SERIES_M + 1)
-
-
-@jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _series_bound(z, k):
-    """Upper bound of S_M - <mu> >= 0 at 0 <= z < 1 - k (see above):
-    sqrt(w) b_{M+1} <eps^(M+1)> / (1 - e). Written as
-    <eps^(M+1)> = e^(M+1) sum_l G_l (lam/2)^l (1 - lam)^(M+1-l),
-    lam = 2 z / (2 z + k), so that no power over- or underflows."""
-    w = 1 - z * z
-    e = (2 * z * k + k * k) / w
-    if not (e < 1):
-        return 1e300  # (no inf: fastmath assumes finite values)
-    lam = 2 * z / (2 * z + k)
-    h2 = 0.25 * lam * lam
-    g2 = (1 - lam) * (1 - lam)
-    n = len(SERIES_G_NEXT)                      # (M + 1) / 2 + 1 terms
-    # s = sum_i G_{2i} h2^i g2^(n-1-i): Horner in h2, g2 powers on the way
-    s = 0.0
-    gp = 1.0
-    for i in range(n - 1, -1, -1):
-        s = s * h2 + SERIES_G_NEXT[i] * gp
-        gp *= g2
-    em = 1.0
-    for _ in range(SERIES_M + 1):
-        em *= e
-    return np.sqrt(w) * SERIES_B_NEXT * em * s / (1 - e)
-
-
-@jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _series_z_of_e(e, k):
-    """z >= 0 with (2 z k + k^2) / (1 - z^2) = e (negative: no such z)"""
-    return (np.sqrt(k * k * (1 - e) + e * e) - k) / e
-
-
-@jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _series_zcut(k, tol_mu):
-    """Cut z_c of the P14 series: _series_bound(z_c, k) <= tol_mu, verified
-    at the returned value (so, by monotonicity, for every z < z_c), and
-    usually >= 0.9 tol_mu (z_c within ~0.1 % of the largest such z).
-    Returns 0.0 if no z qualifies (no series).
-
-    Search in e = (2 z k + k^2) / (1 - z^2) (z(e) in closed form). Start
-    from the model bound(e) ~ b gamma_1 sqrt(min(1, 2k/e)) e^(M+1) / (1 - e)
-    (lam -> 1, w ~ 2k/e near the limb), then Newton steps in log-log space
-    with the model slope D = M + 1 + e / (1 - e) toward 0.97 tol_mu; 1-3
-    bound evaluations (~0.1 us)."""
-    if not (k > 0 and k < 1 and tol_mu > 0):
-        return 0.0
-    tol_mu = min(tol_mu, 1e300)
-    target = 0.97 * tol_mu
-    e = min((target / (SERIES_B_NEXT * SERIES_GAMMA_1)) ** (1.0 / (SERIES_M + 1)), SERIES_E_MAX)
-    D = (SERIES_M + 1) + e / (1 - e)
-    e = min(e * ((1 - e) / np.sqrt(min(1.0, 2 * k / e))) ** (1 / D), SERIES_E_MAX)
-    best = 0.0
-    for it in range(4):
-        z = _series_z_of_e(e, k)
-        if not (z > 0):  # e below its value k^2 at z = 0: no series
-            break
-        bnd = _series_bound(z, k)
-        if bnd <= tol_mu:
-            if z > best:
-                best = z
-            if bnd >= 0.9 * tol_mu or e >= SERIES_E_MAX or not (bnd > 0):
-                break
-        D = (SERIES_M + 1) + e / (1 - e)
-        e = min(e * (target / bnd) ** (1 / D), SERIES_E_MAX)
-    return best
-
-
-@jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _series_coeffs(k, scale):
-    """scale * coefficients a_j(k) of P_M(v) (Horner in k^2 over alpha)"""
-    k2 = k * k
-    n = SERIES_ALPHA.shape[0]
-    a = np.empty(n)
-    for j in range(n):
-        s = 0.0
-        for p in range(n - 1, -1, -1):
-            s = s * k2 + SERIES_ALPHA[j, p]
-        a[j] = s * scale
-    return a
-
-
-@jit(cache=True, nopython=True, fastmath=True, parallel=False, error_model="numpy")
-def _occult_series_batch(zb, m, a, A0, A1, flux):
-    """P14 interior series for zb[:m] (all 0 <= z < z_c < 1 - k):
-    flux = A0 + A1 z^2 - sqrt(w) P(v), P of degree SERIES_M = 11 in v = 1/w
-    with the (scaled) coefficients a; clamped at 1. Unrolled Horner so that
-    LLVM vectorises the loop (a loop over a[] would not be); ~0.9 ns per
-    sample. error_model="numpy": w > 0 here."""
-    a0 = a[0]
-    a1 = a[1]
-    a2 = a[2]
-    a3 = a[3]
-    a4 = a[4]
-    a5 = a[5]
-    a6 = a[6]
-    a7 = a[7]
-    a8 = a[8]
-    a9 = a[9]
-    a10 = a[10]
-    a11 = a[11]
-    for j in range(m):
-        z2 = zb[j] * zb[j]
-        w = 1 - z2
-        v = 1 / w
-        P = a11
-        P = P * v + a10
-        P = P * v + a9
-        P = P * v + a8
-        P = P * v + a7
-        P = P * v + a6
-        P = P * v + a5
-        P = P * v + a4
-        P = P * v + a3
-        P = P * v + a2
-        P = P * v + a1
-        P = P * v + a0
-        f = A0 + A1 * z2 - np.sqrt(w) * P
-        flux[j] = f if f < 1 else 1.0
-
-
-assert SERIES_M == 11 and SERIES_ALPHA.shape == (12, 12)  # _occult_series_batch is unrolled for 11
+# Flux accuracy target of occult_hybrid's interpolants (limb band P21b, interior P21c): their measured errors are
+# <= SERIES_TOL = 1e-8 (0.01 ppm) of the exact kernel; > 0 switches them on (0: exact kernel everywhere, tests).
+# (The rigorous P14 interior series that this name comes from was replaced by the P21c interpolant and removed
+# in the 2026-10-13 cleanup; see git history.)
+SERIES_TOL = 1e-8
 
 # P23: block length of the per-sample path's pass 1 (vectorised counts and
 # interior approximation per block; blocks without exact samples are not scanned again)
@@ -1400,16 +1176,6 @@ def _occult_hybrid(zs, k, u1, u2, series_tol):
         if ok:
             return flux
     return _occult_hybrid_samples(zs, k, u1, u2, interior, limb)
-
-
-@jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def _hybrid_zcut(k, u1, u2, series_tol):
-    """P14 series cut z_c for (k, LD) at flux tolerance series_tol (0: no
-    series). Not used by occult_hybrid since P21c (interior interpolant);
-    kept with the series as the rigorous reference of the unit tests."""
-    omega = 1 / (1 - u1 / 3 - u2 / 6)
-    den = k * k * abs((u1 + 2 * u2) * omega)  # |d flux / d <mu>|
-    return _series_zcut(k, series_tol / den if den > 1e-300 else 1e300) if series_tol > 0 else 0.0
 
 
 # P12: stretch scan. Samples of one class (off the star, interior series,
