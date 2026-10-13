@@ -1,25 +1,7 @@
-import numpy as np
 from numpy import sqrt, pi, arccos, abs, cos
 from numba import jit
 from pandoramoon.overlap_analytic import er_fast
-
-
-@jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def cci(r1, r2, d):
-    """Calculates area of asymmetric "lens" in which two circles intersect
-    Source: http://mathworld.wolfram.com/Circle-CircleIntersection.html"""
-    if r1 < d - r2:
-        return 0
-    elif r1 >= d + r2:
-        return pi * r2 ** 2
-    elif d - r2 <= -r1:
-        return pi * r1 ** 2
-    else:
-        return (
-            r2 ** 2 * arccos((d ** 2 + r2 ** 2 - r1 ** 2) / (2 * d * r2))
-            + r1 ** 2 * arccos((d ** 2 + r1 ** 2 - r2 ** 2) / (2 * d * r1))
-            - 0.5 * sqrt((-d + r2 + r1) * (d + r2 - r1) * (d - r2 + r1) * (d + r2 + r1))
-        )
+from pandoramoon.occult import cci  # circle-circle lens area (one copy for the package)
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)

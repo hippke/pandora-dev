@@ -51,7 +51,7 @@ import numpy as np
 from numba import njit
 
 from pandoramoon import nss
-from pandoramoon.pandora import pandora_loglike, pandora_loglike_planet
+from pandoramoon.kernel import pandora_loglike, pandora_loglike_planet, PLANET_ONLY_MOON
 from pandoramoon.reparam import min_physical_period
 
 from pandoramoon.constants import R_SUN  # noqa: E402  (physics.cfg)
@@ -408,7 +408,7 @@ class _Model:
         self.free = [k for k in spec if isinstance(spec[k], Prior)]
         base = np.zeros(20)
         if model == "planet":                     # Pandora's planet-only moon (orbit inside the planet)
-            base[IDX["per_moon"]] = 1e-6
+            base[IDX["per_moon"]] = PLANET_ONLY_MOON[1]
         for k, v in spec.items():
             if not isinstance(v, Prior):
                 base[IDX[{"q1": "u1", "q2": "u2"}.get(k, k)]] = v
@@ -646,18 +646,19 @@ def _cdf_np(p, x):
     if isinstance(p, LogUniform):
         return np.clip(np.log(np.maximum(x, 1e-300) / p.lo) / math.log(p.hi / p.lo), 0.0, 1.0)
     a, b, c, d = p.par()
-    from math import erfc, sqrt
-    z = (x - a) / b
-    ph = 0.5 * np.vectorize(erfc)(-z / sqrt(2.0))
-    return np.clip((ph - c) / (d - c), 0.0, 1.0)
+    return np.clip((_phi_np((x - a) / b) - c) / (d - c), 0.0, 1.0)
+
+
+def _phi_np(z):
+    """standard normal CDF at an array z (math.erfc; numpy has no erf)"""
+    return 0.5 * np.vectorize(math.erfc)(-np.asarray(z, dtype=float) / math.sqrt(2.0))
 
 
 def _mixture_table(p, mu, sg, beta, K):
     """nodes (x, CDF) of q = (1 - beta) p + beta N(mu, sg) truncated to p's support; (None, None) if the normal has
     no mass there. Note: an untruncated Normal prior is cut at +-12 sigma (mass ~1e-32 dropped)."""
     lo, hi = p.support()
-    from math import erfc, sqrt
-    Phi = lambda z: 0.5 * np.vectorize(erfc)(-np.asarray(z) / sqrt(2.0))
+    Phi = _phi_np
     glo, ghi = float(Phi((lo - mu) / sg)), float(Phi((hi - mu) / sg))
     if not ghi - glo > 1e-12 or not sg > 0:
         return None, None
@@ -968,10 +969,12 @@ class NestedSampler:
             k0 = likelihood.supersampling_factor
             if supersampling == "auto":
                 cad = cadence_of(likelihood.time) if k0 == 1 else 0.0
-                if cad >= 10.0 / 1440:
-                    likelihood = resample_likelihood(likelihood, 5)
-                    self.supersampling_note = (f"supersampling: 5 sub-exposures per cadence (cadence {1440 * cad:.1f} "
-                                               "min; supersampling='auto')")
+                from pandoramoon._config import settings
+                ss = settings()["supersampling"]
+                if cad >= ss["auto_min_cadence_min"] / 1440:
+                    likelihood = resample_likelihood(likelihood, int(ss["auto_factor"]))
+                    self.supersampling_note = (f"supersampling: {int(ss['auto_factor'])} sub-exposures per cadence "
+                                               f"(cadence {1440 * cad:.1f} min; supersampling='auto')")
             elif int(supersampling) != k0:
                 likelihood = resample_likelihood(likelihood, int(supersampling))
                 self.supersampling_note = f"supersampling: {int(supersampling)} sub-exposures per cadence"
@@ -1185,7 +1188,7 @@ class NestedSampler:
             q2 = vals.pop("q2")
             vals["u1"], vals["u2"] = 2.0 * sq * q2, sq * (1.0 - 2.0 * q2)
         if name == "planet":
-            for k, x in zip(MOON_NAMES, (0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)):
+            for k, x in zip(MOON_NAMES, PLANET_ONLY_MOON):
                 vals[k] = x
         return {k: vals[k] for k in PARAMS}
 
