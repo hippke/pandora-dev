@@ -1123,28 +1123,23 @@ def split_half_ks(rs, sub=40_000, seed=0, post_map=None):
 #   2 chains long?     the arms at N and N / 2 agree (dlnZ, KS with a permutation null); else nsteps x 2
 #   3 excess scatter?  per-run lnZ sd > scatter_ratio x quoted: nsteps x 2 if the N / 2 arm scatters more, else n_live x 2
 #   4 better solution? a gap in the runs' lnZ with higher maxL above it: n_live x 2
-# Once rule 3 / 4 sent a fit to more live points, nsteps is never doubled again. Each value: where it came from.
-FIT_RULES = dict(
-    runs_gate=4,          # min runs per arm before an arm statistic is used (also max(4, min_runs / 2))
-    bias_pass=2.0,        # rule 2 pass: |dlnZ| + sigma <= 2 lz_tol (Round 8, known-Z tests: bias(N) <~ dlnZ)
-    bias_esc=2.0,         # rule 2 escalate (imprecise tier): |dlnZ| - k sigma > 2 lz_tol (Round 16) ...
-    k_sig=2.0,            # ... with k = 2 ...
-    k_sig_few=3.0,        # ... or 3 while an arm has < min_runs runs (sd from few runs is unreliable; Round 16)
-    precise_sigma=0.6,    # rule 2 escalate (precise tier, result arm converged and sigma <= 0.6 lz_tol):
-    precise_esc=1.0,      #   |dlnZ| - sigma > 1 lz_tol (Round 16; one threshold cannot do both: Round 23 pool scan)
-    ks_runs=2,            # rule 2 KS escalation on the median null only with >= 2 min_runs runs per arm (Round 16)
-    scatter_ratio=2.75,   # rule 3: normal 1.1-2.1 x quoted at nsteps 64 (67 pools); 0 % false at 32 runs (Round 21)
-    scatter_runs_min=16,  # rule 3 needs >= max(16, 2 min_runs) runs (heavy-tailed sd of few runs; Round 16)
-    scatter_runs_x=2,
-    scatter_falls=1.25,   # rule 3 routing: the N / 2 arm scatters >= 1.25 x more -> nsteps (Round 18)
-    gap_quoted=6.0,       # rule 4: gap > max(6 x quoted, 2 nats); normal pools: largest 3.2 x / 0.81 nats (Round 21)
-    gap_nats=2.0,
-    gap_maxl=2.0,         # rule 4: median maxL above the gap > 2 nats higher than below it
-    failed_dl=5.0,        # failed run: maxL > 5 below the best AND lnZ > max(5 MAD, 2) below the median (Round 6b)
-    failed_mad=5.0,
-    failed_dz=2.0,
-    failed_max=0.1,       # more failed runs than 10 %: not passed
-)
+# Once rule 3 / 4 sent a fit to more live points, nsteps is never doubled again. The constants are in
+# fit_rules.cfg (each with its source), read once at import.
+def _load_fit_rules():
+    """FIT_RULES from fit_rules.cfg next to this file (values and their sources are documented there)"""
+    import configparser
+    import os
+    cp = configparser.ConfigParser()
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fit_rules.cfg")
+    if not cp.read(path):
+        raise FileNotFoundError(f"pandoramoon: {path} is missing (the decision rules of nss.fit)")
+    out = {}
+    for k, v in cp["fit_rules"].items():
+        out[k] = int(v) if v.strip().lstrip("-").isdigit() else float(v)
+    return out
+
+
+FIT_RULES = _load_fit_rules()
 
 
 def _better_solution_gap(runs, q):
