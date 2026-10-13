@@ -13,14 +13,16 @@ def _table_path(name):
 
 def _table_load(name, shape):
     """Offline table `name` (CSV, '#' header lines) as a C-contiguous float64
-    array of the given shape; zeros if the file does not exist (only while
-    it is being generated). Module-level arrays are compile-time constants
-    of the numba functions that read them, so after regenerating a table
-    clear the numba cache (__pycache__/*.nb*)."""
+    array of the given shape. A missing file is an error (zeros would give wrong fluxes), except while the
+    tables are being generated (environment variable PANDORA_BUILDING_TABLES=1). Module-level arrays are
+    compile-time constants of the numba functions that read them; pandoramoon's cache guard (_config.py) clears
+    the numba cache when a table file changes."""
     import os
     path = _table_path(name)
     if not os.path.exists(path):
-        return np.zeros(shape)
+        if os.environ.get("PANDORA_BUILDING_TABLES"):
+            return np.zeros(shape)
+        raise FileNotFoundError(f"pandoramoon: occultation table {path} is missing (reinstall the package)")
     T = np.ascontiguousarray(np.loadtxt(path, delimiter=",", ndmin=2), dtype=np.float64)
     assert T.shape == shape, (name, T.shape, shape)
     return T
@@ -516,7 +518,7 @@ def _limb_table_build(M=LIMB_TAB_M, kmin=LIMB_TAB_KMIN, kmax=LIMB_TAB_KMAX):
     coefficient m (in t) of the component vector C_c(k), c = 0: lex
     (u = (0, 0)), 1: ldx (u = (1, 0), omega = 1.5), 2: edx (u = (-2, 1):
     omega (lex + edx) = (lex + edx) / 1.5). Run
-    `python -c "import pandoramoon.occult as o; o._limb_table_write()"` to
+    `PANDORA_BUILDING_TABLES=1 python -c "import pandoramoon.occult as o; o._limb_table_write()"` to
     regenerate limb_table.csv (only needed if LIMB_N, the nodes, the range or
     M change), then clear the numba cache (__pycache__/*.nb*)."""
     from numpy.polynomial import chebyshev
@@ -747,7 +749,7 @@ def _int_table_build(M=INT_TAB_M, kmin=INT_TAB_KMIN, kmax=INT_TAB_KMAX):
     """(M + 1, INT_W) table of the Chebyshev coefficients (in t) of the ldx
     monomial coefficients c_j(k) (u = (1, 0): deficit = 1.5 ldx), from
     per-call builds at the M + 1 first-kind Chebyshev nodes in t. Run
-    `python -c "import pandoramoon.occult as o; o._int_table_write()"` to
+    `PANDORA_BUILDING_TABLES=1 python -c "import pandoramoon.occult as o; o._int_table_write()"` to
     regenerate interior_table.csv (only needed if INT_N, the nodes, the
     range or M change), then clear the numba cache (__pycache__/*.nb*): the
     cached functions do not notice a changed table module."""

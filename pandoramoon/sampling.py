@@ -269,20 +269,22 @@ def _to_native(per_bary, t0_bary, t0_off, phi_c, delta, u_m, e_c, CDF, M_MIN, Q,
     return per_moon, tau, math.log(per_bary / P_MAX * Q * m * (m + 1.0) / (N * N))
 
 
-# D = the data / prior tuple passed through nss: ( 0-10: Likelihood._tail without the cache,
-#   11 model (0 planet, 1 moon), 12 base[20] (fixed values), 13 nat_p, 14 nat_c, 15 nat_k, 16 nat_par (k, 4),
-#   17 ld_mode (0: q1/q2 -> u1/u2, 1: u1/u2 with the triangle cut, 2: correlated normal u1/u2, 3: fixed u),
-#   18 ld_c[2] (cube indices, mode 2), 19 ld_par[6] (m1, m2, L11, L21, L22, log norm),
-#   20 mp (moon-phase coordinates on/off), 21 mp_c[3] (cube indices of phi_c, delta, u_m), 22 CDF,
-#   23 mp_f[6] (M_MIN, Q, P_MAX, e_c, p_lo, log P_MAX), 24 pm_k (per_moon prior kind), 25 pm_par[4] )
+# D = the data / prior tuple passed through nss: ( 0-8: Likelihood._tail without the cache (0 epoch_distance,
+#   1 supersampling_factor, 2 occult_small_threshold, 3 hill_sphere_threshold, 4 time, 5 inv_var, 6 lin_terms,
+#   7 chi2_flat, 8 time_sorted), 9 model (0 planet, 1 moon), 10 base[20] (fixed values), 11 nat_p, 12 nat_c,
+#   13 nat_k, 14 nat_par (k, 4), 15 ld_mode (0: q1/q2 -> u1/u2, 1: u1/u2 with the triangle cut, 2: correlated
+#   normal u1/u2, 3: fixed u), 16 ld_c[2] (cube indices, mode 2), 17 ld_par[6] (m1, m2, L11, L21, L22, log norm),
+#   18 mp (moon-phase coordinates on/off), 19 mp_c[3] (cube indices of phi_c, delta, u_m), 20 CDF,
+#   21 mp_f[6] (M_MIN, Q, P_MAX, e_c, p_lo, log P_MAX), 22 pm_k (per_moon prior kind), 23 pm_par[4],
+#   24-26 repartition tables (tab, TX, TC) )
 
 @njit(cache=True)
 def _theta(u, D):
     """unit cube -> the 20 Pandora parameters and the log weight (LOGZERO: outside the prior)"""
-    th = D[12].copy()
+    th = D[10].copy()
     lw = 0.0
-    nat_p, nat_c, nat_k, nat_par = D[13], D[14], D[15], D[16]
-    tab, TX, TC = D[26], D[27], D[28]
+    nat_p, nat_c, nat_k, nat_par = D[11], D[12], D[13], D[14]
+    tab, TX, TC = D[24], D[25], D[26]
     for j in range(nat_p.shape[0]):
         if tab[j] < 0:
             th[nat_p[j]] = _ppf(nat_k[j], nat_par[j, 0], nat_par[j, 1], nat_par[j, 2], nat_par[j, 3], u[nat_c[j]])
@@ -291,7 +293,7 @@ def _theta(u, D):
             x, lq = _tab_ppf(TX[tab[j]], TC[tab[j]], u[nat_c[j]])
             th[nat_p[j]] = x
             lw += _logpdf(nat_k[j], nat_par[j, 0], nat_par[j, 1], nat_par[j, 2], nat_par[j, 3], x) - lq
-    ld_mode = D[17]
+    ld_mode = D[15]
     if ld_mode == 0:
         q1 = th[0]
         q2 = th[1]
@@ -301,24 +303,24 @@ def _theta(u, D):
         th[0] = 2.0 * sq * q2
         th[1] = sq * (1.0 - 2.0 * q2)
     elif ld_mode == 1 or ld_mode == 2:
-        lp = D[19]
+        lp = D[17]
         if ld_mode == 2:
-            z1 = _ndtri(u[D[18][0]])
-            z2 = _ndtri(u[D[18][1]])
+            z1 = _ndtri(u[D[16][0]])
+            z2 = _ndtri(u[D[16][1]])
             th[0] = lp[0] + lp[2] * z1
             th[1] = lp[1] + lp[3] * z1 + lp[4] * z2
         if not (th[0] >= 0.0 and th[0] + th[1] <= 1.0 and th[0] + 2.0 * th[1] >= 0.0):
             return th, LOGZERO
         lw += lp[5]
-    if D[20] == 1:
-        mc = D[21]
-        mf = D[23]
-        pm, tau, logw = _to_native(th[3], th[9], th[10], u[mc[0]], u[mc[1]], u[mc[2]], mf[3], D[22], int(mf[0]),
+    if D[18] == 1:
+        mc = D[19]
+        mf = D[21]
+        pm, tau, logw = _to_native(th[3], th[9], th[10], u[mc[0]], u[mc[1]], u[mc[2]], mf[3], D[20], int(mf[0]),
                                    mf[1], mf[2])
         if not logw > LOGZERO or pm < mf[4]:
             return th, LOGZERO
-        pp = D[25]
-        lpdf = _logpdf(D[24], pp[0], pp[1], pp[2], pp[3], pm)
+        pp = D[23]
+        lpdf = _logpdf(D[22], pp[0], pp[1], pp[2], pp[3], pm)
         if not lpdf > -math.inf:
             return th, LOGZERO
         lw += logw + lpdf + mf[5]
@@ -333,13 +335,13 @@ def _loglike(u, D):
     th, lw = _theta(u, D)
     if not lw > LOGZERO:
         return LOGZERO
-    if D[11] == 0:
+    if D[9] == 0:
         return lw + pandora_loglike_planet(th[0], th[1], th[2], th[3], th[4], th[5], th[6], th[7], th[8], th[9],
-                                           th[10], th[11], D[0], D[1], D[2], D[3], D[4], D[5], D[6], D[7], D[8],
-                                           None, D[9], D[10])
+                                           th[10], th[11], D[0], D[1], D[2], D[3], D[4], D[5], D[6], D[7],
+                                           None, D[8])
     return lw + pandora_loglike(th[0], th[1], th[2], th[3], th[4], th[5], th[6], th[7], th[8], th[9], th[10], th[11],
                                 th[12], th[13], th[14], th[15], th[16], th[17], th[18], th[19], D[0], D[1], D[2], D[3],
-                                D[4], D[5], D[6], D[7], D[8], None, D[9], D[10])
+                                D[4], D[5], D[6], D[7], None, D[8])
 
 
 @njit(cache=True)
@@ -521,9 +523,9 @@ class _Model:
         self.wrapped = wrapped
         self.ndim = len(cube)
         tail = like._tail
-        self.D = (float(tail[0]), int(tail[1]), float(tail[2]), float(tail[3]), int(tail[4]),
-                  np.ascontiguousarray(tail[5], dtype=np.float64), np.ascontiguousarray(tail[6], dtype=np.float64),
-                  np.ascontiguousarray(tail[7], dtype=np.float64), float(tail[8]), bool(tail[10]), bool(tail[11]),
+        self.D = (float(tail[0]), int(tail[1]), float(tail[2]), float(tail[3]),
+                  np.ascontiguousarray(tail[4], dtype=np.float64), np.ascontiguousarray(tail[5], dtype=np.float64),
+                  np.ascontiguousarray(tail[6], dtype=np.float64), float(tail[7]), bool(tail[9]),
                   int(model == "moon"), base,
                   np.array(nat_p, dtype=np.int64), np.array(nat_c, dtype=np.int64), np.array(nat_k, dtype=np.int64),
                   np.array(nat_par, dtype=np.float64).reshape(-1, 4),
@@ -918,7 +920,7 @@ def _data_hash(like):
     h = hashlib.sha1()
     for a in (like.time, like.inv_var, like.lin_terms):
         h.update(np.ascontiguousarray(a).tobytes())
-    h.update(repr(like._tail[:5] + (like._tail[8],) + like._tail[10:]).encode())
+    h.update(repr(like._tail[:4] + (like._tail[7],) + like._tail[9:]).encode())
     return h.hexdigest()
 
 
@@ -1029,7 +1031,7 @@ class NestedSampler:
             ok = lw > LOGZERO
             from pandoramoon.pandora import params_valid
             tail = self.likelihood._tail
-            valid = np.array([ok[i] and params_valid(*th[i], tail[0], tail[1], tail[4]) for i in range(len(th))])
+            valid = np.array([ok[i] and params_valid(*th[i], tail[0], tail[1]) for i in range(len(th))])
             if valid.mean() < 0.5:
                 raise ValueError(f"{name} model: only {100 * valid.mean():.0f} % of the prior is valid for Pandora "
                                  "(check the prior ranges, e.g. positive radii, periods and masses)")

@@ -113,7 +113,7 @@ def resample_likelihood(like, factor, exposure=None):
     data = np.where(like.inv_err > 0, like.data, np.nan)
     return Likelihood(subexposure_times(like.time, factor, exposure), data, err, epoch_distance=like.epoch_distance,
                       supersampling_factor=factor, occult_small_threshold=like.occult_small_threshold,
-                      hill_sphere_threshold=like.hill_sphere_threshold, numerical_grid=like.numerical_grid)
+                      hill_sphere_threshold=like.hill_sphere_threshold)
 
 
 def cadence_times(like):
@@ -191,7 +191,7 @@ def model_flux(like, params):
                            p["w_bary"], p["ecc_bary"], p["t0_bary"], p["t0_bary_offset"], p["M_planet"], p["r_moon"],
                            p["per_moon"], p["tau_moon"], p["Omega_moon"], p["i_moon"], p["ecc_moon"], p["w_moon"],
                            p["M_moon"], like.epoch_distance, like.supersampling_factor, like.occult_small_threshold,
-                           like.hill_sphere_threshold, like.numerical_grid, like.time)
+                           like.hill_sphere_threshold, like.time)
     return np.asarray(f)
 
 

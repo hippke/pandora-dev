@@ -101,7 +101,7 @@ def _to_native(per_bary, t0_bary, t0_off, phi_c, delta, u_m, e_c, CDF, M_MIN, Q,
 
 @njit(fastmath=False)
 def ll_moon(u, D):
-    lo, span, T0, E_C, CDF, M_MIN, Q, P_MAX, ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f, pix, tsorted = D
+    lo, span, T0, E_C, CDF, M_MIN, Q, P_MAX, ed, ssf, ost, hst, tgrid, inv_var, lin, chi2f, tsorted = D
     th = u * span + lo
     pm, tau, logw = _to_native(th[1], T0, th[5], th[8], th[9], th[10], E_C, CDF, M_MIN, Q, P_MAX)
     if not logw > -1e300:
@@ -109,19 +109,19 @@ def ll_moon(u, D):
     sq = math.sqrt(th[14])
     return logw + pandora_loglike(2.0 * sq * th[15], sq * (1.0 - 2.0 * th[15]), th[0], th[1], th[2], th[3], th[4],
                                   0.0, 0.0, T0, th[5], th[6], th[7], pm, tau, th[11], th[12], 0.0, 0.0, th[13],
-                                  ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f, None, pix, tsorted)
+                                  ed, ssf, ost, hst, tgrid, inv_var, lin, chi2f, None, tsorted)
 
 
 @njit(fastmath=False)
 def ll_planet(u, D):
-    lo, span, T0, ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f, pix, tsorted = D
+    lo, span, T0, ed, ssf, ost, hst, tgrid, inv_var, lin, chi2f, tsorted = D
     th = u * span + lo
     sq = math.sqrt(th[5])
     # pandora_loglike_planet: Pandora's planet-only path (moon orbit inside the planet) as one fused kernel; same
     # logL as a dummy physical moon up to rounding, ~2.4x faster per call (SAMPLING.md Round 12)
     return pandora_loglike_planet(2.0 * sq * th[6], sq * (1.0 - 2.0 * th[6]), R_SUN, th[0], th[1], th[2], th[3],
-                                  0.0, 0.0, T0, th[4], 1e27, ed, ssf, ost, hst, ng, tgrid, inv_var, lin, chi2f,
-                                  None, pix, tsorted)
+                                  0.0, 0.0, T0, th[4], 1e27, ed, ssf, ost, hst, tgrid, inv_var, lin, chi2f,
+                                  None, tsorted)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -142,10 +142,10 @@ class FirstLook:
         self.like = like = pandora.Likelihood(np.asarray(time, float), np.asarray(flux, float),
                                               np.asarray(flux_err, float), epoch_distance=ed,
                                               supersampling_factor=supersampling_factor, occult_small_threshold=0.0,
-                                              hill_sphere_threshold=1.0, numerical_grid=25)
+                                              hill_sphere_threshold=1.0)
         tail = like._tail
-        assert tail[9] is None
-        self._tail = tail[:9] + tail[10:]
+        assert tail[8] is None                                # the occultation cache (not used)
+        self._tail = tail[:8] + tail[9:]
         ep = np.unique(np.floor((np.asarray(time) - self.t0_bary) / ed + 0.5).astype(int))
         self.e_c = int(round(float(np.mean(ep))))
         self.ndata = len(time)

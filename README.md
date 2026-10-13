@@ -59,7 +59,7 @@ For fits (e.g. with UltraNest), use the `Likelihood` object. It precomputes the 
 ```
 like = pandora.Likelihood(time, data, yerr, epoch_distance=params.epoch_distance,
                           supersampling_factor=1, occult_small_threshold=0,
-                          hill_sphere_threshold=1.1, numerical_grid=25)
+                          hill_sphere_threshold=1.0)
 logL = like(u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
             t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
             Omega_moon, i_moon, ecc_moon, w_moon, M_moon)

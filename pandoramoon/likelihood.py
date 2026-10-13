@@ -46,15 +46,19 @@ class Likelihood(object):
         epoch_distance,
         supersampling_factor=1,
         occult_small_threshold=0.0,
-        hill_sphere_threshold=1.1,
-        numerical_grid=25,
+        hill_sphere_threshold=1.0,
+        numerical_grid=None,
         cache=None,
         eclipse_method="analytic",
     ):
-        if eclipse_method not in ("analytic", "pixelmap"):
-            raise ValueError(
-                'eclipse_method must be "analytic" or "pixelmap", got %r' % (eclipse_method,)
-            )
+        # numerical_grid and eclipse_method="pixelmap" (the legacy pixel raster for limb eclipses) were removed in
+        # 2026-10; the names stay so that positional calls keep working
+        if eclipse_method != "analytic":
+            raise ValueError('eclipse_method: only "analytic" (the pixel raster "pixelmap" was removed in 2026-10)')
+        if numerical_grid is not None:
+            import warnings
+            warnings.warn("Likelihood(numerical_grid=...) is ignored: the pixel raster was removed in 2026-10",
+                          DeprecationWarning, stacklevel=2)
         supersampling_factor = int(supersampling_factor)
         if supersampling_factor < 1:
             raise ValueError("supersampling_factor must be a positive integer")
@@ -85,15 +89,13 @@ class Likelihood(object):
         self.supersampling_factor = supersampling_factor
         self.occult_small_threshold = float(occult_small_threshold)
         self.hill_sphere_threshold = float(hill_sphere_threshold)
-        self.numerical_grid = int(numerical_grid)
         self.cache = cache
-        self.eclipse_pixelmap = eclipse_method == "pixelmap"
         # P8: fixed trailing arguments and the compiled entry point
         self._tail = (
             self.epoch_distance, self.supersampling_factor, self.occult_small_threshold,
-            self.hill_sphere_threshold, self.numerical_grid, self.time,
+            self.hill_sphere_threshold, self.time,
             self.inv_var, self.lin_terms, self.chi2_flat, self.cache,
-            self.eclipse_pixelmap, self.time_sorted,
+            self.time_sorted,
         )
         self._loglike = _compiled_loglike(self._tail)
 

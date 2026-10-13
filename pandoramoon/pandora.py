@@ -9,7 +9,7 @@ from pandoramoon.ellipse import (
     ellipse_subruns,
     subrun_cell_dt, subruns_pay, ellipse_ecc_z_runs
 )
-from pandoramoon.occult import occult_small, occult_hybrid_z2, create_occult_cache, read_occult_cache
+from pandoramoon.occult import occult_small, occult_hybrid_z2, read_occult_cache
 from pandoramoon.helpers import resample
 from pandoramoon.constants import G as G_GRAV, DAY
 from pandoramoon.grids import (
@@ -33,7 +33,6 @@ def params_valid(
     u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
     t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
     i_moon, ecc_moon, w_moon, M_moon, epoch_distance, supersampling_factor,
-    numerical_grid
 ):
     """True if all parameters are within their physical ranges:
 
@@ -45,7 +44,7 @@ def params_valid(
     - quadratic limb darkening physical (Kipping 2013: intensity positive
       and decreasing towards the limb): u1 >= 0, u1 + u2 <= 1, u1 + 2 u2 >= 0
       (the sums with 1e-12 slack for round-off of converted q1, q2);
-    - supersampling_factor >= 1, numerical_grid >= 1.
+    - supersampling_factor >= 1.
 
     Compiled without fastmath, so that the NaN / inf tests are kept (x - x
     == 0 is False for NaN and +-inf). Physical plausibility of the moon orbit
@@ -70,15 +69,14 @@ def params_valid(
         and r_planet >= 0 and r_moon >= 0 and M_moon >= 0
         and ecc_bary >= 0 and ecc_bary < 1 and ecc_moon >= 0 and ecc_moon < 1
         and u1 >= 0 and u1 + u2 <= 1 + 1e-12 and u1 + 2 * u2 >= -1e-12
-        and supersampling_factor >= 1 and numerical_grid >= 1
+        and supersampling_factor >= 1
     )
 
 
 def check_params(
     u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
     t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
-    i_moon, ecc_moon, w_moon, M_moon, epoch_distance=1.0, supersampling_factor=1,
-    numerical_grid=25
+    i_moon, ecc_moon, w_moon, M_moon, epoch_distance=1.0, supersampling_factor=1
 ):
     """Python: the list of violated physical ranges of params_valid()
     (empty if all parameters are valid), e.g. ['per_moon > 0']."""
@@ -98,7 +96,6 @@ def check_params(
         ("0 <= ecc_moon < 1", 0 <= ecc_moon < 1), ("u1 >= 0", u1 >= 0),
         ("u1 + u2 <= 1", u1 + u2 <= 1 + 1e-12), ("u1 + 2 u2 >= 0", u1 + 2 * u2 >= -1e-12),
         ("supersampling_factor >= 1", supersampling_factor >= 1),
-        ("numerical_grid >= 1", numerical_grid >= 1),
     ]
     return bad + [name for name, ok in rules if not ok]
 
@@ -142,13 +139,9 @@ class model_params(object):
         # occult_small (bug #9: 4 ppm off at k = 0.01, 105 ppm at 0.035);
         # 0 = exact Mandel-Agol for every moon (default since bug #9 was fixed)
         self.occult_small_threshold = 0.0
-        self.hill_sphere_threshold = 1.1
-        self.numerical_grid = 25
-        # Mutual eclipses with a body on the stellar limb:
-        # "analytic" (exact 3-circle overlap, default) or "pixelmap"
-        # (legacy pixel raster of size numerical_grid)
-        self.eclipse_method = "analytic"
-        self.time = None
+        # moons beyond this fraction of the Hill radius are unphysical (planet-only model); the same default as
+        # Likelihood and the fits (was 1.1 here until 2026-10, while docs and fits used 1.0)
+        self.hill_sphere_threshold = 1.0
 
 
 class time(object):
@@ -205,20 +198,8 @@ class moon_model(object):
         self.supersampling_factor = params.supersampling_factor
         self.occult_small_threshold = params.occult_small_threshold
         self.hill_sphere_threshold = params.hill_sphere_threshold
-        self.numerical_grid = params.numerical_grid
-        self.eclipse_method = getattr(params, "eclipse_method", "analytic")
-        self._eclipse_pixelmap()  # validate early
-        self.time = params.time
-        self.cache = create_occult_cache(self.u1, self.u2, dim=300)
-
-    def _eclipse_pixelmap(self):
-        if self.eclipse_method == "analytic":
-            return False
-        if self.eclipse_method == "pixelmap":
-            return True
-        raise ValueError(
-            'eclipse_method must be "analytic" or "pixelmap", got %r' % (self.eclipse_method,)
-        )
+        if getattr(params, "eclipse_method", "analytic") != "analytic":
+            raise ValueError('eclipse_method: only "analytic" (the pixel raster "pixelmap" was removed in 2026-10)')
 
     def _evaluate(self, time, cache=None):
         """pandora() for this model at the given (supersampled) time grid"""
@@ -229,7 +210,7 @@ class moon_model(object):
             self.r_moon, self.per_moon, self.tau_moon, self.Omega_moon, self.i_moon, self.ecc_moon, self.w_moon,
             self.M_moon,
             self.epoch_distance, self.supersampling_factor, self.occult_small_threshold, self.hill_sphere_threshold,
-            self.numerical_grid, time, cache, eclipse_pixelmap=self._eclipse_pixelmap())
+            time, cache)
 
     def video(self, time, limb_darkening=True, teff=6000, planet_color="black", moon_color="black", ld_circles=100):
         """matplotlib animation of the transit (pandoramoon.video.transit_video); save it with
@@ -243,7 +224,7 @@ class moon_model(object):
 
     def light_curve(self, time):
         """total, planet and moon flux at the output cadences"""
-        flux_planet, flux_moon, flux_total, px, py, mx, my = self._evaluate(time, self.cache)
+        flux_planet, flux_moon, flux_total, px, py, mx, my = self._evaluate(time)
         return flux_total, flux_planet, flux_moon
 
     def coordinates(self, time):
@@ -281,18 +262,15 @@ def pandora(
     supersampling_factor,
     occult_small_threshold,
     hill_sphere_threshold,
-    numerical_grid,
     time,
     cache=None,
-    eclipse_pixelmap=False
 ):
-    # eclipse_pixelmap=False: limb mutual eclipses via the exact analytic
-    # three-circle overlap (default); True: legacy pixelart() raster.
+    # limb mutual eclipses via the exact analytic three-circle overlap (eclipse.py, overlap_analytic.py)
     if not params_valid(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
-        supersampling_factor, numerical_grid
+        supersampling_factor
     ):
         raise ValueError(PARAMS_ERROR)
 
@@ -339,12 +317,12 @@ def pandora(
     if len(idx) == len(time):
         flux_planet, flux_moon = _window_fluxes(
             xp, yp, xm, ym, unphysical, r_planet, r_moon, u1, u2,
-            occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+            occult_small_threshold, cache
         )
     else:
         flux_planet_w, flux_moon_w = _window_fluxes(
             xp[idx], yp[idx], xm[idx], ym[idx], unphysical, r_planet, r_moon,
-            u1, u2, occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+            u1, u2, occult_small_threshold, cache
         )
         flux_planet, flux_moon = _scatter(len(time), idx, flux_planet_w, flux_moon_w)
     flux_planet, flux_moon, flux_total = _total_and_resample(
@@ -382,10 +360,8 @@ def pandora_flux(
     supersampling_factor,
     occult_small_threshold,
     hill_sphere_threshold,
-    numerical_grid,
     time,
     cache=None,
-    eclipse_pixelmap=False
 ):
     """Same arguments and fluxes as pandora(), but returns only
     (flux_planet, flux_moon, flux_total) and computes the orbit only for
@@ -396,15 +372,15 @@ def pandora_flux(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
-        supersampling_factor, numerical_grid
+        supersampling_factor
     ):
         raise ValueError(PARAMS_ERROR)
     idx, flux_planet_w, flux_moon_w = _window_model(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
-        occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
-        cache, eclipse_pixelmap, False
+        occult_small_threshold, hill_sphere_threshold, time,
+        cache, False
     )
     out_idx, fp, fm, ft = _window_cadences(
         len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
@@ -446,10 +422,8 @@ def pandora_deficit(
     supersampling_factor,
     occult_small_threshold,
     hill_sphere_threshold,
-    numerical_grid,
     time,
     cache=None,
-    eclipse_pixelmap=False
 ):
     """Same arguments as pandora_flux(), but returns the flux deficits
     (1 - flux_planet, 1 - flux_moon, 1 - flux_total) as float32 arrays
@@ -464,15 +438,15 @@ def pandora_deficit(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
-        supersampling_factor, numerical_grid
+        supersampling_factor
     ):
         raise ValueError(PARAMS_ERROR)
     idx, flux_planet_w, flux_moon_w = _window_model(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
-        occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
-        cache, eclipse_pixelmap, False
+        occult_small_threshold, hill_sphere_threshold, time,
+        cache, False
     )
     out_idx, fp, fm, ft = _window_cadences(
         len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
@@ -514,10 +488,8 @@ def pandora_window(
     supersampling_factor,
     occult_small_threshold,
     hill_sphere_threshold,
-    numerical_grid,
     time,
     cache=None,
-    eclipse_pixelmap=False,
     time_sorted=False
 ):
     """Sparse model output: same arguments as pandora_flux(), returns
@@ -532,15 +504,15 @@ def pandora_window(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
-        supersampling_factor, numerical_grid
+        supersampling_factor
     ):
         raise ValueError(PARAMS_ERROR)
     idx, flux_planet_w, flux_moon_w = _window_model(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
-        occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
-        cache, eclipse_pixelmap, time_sorted
+        occult_small_threshold, hill_sphere_threshold, time,
+        cache, time_sorted
     )
     return _window_cadences(
         len(time), idx, flux_planet_w, flux_moon_w, supersampling_factor
@@ -552,8 +524,8 @@ def pandora_loglike(
     u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
     t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
     i_moon, ecc_moon, w_moon, M_moon, epoch_distance, supersampling_factor,
-    occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
-    inv_var, lin_terms, chi2_flat, cache, eclipse_pixelmap, time_sorted
+    occult_small_threshold, hill_sphere_threshold, time,
+    inv_var, lin_terms, chi2_flat, cache, time_sorted
 ):
     """Gaussian log-likelihood -chi^2/2 of the total flux, without
     full-length arrays: chi^2 = chi2_flat + sum over window cadences of
@@ -570,15 +542,15 @@ def pandora_loglike(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
-        supersampling_factor, numerical_grid
+        supersampling_factor
     ):
         return NEG_INF
     los, his, flux_planet_w, flux_moon_w = _window_model_runs(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
         Omega_moon, i_moon, ecc_moon, w_moon, M_moon, epoch_distance,
-        occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
-        cache, eclipse_pixelmap, time_sorted
+        occult_small_threshold, hill_sphere_threshold, time,
+        cache, time_sorted
     )
     chi2 = chi2_flat + _window_chi2_runs(
         len(time), los, his, flux_planet_w, flux_moon_w, supersampling_factor,
@@ -597,8 +569,8 @@ PLANET_ONLY_MOON = (0.0, 1e-6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)  # r_moon, per_moon
 def pandora_loglike_planet(
     u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
     t0_bary, t0_bary_offset, M_planet, epoch_distance, supersampling_factor,
-    occult_small_threshold, hill_sphere_threshold, numerical_grid, time,
-    inv_var, lin_terms, chi2_flat, cache, eclipse_pixelmap, time_sorted
+    occult_small_threshold, hill_sphere_threshold, time,
+    inv_var, lin_terms, chi2_flat, cache, time_sorted
 ):
     """Log-likelihood of the planet-only model (no moon): the same value as
     pandora_loglike() with the moon parameters PLANET_ONLY_MOON (r_moon =
@@ -620,13 +592,13 @@ def pandora_loglike_planet(
             u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
             t0_bary, t0_bary_offset, M_planet, r_m, p_m, tau_m, om_m, i_m, e_m,
             w_m, m_m, epoch_distance, supersampling_factor, occult_small_threshold,
-            hill_sphere_threshold, numerical_grid, time, inv_var, lin_terms,
-            chi2_flat, cache, eclipse_pixelmap, time_sorted
+            hill_sphere_threshold, time, inv_var, lin_terms,
+            chi2_flat, cache, time_sorted
         )
     if not params_valid(
         u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
         t0_bary, t0_bary_offset, M_planet, r_m, p_m, tau_m, om_m, i_m, e_m, w_m,
-        m_m, epoch_distance, supersampling_factor, numerical_grid
+        m_m, epoch_distance, supersampling_factor
     ):
         return NEG_INF
     reach = 1 + r_planet + 1e-6          # _cull_reach() of the planet-only path
@@ -639,8 +611,8 @@ def pandora_loglike_planet(
             u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
             t0_bary, t0_bary_offset, M_planet, r_m, p_m, tau_m, om_m, i_m, e_m,
             w_m, m_m, epoch_distance, supersampling_factor, occult_small_threshold,
-            hill_sphere_threshold, numerical_grid, time, inv_var, lin_terms,
-            chi2_flat, cache, eclipse_pixelmap, time_sorted
+            hill_sphere_threshold, time, inv_var, lin_terms,
+            chi2_flat, cache, time_sorted
         )
     total = 0
     for k in range(len(los)):
@@ -823,7 +795,7 @@ def _cull_window(x_bary, reach):
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _window_fluxes(
     xp, yp, xm, ym, unphysical, r_planet, r_moon, u1, u2,
-    occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+    occult_small_threshold, cache
 ):
     """Planet and moon flux (incl. mutual eclipses) for the given samples"""
     # Squared distances of planet and moon from (0,0) = center of star (P26:
@@ -836,14 +808,14 @@ def _window_fluxes(
         z2_moon = xm * xm + ym * ym
     return _window_fluxes_z(
         xp, yp, xm, ym, z2_planet, z2_moon, unphysical, r_planet, r_moon, u1, u2,
-        occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+        occult_small_threshold, cache
     )
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
 def _window_fluxes_z(
     xp, yp, xm, ym, z2_planet, z2_moon, unphysical, r_planet, r_moon, u1, u2,
-    occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+    occult_small_threshold, cache
 ):
     """_window_fluxes() with precomputed squared distances z2_planet,
     z2_moon (P26: occult_hybrid_z2 takes z^2; only the cache and
@@ -882,7 +854,7 @@ def _window_fluxes_z(
     # limb checks; ~90 % of the draws of a fit have no mutual eclipse)
     if not unphysical and eclipse_possible(xp, yp, xm, ym, r_planet, r_moon):
         flux_moon = eclipse(
-            xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, eclipse_pixelmap,
+            xp, yp, xm, ym, r_planet, r_moon, flux_moon,
             u1, u2
         )
     return flux_planet, flux_moon
@@ -916,7 +888,7 @@ def _window_model(
     u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
     t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
     i_moon, ecc_moon, w_moon, M_moon, epoch_distance, occult_small_threshold,
-    hill_sphere_threshold, numerical_grid, time, cache, eclipse_pixelmap,
+    hill_sphere_threshold, time, cache,
     time_sorted
 ):
     """Culled model core: (ascending sample indices of the window, planet
@@ -961,7 +933,7 @@ def _window_model(
     )
     flux_planet_w, flux_moon_w = _window_fluxes_z(
         xp, yp, xm, ym, zp2, zm2, unphysical, r_planet, r_moon, u1, u2,
-        occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+        occult_small_threshold, cache
     )
     return idx, flux_planet_w, flux_moon_w
 
@@ -991,7 +963,7 @@ def _window_model_runs(
     u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary,
     t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon, Omega_moon,
     i_moon, ecc_moon, w_moon, M_moon, epoch_distance, occult_small_threshold,
-    hill_sphere_threshold, numerical_grid, time, cache, eclipse_pixelmap,
+    hill_sphere_threshold, time, cache,
     time_sorted
 ):
     """_window_model() with the window as sample runs (P18): (los, his,
@@ -1099,7 +1071,7 @@ def _window_model_runs(
         )
     flux_planet_w, flux_moon_w = _window_fluxes_z(
         xp, yp, xm, ym, zp2, zm2, no_eclipse, r_planet, r_moon, u1, u2,
-        occult_small_threshold, numerical_grid, cache, eclipse_pixelmap
+        occult_small_threshold, cache
     )
     return los, his, flux_planet_w, flux_moon_w
 

@@ -1,5 +1,5 @@
 import numpy as np
-from numpy import sqrt, pi, arccos, abs, ceil, fliplr, flipud, cos
+from numpy import sqrt, pi, arccos, abs, cos
 from numba import jit
 from pandoramoon.overlap_analytic import er_fast
 
@@ -42,60 +42,10 @@ def eclipse_ratio(distance_planet_moon, r_planet, r_moon):
     return eclipse_ratio
 
 
-@jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def pixelart(xp, yp, xm, ym, r_planet, r_moon, numerical_grid):
-    if numerical_grid % 2 == 0:  # assure pixel number is odd for perfect circle
-        numerical_grid += 1
-    r_star = (1 / r_moon) * numerical_grid
-    image = np.zeros((numerical_grid + 1, numerical_grid + 1), dtype="int8")
-    
-    color_star = 5    # arbitrary values, but useful for visualization
-    color_moon = 3    # the sum of the values must be unique to identify the
-    color_planet = 2  # total overlap: area of moon on star occulted by planet
-    all_colors = color_star + color_moon + color_planet
-
-    # Paint moon circle by painting one quarter, flipping it over, and rolling it down
-    # Faster than painting naively the full circle, because it saves 3/4 of dist calcs
-    # Caching this part would be a good idea, but numba memory mgmt caused crashes
-    # The gain is very small anyways and the complexity not worth it
-    # The version here, which replaces the usual sqrt with **2, is ~5% faster
-
-    # Paint upper left corner
-    anti_aliasing = np.sqrt(((numerical_grid + 1) ** 2 - (numerical_grid ** 2))) / 2
-    mid = int(ceil(numerical_grid / 2))
-    for x in range(mid):
-        for y in range(mid):
-            d_moon = (numerical_grid - 2 * x) ** 2 + (numerical_grid - 2 * y) ** 2
-            if d_moon < (numerical_grid**2 + anti_aliasing):
-                image[x, y] = color_moon
-    image[mid:,:mid] = flipud(image[:mid:,:mid]) # Copy upper left to upper right
-    image[:,mid:] = fliplr(image[:,:mid])  # Copy upper half to lower half
-
-    # Now add planet and star
-    anti_aliasing = -0.5 / numerical_grid  # Working with sqrt again
-    for x in range(numerical_grid + 1):
-        for y in range(numerical_grid + 1):
-            d_star = sqrt(
-                (xm * r_star + 2 * x - numerical_grid) ** 2
-                + (ym * r_star + 2 * y - numerical_grid) ** 2
-            )
-            if d_star < r_star - anti_aliasing:
-                image[x, y] += color_star
-
-            d_planet = sqrt(
-                ((-(xp - xm) * r_star) + 2 * x - numerical_grid) ** 2
-                + ((-(yp - ym) * r_star) + 2 * y - numerical_grid) ** 2
-            )
-            if d_planet < (r_planet / r_moon) * numerical_grid - anti_aliasing:
-                image[x, y] += color_planet
-
-    moon_sum_analytical = pi * ((numerical_grid) / 2) ** 2
-    moon_occult_frac = np.sum(image == all_colors) / moon_sum_analytical
-    cci = eclipse_ratio(sqrt(xm ** 2 + ym ** 2), 1, r_moon)
-    if cci > 0:
-        return min(1, (1 - ((cci - moon_occult_frac) / cci)))
-    else:
-        return 1
+@jit(cache=True, nopython=True, fastmath=False)
+def _is_nan(x):
+    """NaN test compiled without fastmath (under fastmath the compiler may assume no NaN and drop x != x)"""
+    return x != x
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
@@ -191,8 +141,7 @@ def lens_gradient_term(xp, yp, xm, ym, d, r_planet, r_moon, u1, u2):
 
 
 @jit(cache=True, nopython=True, fastmath=True, parallel=False)
-def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, use_pixelmap=False,
-            u1=None, u2=None):
+def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, u1=None, u2=None):
     """Checks if planet-moon occultation present. If yes, returns adjusted moon flux.
     Parameters
     ----------
@@ -202,14 +151,6 @@ def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, use_pix
         Planet and moon radii. Normalized so that R_star = 1
     flux_moon : float
         Un-occulted moon flux (from Mandel-Agol model) in [0,1]
-    numerical_grid : int
-        Raster diameter [pixels] for pixelart(); used only if use_pixelmap
-        (or as fallback for an exactly degenerate analytic configuration)
-    use_pixelmap : bool
-        False (default): limb eclipses use the exact analytic three-circle
-        overlap (overlap_analytic.er_fast). True: the legacy pixel raster
-        pixelart(), bit-identical to Pandora before the analytic method
-        (then u1, u2 are ignored).
     u1, u2 : float or None
         Quadratic limb darkening. If given (Pandora passes them; T4), partial
         overlaps get the first-order limb-darkening correction
@@ -230,8 +171,7 @@ def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, use_pix
     # Planet-Moon occultation
     # Case 1: No occultation
     # Case 2: Occultation, both bodies on star or off star --> 2-circle intersect
-    # Case 3: Occultation, any body on limb --> analytic 3-circle overlap
-    #         (default) or numerical pixel raster (use_pixelmap=True)
+    # Case 3: Occultation, any body on limb --> analytic 3-circle overlap (overlap_analytic.er_fast)
     # R6a: reject by the squared separation first (no sqrt for the samples
     # without overlap, most of them); the margin 1e-9 keeps every sample the
     # sqrt test below accepts (as eclipse_possible)
@@ -259,37 +199,17 @@ def eclipse(xp, yp, xm, ym, r_planet, r_moon, flux_moon, numerical_grid, use_pix
 
         # Case 3: Occultation, any body on limb
         else:
-            if use_pixelmap:
-                er = pixelart(
-                    xp[idx],
-                    yp[idx],
-                    xm[idx],
-                    ym[idx],
-                    r_planet,
-                    r_moon,
-                    numerical_grid
-                )
-            else:
-                # Argument order differs from pixelart: (xp, yp, rp, xm, ym, rm)
-                er = er_fast(xp[idx], yp[idx], r_planet, xm[idx], ym[idx], r_moon)
-                if er != er:  # NaN: measure-zero degenerate geometry
-                    er = pixelart(
-                        xp[idx],
-                        yp[idx],
-                        xm[idx],
-                        ym[idx],
-                        r_planet,
-                        r_moon,
-                        numerical_grid
-                    )
+            er = er_fast(xp[idx], yp[idx], r_planet, xm[idx], ym[idx], r_moon)
+            if _is_nan(er):
+                # measure-zero degenerate geometry (exact tangencies): the two-circle ratio, which ignores the
+                # stellar limb (the pixel raster that served as this fallback was removed in 2026-10)
+                er = eclipse_ratio(distance_p_m, r_planet, r_moon)
 
         # For Cases 2+3: Calculate reduced moon flux
         if er > 0:
-            f = -(1 - flux_moon[idx]) * 10 ** 6
-            f = f * (1 - er)
-            f = 1 - (-f * 10 ** -6)
+            f = 1 - (1 - flux_moon[idx]) * (1 - er)
             # T4: limb-darkening gradient across the overlap (partial overlaps)
-            if u1 is not None and u2 is not None and not use_pixelmap and er < 1:
+            if u1 is not None and u2 is not None and er < 1:
                 f = f + lens_gradient_term(
                     xp[idx], yp[idx], xm[idx], ym[idx], distance_p_m, r_planet, r_moon, u1, u2
                 )

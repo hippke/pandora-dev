@@ -1,8 +1,7 @@
 """Analytic area of the common overlap of three disks (star, planet, moon).
 
 Used by eclipse() for mutual planet-moon eclipses with a body on the stellar
-limb (the default, eclipse_method="analytic"); replaces the pixel raster
-pixelart() (still available with eclipse_method="pixelmap").
+limb; it replaced the pixel raster pixelart() (removed in 2026-10).
 
 Vendored from the standalone development project ../overlap3
 (overlap3/analytic_fast.py, "v3"), which contains the pure-Python reference
