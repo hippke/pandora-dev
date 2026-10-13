@@ -270,3 +270,20 @@ Example:
    from pandoramoon.helpers import ld_invert
    q1, q2 = ld_invert(u1=0.5, u2=0.5)
 
+
+Configuration
+-------------
+
+Two files in the package directory hold the values that are not function arguments:
+
+:physics.cfg: physical constants (G, day, R_sun, M_sun, M_jup), available as ``pandoramoon.constants``.
+:settings.cfg: default settings and tuning values, each with its source: ``[model]`` (defaults of ``hill_sphere_threshold`` and ``occult_small_threshold``), ``[supersampling]`` (``NestedSampler(supersampling="auto")``), ``[fit]`` (accuracy presets, run and step limits), ``[fit_rules]`` (the decision rules of the fit, ``pandoramoon.nss.FIT_RULES``), ``[detect]`` (recall presets, threshold and jackknife cut of ``detect``), ``[prepare]`` (defaults of ``prepare_lightcurve``) and ``[priors]`` (factors of ``default_priors``).
+
+Both are read once at import (``pandoramoon._config.settings()`` returns the parsed settings). Arguments passed to a function override the file's defaults. Changing the files changes calibrated behaviour (detection threshold, fit accuracy); prefer function arguments.
+
+Numerical code is compiled by numba on first use and cached. Pandora hashes its source, configuration and table files at import and clears its numba cache once when any of them changed, so edits to the ``.cfg`` files take effect (one recompilation).
+
+Environment variables:
+
+:PANDORA_QUIET: ``1`` silences the compile notice on stderr.
+:PANDORA_BUILDING_TABLES: ``1`` only while regenerating the limb-darkening tables (``occult.py``); otherwise a missing table raises an error.

@@ -124,6 +124,8 @@ python example.py
 ```
 This should show a Matplotlib figure and produce a video within a minute.
 
+The first use after installation or an update compiles Pandora's numerical code (up to a few minutes, with a one-line notice on stderr; `PANDORA_QUIET=1` silences it); later runs load the cached result. Default settings and tuning values (model thresholds, sampler accuracy presets and fit rules, detection presets, light-curve preparation, default priors) are in `pandoramoon/settings.cfg`, physical constants in `pandoramoon/physics.cfg`; see [Configuration](docs/Interface.rst#configuration).
+
 For sampling, the following packages will be useful:
 ```
 pip install scipy cython
