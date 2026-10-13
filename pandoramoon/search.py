@@ -22,11 +22,7 @@ from pandoramoon.likelihood import Likelihood
 from pandoramoon.pandora import pandora_flux
 from pandoramoon.sampling import LOGZERO, LogUniform, Normal, Prior, Uniform, _loglike, _Model  # noqa: F401
 
-R_SUN = 696_342_000.0
-M_SUN = 1.98847e30
-M_JUP = 1.89813e27
-G = 6.674e-11
-DAY = 86400.0
+from pandoramoon.constants import R_SUN, M_SUN, M_JUP, G, DAY  # noqa: E402  (physics.cfg)
 
 # first-look presets (SAMPLING.md Round 12, examples/firstlook/README.md): target recall of well-detectable moons
 # (reference dlnZ >= 8) -> planet run, moon runs; repeated small moon runs are cheaper than one large run

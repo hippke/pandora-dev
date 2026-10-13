@@ -54,7 +54,7 @@ from pandoramoon import nss
 from pandoramoon.pandora import pandora_loglike, pandora_loglike_planet
 from pandoramoon.reparam import min_physical_period
 
-R_SUN = 696_342_000.0
+from pandoramoon.constants import R_SUN  # noqa: E402  (physics.cfg)
 LOGZERO = -1e300
 PARAMS = ['u1', 'u2', 'R_star', 'per_bary', 'a_bary', 'r_planet', 'b_bary', 'w_bary', 'ecc_bary', 't0_bary',
           't0_bary_offset', 'M_planet', 'r_moon', 'per_moon', 'tau_moon', 'Omega_moon', 'i_moon', 'ecc_moon',

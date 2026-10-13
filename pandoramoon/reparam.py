@@ -29,8 +29,7 @@ import numpy as np
 from numba import njit
 
 LOGZERO = -1e300      # log L' outside the original prior (P_m > p_max); finite for UltraNest, exp() = 0
-G = 6.67408e-11       # as in pandoramoon._moon_setup
-DAY = 86400.0
+from pandoramoon.constants import G, DAY  # noqa: E402  (physics.cfg)
 
 
 def min_physical_period(R_star_max, rsum_min, M_total_max):
