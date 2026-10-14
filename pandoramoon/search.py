@@ -295,6 +295,8 @@ def detect(likelihood, priors, recall=0.95, threshold=None, seed=1, jack_min=Non
     if nth > 1:
         from concurrent.futures import ThreadPoolExecutor
         nss.make_sampler(_loglike, False, True)      # one sampler for all threads (numba releases the GIL in it)
+        import gc
+        gc.collect()                                  # see nss.fit: no Tk objects may be collected in a worker thread
         with ThreadPoolExecutor(max_workers=nth) as ex:
             res = list(ex.map(lambda a: run(*a), jobs))
     else:
