@@ -43,9 +43,21 @@ Quick start
    print(results["dlogz"], results["dlogzerr"])      # Bayes factor ln Z(moon) - ln Z(planet)
    samples = results["samples"]                      # equal-weight posterior, columns results["paramnames"]
 
-A complete worked example is ``examples/injection_retrieval.ipynb``. With the notebook's data (3 transits,
-30-min cadence, 500 ppm) the planet+moon fit takes 2–4 minutes on
-16 cores and the planet-only fit a few seconds.
+Complete worked examples are the tutorials ``examples/tutorial_detection.ipynb`` and
+``examples/tutorial_characterisation.ipynb``. On data like the tutorials' (3 transits, 30-min cadence, 500 ppm) the
+planet+moon fit takes a few minutes on 16 cores (accuracy medium) and the planet-only fit seconds.
+
+Typical run times for Kepler long-cadence targets (3–40 transits, ~400–1700 points in the fit windows; accuracy
+medium; AMD Ryzen 9 7950X, 16 cores):
+
+=====================================  ==========================================================
+50 % of full planet+moon fits finish   within ~8–10 min
+90 %                                   within ~30 min
+longest (rare)                         ~1 h
+compilation, once per process          ~20 s
+planet-only fit                        ~1–5 s
+``detect`` (first look)                1–5 s per light curve
+=====================================  ==========================================================
 
 
 Searching for moons: detection
@@ -312,6 +324,9 @@ For ``model="moon"`` with the planet comparison, the dictionary also has:
 
 :planet: The planet-only results (the same keys).
 :dlogz, dlogzerr: The Bayes factor ln Z(moon) − ln Z(planet) and its error.
+:bayes_factor: ``text`` (e.g. ``e^3.87 = 47.7``), ``favoured`` (``"moon"`` or ``"planet-only"``), ``jeffreys``
+   (the category on Jeffreys' scale), ``ln_b`` (\|ΔlnZ\|). ``print_results()`` prints it as a sentence. Read
+   `Interpreting the Bayes factor`_ before quoting the category.
 :logz_excluded_correction: The (tiny) exact correction for the short-period part of the moon-period
    prior (see `Moon orbit: phase-at-transit coordinates`_).
 
@@ -529,6 +544,62 @@ see ``SAMPLING.md`` and ``NSS_SAMPLER.md`` in the project directory. In summary:
     −185.95 ± 0.02) and with an independent prediction for an informative limb-darkening prior.
   - Tests: ``test_cases/test_sampling.py``.
 
+
+Interpreting the Bayes factor
+-----------------------------
+
+``print_results()`` gives the Bayes factor B = exp(ΔlnZ), ΔlnZ = ln Z(moon) − ln Z(planet only), and its category on
+Jeffreys' scale, e.g.::
+
+   Bayes factor: dlogZ = logZ(moon) - logZ(planet) = 3.865 +- 0.134
+   Bayes factor: e^3.87 = 47.7 in favor of the moon model; Jeffreys' scale: "very strong" evidence (...)
+
+The common verbal scales, converted to ΔlnZ (Pandora uses the first):
+
+==============================  ==========================  ==============================  ==============
+ΔlnZ (Bayes factor)             Jeffreys (1961)             Kass & Raftery (1995)           Trotta (2008)
+==============================  ==========================  ==============================  ==============
+0 – 1.15 (1 – 3.2)              barely worth mentioning     bare mention (to 1), positive   inconclusive (to 1), weak
+1.15 – 2.3 (3.2 – 10)           substantial                 positive                        weak (to 2.5)
+2.3 – 3.45 (10 – 32)            strong                      positive (to 3), strong         moderate (from 2.5)
+3.45 – 4.6 (32 – 100)           very strong                 strong                          moderate
+> 4.6 (> 100)                   decisive                    strong (to 5), very strong      moderate (to 5), strong
+==============================  ==========================  ==============================  ==============
+
+Negative ΔlnZ favours the planet-only model on the same scale. **These words describe the evidence only if the
+models describe the data apart from white Gaussian noise with the given errors.** For moon searches in real light
+curves, use them with these caveats:
+
+- **Unmodelled effects inflate ΔlnZ.** The moon model is flexible: through the planet's motion around the
+  barycentre and the moon's own dips it can absorb anything the planet-only model cannot fit. Examples from our
+  tests on Kepler light curves:
+
+  - a slow drift of the impact parameter between transits (orbital precession): ΔlnZ ≈ +35 with no moon;
+  - a prior on a/R⋆ that excludes the transit's duration: ΔlnZ ≈ +1800 (fixed in ``default_priors``);
+  - stellar variability left after detrending on an active star: up to ΔlnZ ≈ +190 in no-moon controls.
+
+  Signs of this: a moon at the edge of its prior (Pandora warns), a fit improvement that does not survive the
+  epoch jackknife, a result that changes with the detrending, timing or duration changes of the planet's transits.
+
+- **On real data the relevant yardstick is empirical**: how often the same star produces such a ΔlnZ without a moon.
+  Inject planet-only transits at other phases of the same light curve (after removing the real transits), and moon
+  signals, process them exactly like the real data (detrending, priors, ``detect`` or the full fit), and compare.
+  A ΔlnZ that the star's own controls also reach is no evidence, whatever the scale says.
+
+- **ΔlnZ depends on the moon priors.** The Bayes factor contains an Occam penalty set by the volume of the moon priors
+  (radius, period, mass, orientation). Wider priors lower it, narrower ones raise it. Quote it together with the
+  priors (e.g. ``default_priors``).
+
+- **The real uncertainty is larger than ``dlogzerr``.** ``dlogzerr`` is the statistical error. Add the sampler's
+  systematic (up to +0.13 nats from the default chain length, on the high side; see `Limitations`_); at
+  ``accuracy="medium"`` fits deviated by up to ~0.5 nats from high-accuracy fits on our test cases. Detrending choices
+  can move ΔlnZ by much more.
+
+- **The Bayes factor updates prior odds.** It multiplies the prior odds that this planet has a detectable moon, which
+  are small. A Bayes factor of 50 on small prior odds can still leave modest posterior odds for a moon.
+
+- ``detect``'s threshold of 3 was calibrated on white-noise injections and real Kepler controls (with the epoch
+  jackknife); it is a screening threshold, not a statement of evidence.
 
 Limitations
 -----------

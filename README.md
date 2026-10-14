@@ -13,7 +13,7 @@ Pandora employs an analytical photodynamical model, including:
 - Full and partial planet-moon eclipses (exact analytic three-circle overlap, also on the stellar limb)
 - Barycentric motion of planet and moon
 
-To search for moons, Pandora includes a nested sampler (`NestedSampler`, see "Fitting" below) that fits planet+moon and planet-only models and returns their Bayesian evidences. We provide an [example workflow](https://github.com/hippke/Pandora/blob/main/examples/injection_retrieval.ipynb) for a planet+moon injection into Kepler-like data with Gaussian noise, its recovery, corner plots, and the Bayes factor. Pandora is fast: on the example data (3 transits at 30-min cadence) one likelihood evaluation takes about 3-4 microseconds on one core, and the complete planet+moon retrieval takes a few minutes on a 16-core machine. Through the `Likelihood` object, Pandora can also be used with other samplers, e.g. [UltraNest](https://github.com/JohannesBuchner/UltraNest) or [dynesty](https://github.com/joshspeagle/dynesty).
+To search for moons, Pandora includes a nested sampler (`NestedSampler`, see "Fitting" below) that fits planet+moon and planet-only models and returns their Bayesian evidences. Two tutorials show the workflow: [detection](https://github.com/hippke/Pandora/blob/main/examples/tutorial_detection.ipynb) and [characterisation](https://github.com/hippke/Pandora/blob/main/examples/tutorial_characterisation.ipynb) (a planet+moon injection into a light curve with stellar variability and red noise, detrending, the fast detection test, the full fit, corner plots and the Bayes factor). Pandora is fast: on the example data (3 transits at 30-min cadence) one likelihood evaluation takes about 3-4 microseconds on one core, and the complete planet+moon retrieval takes a few minutes on a 16-core machine. Through the `Likelihood` object, Pandora can also be used with other samplers, e.g. [UltraNest](https://github.com/JohannesBuchner/UltraNest) or [dynesty](https://github.com/joshspeagle/dynesty).
 
 
 ### Create transit light curve
@@ -64,7 +64,7 @@ logL = like(u1, u2, R_star, per_bary, a_bary, r_planet, b_bary, w_bary, ecc_bary
             t0_bary, t0_bary_offset, M_planet, r_moon, per_moon, tau_moon,
             Omega_moon, i_moon, ecc_moon, w_moon, M_moon)
 ```
-See the [example workflow](https://github.com/hippke/Pandora/blob/main/examples/injection_retrieval.ipynb). The model functions take the same arguments as `pandora()`:
+See the [characterisation tutorial](https://github.com/hippke/Pandora/blob/main/examples/tutorial_characterisation.ipynb). The model functions take the same arguments as `pandora()`:
 
 | Function | Returns | Use |
 |---|---|---|

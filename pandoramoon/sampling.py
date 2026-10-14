@@ -806,6 +806,26 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max
     return res
 
 
+# Jeffreys' scale (Jeffreys 1961, Theory of Probability, App. B) in natural-log units: upper ln B of each category
+JEFFREYS = ((1.15, "barely worth mentioning"), (2.3, "substantial"), (3.45, "strong"), (4.6, "very strong"),
+            (math.inf, "decisive"))
+
+
+def bayes_factor_words(dlogz):
+    """(Bayes factor text, favoured model, Jeffreys' category) for dlnZ = ln Z(moon) - ln Z(planet). The scale assumes
+    that the models describe the data apart from white noise; see Fitting.rst "Interpreting the Bayes factor"."""
+    x = float(dlogz)
+    a = abs(x)
+    favoured = "moon" if x >= 0 else "planet-only"
+    if a < 20:
+        b = math.exp(a)
+        btxt = f"e^{a:.2f} = {b:.3g}" if b < 1000 else f"e^{a:.2f} = {b:.0f}"
+    else:
+        btxt = f"e^{a:.0f} = 10^{a / math.log(10):.0f}"
+    words = next(w for lim, w in JEFFREYS if a <= lim)
+    return btxt, favoured, words
+
+
 _EDGE_PLANET = ("a_bary", "r_planet", "per_bary", "t0_bary_offset")
 _EDGE_MOON = ("r_moon", "M_moon")
 
@@ -1083,6 +1103,9 @@ class NestedSampler:
             res["planet"] = pl
             res["dlogz"] = res["logz"] - pl["logz"]
             res["dlogzerr"] = float(math.hypot(res["logzerr"], pl["logzerr"]))
+            btxt, fav, words = bayes_factor_words(res["dlogz"])
+            res["bayes_factor"] = dict(text=btxt, favoured=fav, jeffreys=words,
+                                       ln_b=float(abs(res["dlogz"])), note="white-noise scale; see the docs' caveats")
         elif self.model == "moon" and self.models["moon"].F_excluded > 0:
             res["logz_excluded_fraction"] = self.models["moon"].F_excluded
         if self.log_dir is not None:
@@ -1144,6 +1167,9 @@ class NestedSampler:
         if "planet" in r:
             block(r["planet"], "planet only")
             print(f"Bayes factor: dlogZ = logZ(moon) - logZ(planet) = {r['dlogz']:.3f} +- {r['dlogzerr']:.3f}")
+            btxt, fav, words = bayes_factor_words(r["dlogz"])
+            print(f'Bayes factor: {btxt} in favor of the {fav} model; Jeffreys\' scale: "{words}" evidence '
+                  "(for white noise and correct models; see the documentation for the caveats)")
         jk = r.get("jackknife")
         if jk:
             print("Epoch jackknife (chi2 improvement of the moon fit per transit): " +
