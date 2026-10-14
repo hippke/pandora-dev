@@ -437,6 +437,9 @@ def make_sampler(ll_u, parallel, with_data=False):
                 scale /= 1.1
             scale = min(max(scale, 1e-3), 1e3)
             it += 1
+            if stop.shape[0] > 2:                  # progress for fit()'s status line (read by the main thread)
+                stop[1] = ncall
+                stop[2] = it
         # live points
         logw_live = logX - math.log(n)
         for a in range(n):
@@ -554,7 +557,7 @@ def run(ll_u, ndim, wrapped=None, nlive=1000, nsteps=None, K=None, k=1, frac_rem
     (dU, dL, dlogw, ncall, it, scale, exp_rate, nrecl,
      ins, mix, nstuck, nmaxexp) = ns(U, L, nsteps, K, k, wrapped, frac_remain, max_iter, seed + 1, scale0,
                                               nbsub, recluster, kpair,
-                                              stop if stop is not None else np.zeros(1, dtype=np.int64), D,
+                                              stop if stop is not None else np.zeros(3, dtype=np.int64), D,
                                               lx0)
     t2 = time.perf_counter()
     lw = dlogw + dL
@@ -780,7 +783,7 @@ ACCURACY = {a: dict(nlive=_FIT[f"{a}_nlive"], lz_tol=_FIT[f"{a}_lz_tol"], ks_tol
 def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=None,
         max_runs=None, ks_tol=0.05, lz_tol=0.1, seed=1, dirs="pairs", frac_remain=0.01, verbose=True,
         post_map=None, kpair=4, check=True, max_nsteps=None, recluster=0.25, data=None,
-        accuracy=None, resume=None, callback=None, max_nlive=None):
+        accuracy=None, resume=None, callback=None, max_nlive=None, progress=False, progress_label="fit"):
     """Nested sampling with built-in convergence checks.
 
     Independent serial nss runs (n_live = nlive each) run in parallel threads and are merged as one run
@@ -807,6 +810,9 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
     "run_cap". The result's status ("passed" / "stalled" / "run_cap") and reason (which checks were not met, by how
     much) say why.
 
+    progress: False (default), True (a status line every 2 s in a terminal / Jupyter, every 30 s otherwise: runs done,
+    n_live, nsteps, the current lnZ, calls, calls per second, elapsed time) or the interval in seconds;
+    progress_label: the line's prefix. Does not change the result.
     accuracy: None (use the arguments) or a preset of ACCURACY (overrides nlive, lz_tol, ks_tol, min_runs):
     "high" (lnZ +-0.1, KS 0.05, 1000 live, >= 16 runs), "medium" (+-0.2, KS 0.08, 500 live, >= 8 runs).
     Returns dict(logz, logzerr (empirical), logzerr_boot, samples_u, runs, history, passed, nsteps, nlive,
@@ -822,6 +828,44 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
     flight at a crash are redone with their original seeds), and
     the checks are evaluated before any new run is started (a fit that had passed passes again at once)."""
     from concurrent.futures import ThreadPoolExecutor
+    import sys
+    # progress status (Round 23): a status line every few seconds while the runs execute (as UltraNest's). The compiled
+    # runs write their calls / iterations into their stop array; the main thread, otherwise idle in wait(), reads them.
+    # Interactive (terminal, Jupyter): one line rewritten in place every 2 s; otherwise (logs) a new line every 30 s.
+    interactive = bool(getattr(sys.stdout, "isatty", lambda: False)() or "ipykernel" in sys.modules)
+    p_every = (2.0 if interactive else 30.0) if progress is True else (float(progress) if progress else 0.0)
+    p_state = dict(len=0, hist=[])
+
+    def clear_status():
+        if p_state["len"]:
+            sys.stdout.write("\r" + " " * p_state["len"] + "\r")
+            p_state["len"] = 0
+
+    def say(msg):
+        clear_status()
+        print(msg, flush=True)
+
+    def status():
+        now = time.perf_counter()
+        calls = ncall_tot[0] + sum(int(v[1][1]) for v in inflight.values())
+        ph = p_state["hist"]
+        ph.append((now, calls))
+        while len(ph) > 2 and now - ph[0][0] > 15.0:
+            ph.pop(0)
+        rate = (ph[-1][1] - ph[0][1]) / (ph[-1][0] - ph[0][0]) if len(ph) > 1 and ph[-1][0] > ph[0][0] else 0.0
+        el = now - t0
+        R = arms.get(N, [])
+        lz = f"lnZ {hist[-1]['logz']:.2f} +- {hist[-1]['logz_err']:.2f} (target {lz_tol:g})" if hist else "lnZ -"
+        s = (f"{progress_label}: {len(R)} runs done (min {min_runs}, max {max_runs}), {len(inflight)} running | "
+             f"n_live {nlive}, nsteps {N} | {lz} | {calls:,} calls, {int(round(rate)):,} calls/s | "
+             f"{int(el // 3600)}:{int(el % 3600 // 60):02d}:{int(el % 60):02d}")
+        if interactive:
+            sys.stdout.write("\r" + s.ljust(p_state["len"]))
+            sys.stdout.flush()
+            p_state["len"] = len(s)
+        else:
+            print(s, flush=True)
+
     if accuracy is not None:
         a = ACCURACY[accuracy]
         nlive, lz_tol, ks_tol = a["nlive"], a["lz_tol"], a["ks_tol"]
@@ -983,7 +1027,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
             if check:
                 s += (f" | check nsteps {Nc}: {h['check_runs']} runs, dlnZ {h['dlnz']:+.3f} +- {h['dlnz_err']:.3f}, "
                       f"KS arms {h['ks_arms']:.3f} (p{h['ks_arms_param']})")
-            print(s + f", {h['wall']:.1f} s" + (" [final]" if final else ""), flush=True)
+            say(s + f", {h['wall']:.1f} s" + (" [final]" if final else ""))
         own_ok = bool(sR["M"] >= min_runs and ks <= ks_tol and sR["err"] <= lz_tol)
         passed = bool(own_ok and ok_bias and sR["n_failed"] <= FR["failed_max"] * sR["M_all"])
         # which checks are not met (reported in the result: status / reason)
@@ -1003,16 +1047,15 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
         if (stalled and not passed and not final and sR["M"] >= FR["stall_runs_x"] * min_runs
                 and sR["err"] <= lz_tol):
             if verbose:
-                print(f"  fit: {why}, no further escalation possible; lnZ error {sR['err']:.3f} <= lz_tol: stop",
-                      flush=True)
+                say(f"  fit: {why}, no further escalation possible; lnZ error {sR['err']:.3f} <= lz_tol: stop")
             return False, "stop", sR["M_all"]
         if esc_nlive and nlive < max_nlive and not final:
             if verbose:
-                print(f"  fit: {why} -> n_live {nlive} -> {2 * nlive}", flush=True)
+                say(f"  fit: {why} -> n_live {nlive} -> {2 * nlive}")
             return False, "nlive", sR["M_all"]
         escalate = bool(esc_nsteps and N < max_nsteps and not passed)
         if escalate and verbose:
-            print(f"  fit: {why}", flush=True)
+            say(f"  fit: {why}")
         return passed, escalate, sR["M_all"]
 
     # continuous scheduling: the pool is kept full (no batch barrier); a new run goes to the arm with fewer
@@ -1044,7 +1087,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
                 idx = nxt
                 used.add(idx)
                 sd = seed + 1000 * idx
-                flag = np.zeros(1, dtype=np.int64)
+                flag = np.zeros(3, dtype=np.int64)      # [stop request, calls, iterations] (progress)
                 inflight[ex.submit(run, ll_u, ndim, wrapped=wrapped, nlive=nlive, nsteps=ns, k=1, seed=sd, dirs=dirs,
                                    frac_remain=frac_remain, kpair=kpair, stop=flag,
                                    recluster=recluster, data=data)] = (ns, flag, idx)
@@ -1066,7 +1109,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
         def escalate_now():
             nonlocal N, nesc
             if verbose:
-                print(f"  fit: nsteps {N} vs {max(1, N // 2)} disagree -> nsteps {2 * N}", flush=True)
+                say(f"  fit: nsteps {N} vs {max(1, N // 2)} disagree -> nsteps {2 * N}")
             dropped = max(1, N // 2)
             dropped_idx = [int(r.get("idx", -1)) for r in arms.pop(dropped, [])]
             N *= 2
@@ -1107,7 +1150,12 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
         ndone = 0
         pre_last = False
         while not stop_now:
-            done, _ = wait(list(inflight), return_when=FIRST_COMPLETED)
+            done, _ = wait(list(inflight), timeout=p_every or None, return_when=FIRST_COMPLETED)
+            if p_every and (not done or time.perf_counter() - p_state.get("t", 0.0) >= p_every):
+                p_state["t"] = time.perf_counter()
+                status()
+            if not done:
+                continue
             for f in done:
                 ns, _flag, idx = inflight.pop(f)
                 r = f.result()
@@ -1159,6 +1207,7 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
             r = f.result()
             ncall_tot[0] += r["ncall"]
             n_aborted[0] += 1
+    clear_status()
     passed, _, _ = evaluate(N, final=True)
     fails = hist[-1]["fails"]
     if passed:

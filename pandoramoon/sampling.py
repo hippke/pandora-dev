@@ -701,7 +701,7 @@ def _thin(w, max_n, seed=0):
     return idx, nw / nw.sum()
 
 
-def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max_weighted=None):
+def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max_weighted=None, progress=False):
     """one nss.fit of a _Model, with the run store / resume; returns the UltraNest-like result dict"""
     resume = None
     callback = None
@@ -750,7 +750,7 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max
         return m.to_params(U)
     t0 = time.perf_counter()
     r = nss.fit(_loglike, m.ndim, wrapped=m.wrapped, data=m.D, post_map=post_map, verbose=verbose, resume=resume,
-                callback=callback, **nss_kw)
+                callback=callback, progress=progress, progress_label=f"{label} model", **nss_kw)
     wall = time.perf_counter() - t0
     names = m.paramnames()
     samples = m.to_params(r["samples_u"])
@@ -927,11 +927,14 @@ class NestedSampler:
         h.update(repr(("nss-init", nss.INIT_VERSION)).encode())   # runs stored before Round 20 are not mixed in
         return h.hexdigest()
 
-    def run(self, accuracy="high", max_weighted_samples=None, **nss_kw):
+    def run(self, accuracy="high", max_weighted_samples=None, progress=None, **nss_kw):
         """run the fit(s). accuracy: "high" (logZ +-0.1, default) or "medium" (+-0.2, faster); max_weighted_samples:
         thin results["weighted_samples"] (all points of the merged runs, up to ~1e6) to about this many points
         (unbiased: Horvitz-Thompson thinning; None = keep all); further keyword arguments go to
         pandoramoon.nss.fit (e.g. nlive, lz_tol, ks_tol, max_runs, nsteps).
+        progress: a status line while the fit runs (runs done, n_live, nsteps, current ln Z, likelihood calls, calls
+        per second, elapsed time): every 2 s in a terminal or Jupyter (one line, updated in place), every 30 s in a
+        log file. None (default): on if verbose; True / False; or the interval in seconds.
         Returns the results dict (also self.results)."""
         kw = dict(accuracy=accuracy, threads=self.threads, seed=self.seed)
         kw.update(nss_kw)
@@ -948,7 +951,8 @@ class NestedSampler:
                       f"({', '.join(m.cube_names)})", flush=True)
             mode = self.resume if self.resume == "resume" else "fresh"
             hs = self._settings_hash(name, {k: v for k, v in kw.items() if k != "threads"})
-            out[name] = _fit_model(m, kw, store, mode, hs, self.verbose, name, max_weighted=max_weighted_samples)
+            out[name] = _fit_model(m, kw, store, mode, hs, self.verbose, name, max_weighted=max_weighted_samples,
+                                   progress=self.verbose if progress is None else progress)
         res = out[self.model]
         if self.model == "moon" and "planet" in out:
             pl = out["planet"]

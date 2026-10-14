@@ -142,17 +142,26 @@ Interface
       actually uses is ``sampler.likelihood`` (e.g. ``sampler.likelihood(**sampler.parameters())``
       gives the ``logl`` of ``results["maxlikelihood"]``).
 
-   .. method:: run(accuracy="high", max_weighted_samples=None, **kwargs)
+   .. method:: run(accuracy="high", max_weighted_samples=None, progress=None, **kwargs)
 
       Runs the fit (for ``model="moon"``: first the planet-only fit, then the planet+moon fit) and
       returns the results dictionary (also stored as ``sampler.results``).
 
       :accuracy: ``"high"`` (default): statistical error of ln Z ≤ 0.1, posterior reproducible to a
          KS distance ≤ 0.05, 1000 live points per run, at least 16 runs. ``"medium"``: ≤ 0.2 and
-         ≤ 0.08, 500 live points per run, at least 8 runs; about 2–5× faster.
+         ≤ 0.08, 500 live points per run, at least 8 runs; about 2–5× faster. Use ``"medium"`` to follow up
+         detections; for evidence comparisons at the 0.1–0.3 nat level use ``"high"`` (on our test cases medium
+         fits deviated by up to 0.5 nats, 2.5 × their quoted error, from the high-accuracy values).
       :max_weighted_samples: Thin ``weighted_samples`` (all points of the merged runs, up to ~10⁶) to about
          this many points. Unbiased Horvitz–Thompson thinning: heavy points are kept, light ones kept at
          random with their weight scaled up. ``None`` (default): keep all.
+      :progress: A status line while the fit runs: the model, runs done (and the minimum / maximum),
+         runs in progress, live points and chain length, the current ln Z and its error, likelihood calls
+         so far and per second, and the elapsed time, e.g. ``moon model: 8 runs done (min 8, max 96),
+         4 running | n_live 500, nsteps 64 | lnZ -194.77 +- 0.18 (target 0.2) | 107,153,206 calls,
+         683,412 calls/s | 0:02:34``. In a terminal or Jupyter the line is updated in place every 2 s; in a
+         log file a new line is written every 30 s. ``None`` (default): on if ``verbose``; ``True`` /
+         ``False``; or the interval in seconds. It does not change the result.
       :kwargs: Passed to :func:`pandoramoon.nss.fit`, e.g. ``nlive``, ``lz_tol``, ``ks_tol``,
          ``min_runs``, ``max_runs`` (default 96), ``nsteps`` (initial chain length, default 4 × the
          number of sampled coordinates).
