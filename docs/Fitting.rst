@@ -250,8 +250,12 @@ The results dictionary uses UltraNest's keys:
 :H: Information gain from the prior to the posterior [nats].
 :ncall, niter: Likelihood calls (including the check runs) and nested-sampling iterations.
 :insertion_order_test: Insertion-index test (Fowlie, Handley & Su 2020), pooled over runs.
-:passed: ``True`` if all convergence checks passed (see `Self-checks`_). If ``False``, the fit
-   stopped at ``max_runs``; the result is usable but its error is not guaranteed.
+:passed: ``True`` if all convergence checks passed (see `Self-checks`_). If ``False``, the result is
+   usable but its error is not guaranteed; ``status`` and ``reason`` say why.
+:status, reason: ``"passed"``; ``"stalled"``: a check asked for longer chains or more live points but both
+   were at their limit (or longer chains were ruled out by ``multimodal``), and the fit stopped once the ln Z
+   error was within the tolerance; ``"run_cap"``: ``max_runs`` reached. ``reason`` lists the checks that were not
+   met and by how much (e.g. ``split-half KS 0.062 > ks_tol 0.05``).
 :nsteps, runs, nlive, n_escalations, history: Final chain length, number of merged runs, live points
    per run, number of chain-length doublings, and the history of the checks.
 :multimodal, n_nlive_escalations: ``multimodal`` is ``True`` if the runs disagreed the way runs do that
@@ -396,10 +400,14 @@ Four rules decide (all constants in ``pandoramoon/settings.cfg``, section ``[fit
    doubled); otherwise the number of live points per run is doubled.
 4. **Did some runs find a better solution?** If a few runs have a clearly higher ln Z and likelihood than the
    others, the others missed part of the posterior: the number of live points is doubled (up to
-   ``max_nlive``), and the result is flagged ``multimodal``. Chain lengths are then not increased any further.
+   ``max_nlive``), and the result is flagged ``multimodal``. Chain lengths are then not increased any further;
+   rule 3 doubles the live points instead.
 
-The checks are evaluated after every finished run, as soon as a decision is possible. A fit that does not
-pass within ``max_runs`` runs is returned with ``passed=False``.
+The checks are evaluated after every finished run, as soon as a decision is possible. If a rule asks for an
+escalation that is no longer possible (live points at ``max_nlive``, chains at ``max_nsteps``, or longer chains
+ruled out by ``multimodal``), more runs would only shrink the error bar: the fit stops as soon as the ln Z error
+is within the tolerance (``passed=False``, ``status="stalled"``). Otherwise a fit that does not pass within
+``max_runs`` runs is returned with ``passed=False``, ``status="run_cap"``.
 
 **What the error means.** ``logzerr`` is the statistical error of this fit; ten C0 fits with different
 seeds scattered by 0.06, against a quoted 0.07. Different sampler settings (live points, chain length)

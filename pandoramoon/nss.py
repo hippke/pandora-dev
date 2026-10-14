@@ -800,8 +800,12 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
 
     On nsteps x 2 the old result arm becomes the check arm; on n_live x 2 both arms restart. Once rule 3 or 4 sent the
     fit to more live points (result "multimodal": True), nsteps is not doubled again (the arms then differ by which
-    got the runs that found the better solution). Caps: max_nsteps (64 ndim), max_nlive (4 nlive), max_runs; at a cap
-    the fit continues to max_runs and returns passed=False if rule 1 is not met.
+    got the runs that found the better solution); rule 3 then doubles n_live instead. When a rule asks for an escalation
+    that cannot be done (n_live / nsteps at its cap max_nlive (4 nlive) / max_nsteps (64 ndim), or an nsteps request
+    blocked by multimodal), the fit stops as soon as the lnZ error is within lz_tol: passed=False, status "stalled"
+    (Round 23; more runs would only shrink the error). Otherwise a fit that does not pass stops at max_runs: status
+    "run_cap". The result's status ("passed" / "stalled" / "run_cap") and reason (which checks were not met, by how
+    much) say why.
 
     accuracy: None (use the arguments) or a preset of ACCURACY (overrides nlive, lz_tol, ks_tol, min_runs):
     "high" (lnZ +-0.1, KS 0.05, 1000 live, >= 16 runs), "medium" (+-0.2, KS 0.08, 500 live, >= 8 runs).
@@ -951,13 +955,26 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
         for runs_ in ((R, C) if check else (R,)):
             if len(runs_) >= gate and _better_solution_gap(runs_, q_run):
                 esc_nlive, why = True, "some runs found a better solution"
-        h.update(mode_problem=bool(esc_nlive), escalation_reason=why)
         if esc_nlive:
             multimodal[0] = True
-        if multimodal[0]:
+        blocked = False
+        if multimodal[0] and esc_nsteps:
             # once runs disagree like runs that miss modes, the comparison of the arms only shows which arm got the
-            # lucky runs (Kepler artefact fits escalated nsteps to 1024 on that): no nsteps escalation any more
+            # lucky runs (Kepler artefact fits escalated nsteps to 1024 on that): no nsteps escalation any more.
+            # Rule 3's excess scatter goes to n_live instead (Round 23: n_live lowers the chain-length bias about like
+            # nsteps, 1 / (nsteps n_live), and the mode loss); a blocked rule-2 request has no substitute.
             esc_nsteps = False
+            if why.startswith("excess scatter"):
+                esc_nlive, why = True, why + " (multimodal: n_live instead of nsteps)"
+            else:
+                blocked = True
+        h.update(mode_problem=bool(esc_nlive), escalation_reason=why)
+        # no remedy left (Round 23): the requested escalation cannot be done (n_live or nsteps at its cap, or an nsteps
+        # request blocked by multimodal). More runs only shrink the error, so the fit stops once the lnZ error is
+        # within lz_tol (passed=False, status "stalled")
+        can_act = (esc_nlive and nlive < max_nlive) or (esc_nsteps and N < max_nsteps)
+        stalled = bool((esc_nlive or esc_nsteps or blocked) and not can_act)
+        h.update(stalled=stalled)
         hist.append(h)
         if verbose:
             s = (f"  fit: nsteps {N:4d}: {sR['M']:3d} runs x {nlive} live: logZ {lzR:.3f} +- {sR['err']:.3f} "
@@ -969,6 +986,26 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
             print(s + f", {h['wall']:.1f} s" + (" [final]" if final else ""), flush=True)
         own_ok = bool(sR["M"] >= min_runs and ks <= ks_tol and sR["err"] <= lz_tol)
         passed = bool(own_ok and ok_bias and sR["n_failed"] <= FR["failed_max"] * sR["M_all"])
+        # which checks are not met (reported in the result: status / reason)
+        fails = []
+        if sR["M"] < min_runs:
+            fails.append(f"{sR['M']} runs < min_runs {min_runs}")
+        if sR["err"] > lz_tol:
+            fails.append(f"lnZ error {sR['err']:.3f} > lz_tol {lz_tol}")
+        if ks > ks_tol:
+            fails.append(f"split-half KS {ks:.3f} > ks_tol {ks_tol}")
+        if not ok_bias:
+            fails.append(f"chain-length check: arms N/2, N differ (dlnZ {h.get('dlnz', np.nan):+.3f} +- "
+                         f"{h.get('dlnz_err', np.nan):.3f}, KS {h.get('ks_arms', np.nan):.3f})")
+        if sR["n_failed"] > FR["failed_max"] * sR["M_all"]:
+            fails.append(f"{sR['n_failed']} failed runs")
+        h.update(fails=fails)
+        if (stalled and not passed and not final and sR["M"] >= FR["stall_runs_x"] * min_runs
+                and sR["err"] <= lz_tol):
+            if verbose:
+                print(f"  fit: {why}, no further escalation possible; lnZ error {sR['err']:.3f} <= lz_tol: stop",
+                      flush=True)
+            return False, "stop", sR["M_all"]
         if esc_nlive and nlive < max_nlive and not final:
             if verbose:
                 print(f"  fit: {why} -> n_live {nlive} -> {2 * nlive}", flush=True)
@@ -987,7 +1024,13 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
     n_aborted = [0]
     n_obsolete = [0]                             # runs aborted at an escalation (their arm was dropped)
     n_eval = [0, 0]                              # full evaluations: regular cadence / triggered by precheck
+    stop_cause = [""]                            # "stalled": no remedy left and the lnZ error within lz_tol
     t_eval = [0.0]                               # wall time of the Python checks (main thread)
+    # free unreachable objects in the main thread before the worker threads start: closed matplotlib figures of a Tk
+    # backend must not be garbage-collected in a worker thread (Tcl aborts the process: "Tcl_AsyncDelete: async
+    # handler deleted by the wrong thread"; seen 10-14 in test_sampling after plot_run())
+    import gc
+    gc.collect()
     with ThreadPoolExecutor(max_workers=threads) as ex:
         def top_up():
             nonlocal nxt
@@ -1047,8 +1090,9 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
             # resumed: evaluate the stored runs first (a fit that had passed passes again without new runs)
             while True:
                 passed, escalate, M = evaluate(N)
-                if passed or M >= max_runs:
+                if passed or M >= max_runs or escalate == "stop":
                     stop_now = True
+                    stop_cause[0] = "stalled" if escalate == "stop" else stop_cause[0]
                     break
                 if not escalate:
                     break
@@ -1094,6 +1138,9 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
                 passed, escalate, M = evaluate(N)
                 t_eval[0] += time.perf_counter() - te
                 pre_last = pre
+                if escalate == "stop":
+                    stop_cause[0] = "stalled"
+                    break
                 if passed or (M >= max_runs and escalate != "nlive"):
                     break
                 if escalate == "nlive":
@@ -1113,6 +1160,16 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
             ncall_tot[0] += r["ncall"]
             n_aborted[0] += 1
     passed, _, _ = evaluate(N, final=True)
+    fails = hist[-1]["fails"]
+    if passed:
+        status, reason = "passed", ""
+    elif stop_cause[0] == "stalled":
+        status = "stalled"
+        reason = (f"no further escalation possible ({hist[-2]['escalation_reason'] if len(hist) > 1 else ''}; n_live "
+                  f"{nlive}, nsteps {N}); stopped with the lnZ error within lz_tol. Not met: " + "; ".join(fails))
+    else:
+        status = "run_cap"
+        reason = f"max_runs ({max_runs}) reached. Not met: " + "; ".join(fails)
     bad = set(failed_runs(arms[N]))
     R = [r for i, r in enumerate(arms[N]) if i not in bad]
     lzm, samples, ess = merge(R, seed=seed)
@@ -1126,4 +1183,4 @@ def fit(ll_u, ndim, wrapped=None, nlive=2000, nsteps=None, threads=12, min_runs=
                 wall=time.perf_counter() - t0, ncall=hist[-1]["ncall"], nlive=nlive, nlive0=nlive0,
                 n_nlive_escalations=nlesc, multimodal=multimodal[0], nsteps=N, nsteps0=nsteps,
                 n_escalations=nesc, dlnz_check=hist[-1].get("dlnz"), dlnz_check_err=hist[-1].get("dlnz_err"),
-                ks_arms=hist[-1].get("ks_arms"), maxL=float(max(r["maxL"] for r in R)))
+                ks_arms=hist[-1].get("ks_arms"), maxL=float(max(r["maxL"] for r in R)), status=status, reason=reason)

@@ -782,7 +782,8 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max
         maxlikelihood=dict(logl=float(logl[ib]), point=pts[ib].tolist(), point_untransformed=U[ib].tolist()),
         insertion_order_test=dict(D=hist.get("ins_pooled_D"), p=hist.get("ins_pooled_p"),
                                   p_fisher=hist.get("ins_fisher_p")),
-        passed=bool(r["passed"]), nsteps=int(r["nsteps"]), nlive=int(r["nlive"]), runs=len(runs),
+        passed=bool(r["passed"]), status=r.get("status", "passed" if r["passed"] else "run_cap"),
+        reason=r.get("reason", ""), nsteps=int(r["nsteps"]), nlive=int(r["nlive"]), runs=len(runs),
         runs_check=len(r["runs_check"]), n_escalations=int(r["n_escalations"]), n_failed=int(r["n_failed"]),
         n_nlive_escalations=int(r.get("n_nlive_escalations", 0)), multimodal=bool(r.get("multimodal", False)),
         dlogz_check=r.get("dlnz_check"), ks_arms=r.get("ks_arms"), history=r["history"], wall=wall,
@@ -992,7 +993,8 @@ class NestedSampler:
             if r is None:
                 continue
             if not r["passed"]:
-                warn.append(f"{name}: convergence checks not passed (result usable, error not guaranteed)")
+                warn.append(f"{name}: convergence checks not passed (status {r.get('status')}; result usable, error not "
+                            f"guaranteed): {r.get('reason', '')}")
             if r.get("multimodal"):
                 warn.append(f"{name}: the runs disagree like runs that miss a mode; ln Z may be too low")
         res["warnings"] = warn
