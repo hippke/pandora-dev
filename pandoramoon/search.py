@@ -55,7 +55,10 @@ def default_priors(t0_bary, per_bary, r_planet, per_bary_err=None, a_bary=None, 
     t0_bary [d]: a reference transit time (fixed; its uncertainty is t0_bary_offset +- t0_halfwidth [d]).
     per_bary [d]: the planet period; prior +- max(5 per_bary_err, 0.002 per_bary).
     r_planet [R_star]: the planet radius estimate; prior 0.5 ... 1.5 x.
-    a_bary [R_star]: (lo, hi) or None (Kepler's law with M_star + M_planet, +- 2.3 %).
+    a_bary [R_star]: (lo, hi) or None: log-uniform over 0.4 ... 2.5 x Kepler's law (M_star + M_planet, circular), which
+        allows for errors of the stellar density and for eccentric orbits (settings.cfg [priors]). (A prior narrowed
+        around Kepler's law forces a wrong transit duration on the planet-only model whenever the catalogue star or
+        a circular orbit is wrong, and the moon model then fakes a moon.)
     R_star [m], M_star [kg], M_planet [kg]: estimates; priors R_star 0.8 ... 1.2 x, M_planet 0.5 ... 1.5 x.
     Moon: r_moon 0.1 ... 0.7 r_planet, per_moon 0 ... per_moon_max (default 0.19 per_bary: the period at the
     planet's Hill radius), tau 0 ... 1, Omega 0 ... 180 deg, i 0 ... 180 deg, M_moon 0 ... 0.5 M_planet.
@@ -65,17 +68,18 @@ def default_priors(t0_bary, per_bary, r_planet, per_bary_err=None, a_bary=None, 
     Q = _PRI
     P = float(per_bary)
     dP = max(Q["per_bary_err_sigmas"] * float(per_bary_err or 0.0), Q["per_bary_min_frac"] * P)
+    a_wide = None
     if a_bary is None:
         a = (G * (M_star + M_planet) * (P * DAY) ** 2 / (4 * math.pi ** 2)) ** (1 / 3) / R_star
-        a_bary = ((1 - Q["a_bary_frac"]) * a, (1 + Q["a_bary_frac"]) * a)
+        a_wide = (Q["a_bary_lo"] * a, Q["a_bary_hi"] * a)
     k = float(r_planet)
     pm_max = float(per_moon_max) if per_moon_max is not None else round(Q["per_moon_hill"] * P, 3)
     th = float(t0_halfwidth) if t0_halfwidth is not None else Q["t0_halfwidth"]
-    return dict(
+    pri = dict(
         q1=Uniform(0, 1), q2=Uniform(0, 1),
         R_star=Uniform(Q["R_star_lo"] * R_star, Q["R_star_hi"] * R_star),
         per_bary=Uniform(P - dP, P + dP),
-        a_bary=Uniform(*a_bary),
+        a_bary=LogUniform(*a_wide) if a_wide is not None else Uniform(*a_bary),
         r_planet=Uniform(Q["r_planet_lo"] * k, Q["r_planet_hi"] * k),
         b_bary=Uniform(0, 1),
         t0_bary=float(t0_bary),
@@ -88,6 +92,7 @@ def default_priors(t0_bary, per_bary, r_planet, per_bary_err=None, a_bary=None, 
         i_moon=Uniform(0, 180),
         M_moon=Uniform(0, Q["M_moon_max"] * M_planet),
     )
+    return pri
 
 
 # --------------------------------------------------------------------------------------- light curve
@@ -332,6 +337,9 @@ def detect(likelihood, priors, recall=0.95, threshold=None, seed=1, jack_min=Non
         summ["M_moon/M_planet"] = tuple(float(v) for v in np.percentile(col["M_moon"] / col["M_planet"], [50, 16, 84]))
     interesting = bool(dl > st["threshold"])
     warn = []
+    from pandoramoon.sampling import edge_warnings
+    warn += edge_warnings(mp.spec, mp.paramnames(), mp.to_params(rp["samples_u"]), "planet only")
+    warn += edge_warnings(mm.spec, names, pars, "planet + moon", moon=True)
     if len(jk["epochs"]) < 2:
         warn.append("fewer than 2 transits with data: the moon signal cannot be checked across transits")
     if interesting and not jk["passed"]:

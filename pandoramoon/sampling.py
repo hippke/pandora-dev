@@ -701,7 +701,8 @@ def _thin(w, max_n, seed=0):
     return idx, nw / nw.sum()
 
 
-def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max_weighted=None, progress=False):
+def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max_weighted=None, progress=False,
+               hash_parts=None):
     """one nss.fit of a _Model, with the run store / resume; returns the UltraNest-like result dict"""
     resume = None
     callback = None
@@ -709,7 +710,13 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max
         st = store.read_state()
         if resume_mode == "resume" and st is not None:
             if st.get("hash") != settings_hash:
-                raise ValueError(f"{store.path}: stored fit has different data, priors or settings; use "
+                old = st.get("hash_parts") or {}
+                diff = [k for k in ("data", "priors", "settings") if hash_parts and old.get(k) != hash_parts.get(k)]
+                if "data" in diff and old.get("data_parts") and hash_parts.get("data_parts"):
+                    diff = [d if d != "data" else "data (" + ", ".join(k for k in old["data_parts"] if
+                            old["data_parts"][k] != hash_parts["data_parts"].get(k)) + ")" for d in diff]
+                raise ValueError(f"{store.path}: stored fit has different "
+                                 f"{', '.join(diff) if old and diff else 'data, priors or settings'}; use "
                                  "resume='overwrite' or 'subfolder'")
             runs = []
             for ns, idx, path in store.stored_runs():
@@ -724,7 +731,7 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max
         else:
             for _ns, _idx, path in store.stored_runs():
                 os.remove(path)
-            store.write_state(dict(hash=settings_hash, N=None, nesc=0))
+            store.write_state(dict(hash=settings_hash, hash_parts=hash_parts or {}, N=None, nesc=0))
 
         def callback(event, **kw):
             if event == "run":
@@ -797,6 +804,43 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max
         st.update(hash=settings_hash, N=int(r["nsteps"]), nesc=int(r["n_escalations"]), finished=True)
         store.write_state(st)
     return res
+
+
+_EDGE_PLANET = ("a_bary", "r_planet", "per_bary", "t0_bary_offset")
+_EDGE_MOON = ("r_moon", "M_moon")
+
+
+def edge_warnings(spec, names, samples, label, moon=False):
+    """warnings when the posterior piles up at an artificial prior edge (settings.cfg [checks]): both edges of a_bary,
+    r_planet, per_bary, t0_bary_offset; for moon models also the upper edges of r_moon and M_moon (a large or heavy moon
+    at its limit typically repairs a misfit of the planet model, e.g. a wrong a/R* prior or transit-shape changes)"""
+    from pandoramoon._config import settings
+    C = settings()["checks"]
+    fr, mass = float(C["edge_frac"]), float(C["edge_mass"])
+    out = []
+    X = np.asarray(samples, dtype=float)
+    for n in _EDGE_PLANET + (_EDGE_MOON if moon else ()):
+        p = spec.get(n)
+        if n not in names or not isinstance(p, (Uniform, LogUniform)) or len(X) == 0:
+            continue
+        x = X[:, names.index(n)]
+        lo, hi = p.lo, p.hi
+        if isinstance(p, LogUniform):
+            x, lo, hi = np.log(np.maximum(x, 1e-300)), math.log(lo), math.log(hi)
+        w = fr * (hi - lo)
+        sides = (("upper", float(np.mean(x > hi - w))),) if n in _EDGE_MOON else \
+            (("lower", float(np.mean(x < lo + w))), ("upper", float(np.mean(x > hi - w))))
+        for side, f in sides:
+            if f > mass:
+                if n in _EDGE_MOON:
+                    out.append(f"{label}: {100 * f:.0f} % of the posterior of {n} at the upper edge of its prior "
+                               f"({p.hi:.4g}): a moon at its size / mass limit typically repairs a misfit of the "
+                               "planet-only model (prior on a_bary, transit-shape or timing changes), not a moon")
+                else:
+                    out.append(f"{label}: {100 * f:.0f} % of the posterior of {n} at the {side} edge of its prior "
+                               f"[{p.lo:.6g}, {p.hi:.6g}]: the prior excludes values the data prefer; widen it (the "
+                               "Bayes factor is unreliable otherwise)")
+    return out
 
 
 def _fit_model_is(m, nss_kw, verbose, label, max_weighted=None):
@@ -969,14 +1013,21 @@ class NestedSampler:
                 raise ValueError(f"{name} model: only {100 * valid.mean():.0f} % of the prior is valid for Pandora "
                                  "(check the prior ranges, e.g. positive radii, periods and masses)")
 
-    def _settings_hash(self, name, nss_kw):
+    def _hash_parts(self, name, nss_kw):
         m = self.models[name]
-        h = hashlib.sha1()
-        h.update(_data_hash(self.likelihood).encode())
-        h.update(repr(sorted((k, repr(v)) for k, v in m.spec.items())).encode())
-        h.update(repr((name, m.moon_phase, self.ld_correlation, self.seed, sorted(nss_kw.items()))).encode())
-        h.update(repr(("nss-init", nss.INIT_VERSION)).encode())   # runs stored before Round 20 are not mixed in
-        return h.hexdigest()
+        L = self.likelihood
+        sub = {k: hashlib.sha1(np.ascontiguousarray(a).tobytes()).hexdigest()[:12]
+               for k, a in (("time", L.time), ("inv_var", L.inv_var), ("lin_terms", L.lin_terms))}
+        sub["tail"] = hashlib.sha1(repr(L._tail[:4] + (L._tail[7],) + L._tail[9:]).encode()).hexdigest()[:12]
+        return dict(data=_data_hash(self.likelihood), data_parts=sub,
+                    priors=hashlib.sha1(repr(sorted((k, repr(v)) for k, v in m.spec.items())).encode()).hexdigest(),
+                    settings=hashlib.sha1(repr((name, m.moon_phase, self.ld_correlation, self.seed,
+                                                sorted(nss_kw.items()), ("nss-init", nss.INIT_VERSION))).encode()
+                                          ).hexdigest())
+
+    def _settings_hash(self, name, nss_kw):
+        p = self._hash_parts(name, nss_kw)
+        return hashlib.sha1((p["data"] + p["priors"] + p["settings"]).encode()).hexdigest()   # data_parts: diagnostics
 
     def run(self, accuracy=None, max_weighted_samples=None, progress=None, **nss_kw):
         """run the fit(s). accuracy: "medium" (logZ +-0.2; the default, settings.cfg [fit] default_accuracy) or
@@ -1005,7 +1056,8 @@ class NestedSampler:
                 print(f"NestedSampler: {name} model, {m.ndim} sampled coordinates "
                       f"({', '.join(m.cube_names)})", flush=True)
             mode = self.resume if self.resume == "resume" else "fresh"
-            hs = self._settings_hash(name, {k: v for k, v in kw.items() if k != "threads"})
+            kh = {k: v for k, v in kw.items() if k != "threads"}
+            hs, hparts = self._settings_hash(name, kh), self._hash_parts(name, kh)
             done = False
             if name == "planet" and self.planet_evidence == "is" and not any(m.wrapped):
                 res_is, info = _fit_model_is(m, kw, self.verbose, name, max_weighted=max_weighted_samples)
@@ -1017,7 +1069,7 @@ class NestedSampler:
                           flush=True)
             if not done:
                 out[name] = _fit_model(m, kw, store, mode, hs, self.verbose, name, max_weighted=max_weighted_samples,
-                                       progress=self.verbose if progress is None else progress)
+                                       progress=self.verbose if progress is None else progress, hash_parts=hparts)
         res = out[self.model]
         if self.model == "moon" and "planet" in out:
             pl = out["planet"]
@@ -1066,6 +1118,8 @@ class NestedSampler:
                             f"guaranteed): {r.get('reason', '')}")
             if r.get("multimodal"):
                 warn.append(f"{name}: the runs disagree like runs that miss a mode; ln Z may be too low")
+            mname = "moon" if (name != "planet only" and self.model == "moon") else "planet"
+            warn += edge_warnings(self.models[mname].spec, r["paramnames"], r["samples"], name, moon=mname == "moon")
         res["warnings"] = warn
 
     def print_results(self):

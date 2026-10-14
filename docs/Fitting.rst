@@ -78,10 +78,26 @@ A search has two stages: a fast **detection** test for every light curve, and th
 
 .. function:: default_priors(t0_bary, per_bary, r_planet, per_bary_err=None, a_bary=None, R_star=R_sun, M_star=M_sun, M_planet=M_Jup, t0_halfwidth=0.05, per_moon_max=None)
 
-   Priors for a moon search around a known planet: narrow planet priors around the given values (a_bary from
-   Kepler's law) and wide moon priors (r_moon 0.1–0.7 × r_planet, per_moon up to the period at the Hill radius
+   Priors for a moon search around a known planet: planet priors around the given values and wide moon priors
+   (r_moon 0.1–0.7 × r_planet, per_moon up to the period at the Hill radius
    ≈ 0.19 × per_bary, all orientations, M_moon up to half the planet's mass). The Bayes factor depends on the moon
    priors; ``detect``'s threshold was calibrated with priors of this kind.
+
+   **a_bary** (a/R⋆): by default log-uniform over 0.4–2.5 × the value from Kepler's law for the given star and a
+   circular orbit. That allows for errors of the catalogued stellar density (a ∝ ρ^⅓) and for eccentric orbits,
+   which change the transit duration by up to ~1.7×. A narrow prior around Kepler's law (± 2.3 %, the default before
+   Pandora 2.0) is dangerous: if the transit's duration lies outside it, the planet-only model cannot fit the
+   transit, and the moon model "repairs" it with a large or heavy moon. On Kepler-747 b (a/R⋆ 32.5 from the transit,
+   54.6 from Kepler's law) this gave a false Bayes factor of ~1800.
+   ``a_bary=(lo, hi)`` sets a uniform range directly; keep it wide. Do not centre it on a planet-only fit: a moon
+   biases the planet-only a/R⋆ low (its dips lengthen the apparent transit), and the moon fit then runs into the
+   prior's edge (tested: fewer moons recovered, prior-edge warnings in 15 % of moon systems).
+
+   **Prior-edge warnings:** ``NestedSampler`` and ``detect`` warn when the posterior of a_bary, r_planet, per_bary or
+   t0_bary_offset piles up at an edge of its prior (> 10 % of the mass in the outer 2 % of the range), and when the
+   moon's r_moon or M_moon sits at the upper edge of its prior. A moon at its size or mass limit typically repairs a
+   misfit of the planet-only model (a wrong prior, or changes of the transit's timing or shape between epochs), not a
+   real moon.
 
 .. function:: detect(likelihood, priors, recall=0.95, threshold=3.0, seed=1, jack_min=18, ld_correlation=0.0, verbose=False, threads=None)
 
@@ -133,7 +149,11 @@ Interface
       *log_dir* for every new sampler), ``"resume"`` (continue or reuse the fit stored in *log_dir*)
       or ``"overwrite"``.
    :threads: *(int)* Number of runs in parallel. Default: all cores available to the process.
-   :seed: *(int)* Random seed. A fit is reproducible for a given seed and number of threads.
+   :seed: *(int)* Random seed. A fit is reproducible for a given seed and number of threads, with the same
+      compiled code: numba's code compiled fresh (first use after an update) and loaded from its cache can differ in
+      the last bit of a likelihood value (fastmath), and nested sampling then takes another path to a statistically
+      equivalent result. Model light curves *simulated* in two processes can differ in the same way; data read
+      from files are identical (resuming a fit of real data is not affected).
    :verbose: *(bool)* Print the progress of the checks.
    :planet_evidence: How the planet-only model is fitted. ``"is"`` (default): one short nested-sampling
       pilot (4 runs of 100 live points, in parallel) gives the posterior's shape, and importance sampling
