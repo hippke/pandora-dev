@@ -799,6 +799,53 @@ def _fit_model(m, nss_kw, store, resume_mode, settings_hash, verbose, label, max
     return res
 
 
+def _fit_model_is(m, nss_kw, verbose, label, max_weighted=None):
+    """planet-only evidence by importance sampling (nss.fit_is); None if its checks fail (caller: full fit)"""
+    acc = nss_kw.get("accuracy") or "medium"
+    lz_tol = float(nss_kw.get("lz_tol") or nss.ACCURACY[acc]["lz_tol"])
+    if verbose:
+        print(f"  {label}: evidence by importance sampling (planet_evidence='is')", flush=True)
+    t0 = time.perf_counter()
+    nss.make_sampler(_loglike, False, True)          # the serial sampler (shared with the nested-sampling fits)
+    nss.make_batch(_loglike, True)
+    t_compile = time.perf_counter() - t0
+    r = nss.fit_is(_loglike, m.ndim, wrapped=m.wrapped, data=m.D, threads=nss_kw.get("threads", 1),
+                   seed=nss_kw.get("seed", 1), lz_tol=lz_tol, verbose=verbose)
+    if not r["ok"]:
+        return None, r
+    names = m.paramnames()
+    w = r["w"]
+    n_weighted_all = len(w)
+    ti, w = _thin(w, max_weighted, seed=1)
+    U, Lp = r["U"][ti], r["logL"][ti]
+    _, lw = m.native(U)
+    logl = Lp - lw
+    pts = m.to_params(U)
+    # equal-weight posterior samples: systematic resampling of the weighted draws (~ the effective sample size x 4)
+    ns_eq = int(min(len(w), max(1000, 4 * r["ess"])))
+    cw = np.cumsum(w) / np.sum(w)
+    pos = (np.random.default_rng(1).uniform() + np.arange(ns_eq)) / ns_eq
+    samples = pts[np.minimum(np.searchsorted(cw, pos), len(pts) - 1)]
+    logz = float(r["logz"])
+    H = float(np.sum(w * (logl - logz)))
+    ib = int(np.argmax(logl))
+    res = dict(
+        paramnames=names, logz=logz, logzerr=float(r["logzerr"]), logzerr_bs=np.nan, logz_single=r["pilot"]["logz"],
+        ess=float(r["ess"]), H=H, Herr=np.nan, ncall=int(r["ncall"]), niter=int(r["pilot"]["niter"]),
+        posterior=_summary(samples, names), samples=samples,
+        weighted_samples=dict(upoints=U, points=pts, weights=w, logl=logl),
+        maxlikelihood=dict(logl=float(logl[ib]), point=pts[ib].tolist(), point_untransformed=U[ib].tolist()),
+        insertion_order_test={}, passed=True, status="passed", reason="", method="importance",
+        importance=dict(ess=r["ess"], max_share=r["max_share"], n_draws=r["n_draws"], pilot=r["pilot"],
+                        lz_tol=lz_tol),
+        nsteps=4 * m.ndim, nlive=int(r["pilot"]["nlive"]), runs=1, runs_check=0, n_escalations=0, n_failed=0,
+        n_nlive_escalations=0, multimodal=False, dlogz_check=None, ks_arms=None, history=[],
+        wall=time.perf_counter() - t0, t_compile=t_compile, model=m.model, moon_phase=bool(m.moon_phase),
+        sampled_coordinates=list(m.cube_names), priors_truncated=dict(m.truncated), n_weighted_all=int(n_weighted_all),
+        run_logz=[r["pilot"]["logz"]], run_logzerr=[r["pilot"]["logzerr"]], run_maxL=[float(np.max(logl))])
+    return res, r
+
+
 def _write_results(path, res, priors_repr):
     os.makedirs(os.path.join(path, "info"), exist_ok=True)
     os.makedirs(os.path.join(path, "chains"), exist_ok=True)
@@ -848,7 +895,8 @@ class NestedSampler:
     """
 
     def __init__(self, likelihood, priors, model="moon", compare_planet=True, moon_phase="auto", ld_correlation=0.0,
-                 log_dir=None, resume="subfolder", threads=None, seed=1, verbose=True, supersampling="auto"):
+                 log_dir=None, resume="subfolder", threads=None, seed=1, verbose=True, supersampling="auto",
+                 planet_evidence="is"):
         if model not in ("moon", "planet"):
             raise ValueError('model must be "moon" or "planet"')
         if resume not in ("subfolder", "resume", "overwrite"):
@@ -883,6 +931,9 @@ class NestedSampler:
                 threads = os.cpu_count() or 1
         self.threads = int(threads)
         self.models = {}
+        if planet_evidence not in ("is", "nested"):
+            raise ValueError('planet_evidence must be "is" or "nested"')
+        self.planet_evidence = planet_evidence
         self._moon_phase = moon_phase
         if model == "moon":
             self.models["moon"] = _Model(likelihood, self.priors, "moon", moon_phase, ld_correlation)
@@ -927,8 +978,9 @@ class NestedSampler:
         h.update(repr(("nss-init", nss.INIT_VERSION)).encode())   # runs stored before Round 20 are not mixed in
         return h.hexdigest()
 
-    def run(self, accuracy="high", max_weighted_samples=None, progress=None, **nss_kw):
-        """run the fit(s). accuracy: "high" (logZ +-0.1, default) or "medium" (+-0.2, faster); max_weighted_samples:
+    def run(self, accuracy=None, max_weighted_samples=None, progress=None, **nss_kw):
+        """run the fit(s). accuracy: "medium" (logZ +-0.2; the default, settings.cfg [fit] default_accuracy) or
+        "high" (+-0.1, for evidence comparisons at the 0.1-0.3 nat level); max_weighted_samples:
         thin results["weighted_samples"] (all points of the merged runs, up to ~1e6) to about this many points
         (unbiased: Horvitz-Thompson thinning; None = keep all); further keyword arguments go to
         pandoramoon.nss.fit (e.g. nlive, lz_tol, ks_tol, max_runs, nsteps).
@@ -936,6 +988,9 @@ class NestedSampler:
         per second, elapsed time): every 2 s in a terminal or Jupyter (one line, updated in place), every 30 s in a
         log file. None (default): on if verbose; True / False; or the interval in seconds.
         Returns the results dict (also self.results)."""
+        if accuracy is None:
+            from pandoramoon._config import settings
+            accuracy = str(settings()["fit"]["default_accuracy"])
         kw = dict(accuracy=accuracy, threads=self.threads, seed=self.seed)
         kw.update(nss_kw)
         out = {}
@@ -951,8 +1006,18 @@ class NestedSampler:
                       f"({', '.join(m.cube_names)})", flush=True)
             mode = self.resume if self.resume == "resume" else "fresh"
             hs = self._settings_hash(name, {k: v for k, v in kw.items() if k != "threads"})
-            out[name] = _fit_model(m, kw, store, mode, hs, self.verbose, name, max_weighted=max_weighted_samples,
-                                   progress=self.verbose if progress is None else progress)
+            done = False
+            if name == "planet" and self.planet_evidence == "is" and not any(m.wrapped):
+                res_is, info = _fit_model_is(m, kw, self.verbose, name, max_weighted=max_weighted_samples)
+                if res_is is not None:
+                    out[name] = res_is
+                    done = True
+                elif self.verbose:
+                    print(f"  {name}: importance sampling not used ({info.get('reason')}): nested-sampling fit",
+                          flush=True)
+            if not done:
+                out[name] = _fit_model(m, kw, store, mode, hs, self.verbose, name, max_weighted=max_weighted_samples,
+                                       progress=self.verbose if progress is None else progress)
         res = out[self.model]
         if self.model == "moon" and "planet" in out:
             pl = out["planet"]
@@ -1011,9 +1076,12 @@ class NestedSampler:
             return
 
         def block(r, title):
-            print(f"{title}: logZ = {r['logz']:.3f} +- {r['logzerr']:.3f}   "
-                  f"({'checks passed' if r['passed'] else 'checks NOT passed'}; {r['runs']} runs x {r['nlive']} live, "
-                  f"nsteps {r['nsteps']}, {r['ncall'] / 1e6:.0f} M calls, {r['wall']:.0f} s)")
+            if r.get("method") == "importance":
+                how = (f"importance sampling, ESS {r['importance']['ess']:.0f}, {r['ncall']:,} calls, {r['wall']:.0f} s")
+            else:
+                how = (f"{'checks passed' if r['passed'] else 'checks NOT passed'}; {r['runs']} runs x {r['nlive']} "
+                       f"live, nsteps {r['nsteps']}, {r['ncall']:,} calls, {r['wall']:.0f} s")
+            print(f"{title}: logZ = {r['logz']:.3f} +- {r['logzerr']:.3f}   ({how})")
             p = r["posterior"]
             for j, n in enumerate(r["paramnames"]):
                 print(f"    {n:16s}: {p['median'][j]:.6g} -{p['median'][j] - p['errlo'][j]:.3g} "

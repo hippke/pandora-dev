@@ -596,6 +596,196 @@ def _ks(a, b):
                                - np.searchsorted(b, x, side="right") / len(b))))
 
 
+# ---------------------------------------------------------------------------------------------
+# evidence by importance sampling (2026-10-14): for unimodal, near-Gaussian posteriors (the planet-only model). One
+# nested-sampling run gives the posterior shape; a Student-t proposal fitted to it gives lnZ = ln mean(L / q) over
+# draws in the unit cube (draws outside the cube count with weight 0: unbiased without normalising the truncation).
+
+_BATCHES = {}
+
+
+def make_batch(ll_u, with_data=False):
+    """compiled parallel evaluation of ll_u at the rows of U (-inf outside the open unit cube)"""
+    key = (id(ll_u), with_data)
+    if key in _BATCHES:
+        return _BATCHES[key]
+    if with_data:
+        LL = ll_u
+    else:
+        @njit(inline="always")
+        def LL(x, D):
+            return ll_u(x)
+
+    @njit(parallel=True, nogil=True)
+    def batch(U, D):
+        n = U.shape[0]
+        out = np.empty(n)
+        for i in prange(n):
+            ok = True
+            for j in range(U.shape[1]):
+                if not (U[i, j] > 0.0 and U[i, j] < 1.0):
+                    ok = False
+            out[i] = LL(U[i], D) if ok else -np.inf
+        return out
+    _BATCHES[key] = batch
+    return batch
+
+
+def _t_draw(rng, mu, C, df, n):
+    """n draws of a multivariate Student-t (location mu, shape C) and their log densities"""
+    d = len(mu)
+    Lc = np.linalg.cholesky(C)
+    z = rng.standard_normal((n, d))
+    g = rng.chisquare(df, n) / df
+    x = mu + (z @ Lc.T) / np.sqrt(g)[:, None]
+    y = np.linalg.solve(Lc, (x - mu).T).T
+    m = np.sum(y * y, axis=1)
+    logdet = 2.0 * np.sum(np.log(np.diag(Lc)))
+    lq = (math.lgamma((df + d) / 2) - math.lgamma(df / 2) - 0.5 * d * math.log(df * math.pi) - 0.5 * logdet
+          - 0.5 * (df + d) * np.log1p(m / df))
+    return x, lq
+
+
+def _weighted_moments(U, w):
+    w = w / w.sum()
+    mu = w @ U
+    X = U - mu
+    C = (X * w[:, None]).T @ X
+    C += np.eye(len(mu)) * 1e-12 * max(np.trace(C), 1e-300)
+    return mu, C
+
+
+@njit(parallel=True, cache=True)
+def _kde_logq(Yx, Yc, base, df):
+    """log of the mean over centres of Student-t kernels, in whitened coordinates (rows of Yx: points, of Yc:
+    centres; base: the kernel's log normalisation)"""
+    n, d = Yx.shape
+    m = Yc.shape[0]
+    out = np.empty(n)
+    for i in prange(n):
+        t = np.empty(m)
+        mx = -np.inf
+        for c in range(m):
+            s = 0.0
+            for j in range(d):
+                r = Yx[i, j] - Yc[c, j]
+                s += r * r
+            t[c] = -0.5 * (df + d) * math.log1p(s / df)
+            mx = max(mx, t[c])
+        acc = 0.0
+        for c in range(m):
+            acc += math.exp(t[c] - mx)
+        out[i] = base + mx + math.log(acc / m)
+    return out
+
+
+def _mix_draw(rng, Uc, mu, C, S, n):
+    """draws of the proposal (KDE of t kernels around the centres Uc + defensive global t) and their log density"""
+    d = len(mu)
+    df, h, sc, fd = float(S["df"]), float(S["kde_bandwidth"]), float(S["scale"]), float(S["defensive"])
+    nk = int(rng.binomial(n, 1.0 - fd))
+    Lk = np.linalg.cholesky(h * h * C)
+    z = rng.standard_normal((nk, d))
+    g = rng.chisquare(df, nk) / df
+    xk = Uc[rng.integers(0, len(Uc), nk)] + (z @ Lk.T) / np.sqrt(g)[:, None]
+    xg, _ = _t_draw(rng, mu, C * sc * sc, df, n - nk)
+    x = np.vstack([xk, xg])
+    _, lg = _t_logpdf(x, mu, C * sc * sc, df)
+    Li = np.linalg.inv(Lk)
+    base = (math.lgamma((df + d) / 2) - math.lgamma(df / 2) - 0.5 * d * math.log(df * math.pi)
+            - float(np.sum(np.log(np.diag(Lk)))))
+    lk = _kde_logq(np.ascontiguousarray(x @ Li.T), np.ascontiguousarray(Uc @ Li.T), base, df)
+    return x, np.logaddexp(math.log(1.0 - fd) + lk, math.log(fd) + lg)
+
+
+def _t_logpdf(x, mu, C, df):
+    d = len(mu)
+    Lc = np.linalg.cholesky(C)
+    y = np.linalg.solve(Lc, (x - mu).T).T
+    m = np.sum(y * y, axis=1)
+    return x, (math.lgamma((df + d) / 2) - math.lgamma(df / 2) - 0.5 * d * math.log(df * math.pi)
+               - float(np.sum(np.log(np.diag(Lc)))) - 0.5 * (df + d) * np.log1p(m / df))
+
+
+def fit_is(ll_u, ndim, wrapped=None, data=None, threads=12, seed=1, lz_tol=0.2, verbose=True):
+    """lnZ and posterior by importance sampling (settings.cfg [planet_is]): a pilot nss.run gives the posterior; the
+    proposal is a mixture of Student-t kernels around points drawn from it plus a defensive wide Student-t; lnZ =
+    ln mean(L / q) over draws in the unit cube (draws outside it count with weight 0: unbiased without normalising the
+    truncation), more draws until the error <= error_frac x lz_tol. Returns dict(ok, logz, logzerr, U (draws with
+    w > 0), logL, w (normalised), ess, max_share, ncall, wall, pilot, reason). ok=False: a check failed (the caller
+    falls back to fit()). Not for wrapped (periodic) dimensions or multimodal posteriors."""
+    import numba
+    S = _settings()["planet_is"]
+    t0 = time.perf_counter()
+    if wrapped is not None and any(wrapped):
+        return dict(ok=False, reason="wrapped dimensions", ncall=0, wall=0.0)
+    numba.set_num_threads(max(1, int(threads)))
+    nl = int(S["pilot_nlive"])
+    npil = max(1, int(S["pilot_runs"]))
+    # pilot: npil runs in parallel threads (compiled once outside the threads, as in fit), merged as one run
+    run(ll_u, ndim, wrapped=wrapped, nlive=max(40, 2 * ndim + 8), nsteps=2, k=1, max_iter=3, seed=seed + 999,
+        data=data, init_reject=False)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(npil, max(1, int(threads)))) as ex:
+        runs = list(ex.map(lambda i: run(ll_u, ndim, wrapped=wrapped, nlive=nl, k=1, seed=seed + 1000 * i,
+                                         dirs="pairs", data=data), range(npil)))
+    lzp, lw = merge_weights(runs)
+    Up = np.concatenate([q["dead_u"] for q in runs])
+    Hm = float(np.mean([q["H"] for q in runs]))
+    p = dict(logz=float(lzp), logzerr=math.sqrt(max(Hm, 0.0) / (nl * npil)), ncall=int(sum(q["ncall"] for q in runs)),
+             niter=int(sum(q["niter"] for q in runs)))
+    batch = make_batch(ll_u, data is not None)
+    D = data if data is not None else (0,)
+    w = np.exp(lw - lw.max())
+    mu, C = _weighted_moments(Up, w)
+    rng = np.random.default_rng(seed + 54321)
+    Uc = Up[rng.choice(len(w), size=int(S["kde_centres"]), p=w / w.sum())]
+    ncall = int(p["ncall"])
+    n = int(S["n_draws"])
+    xs, Ls, lws = [], [], []
+    while True:
+        x, lq = _mix_draw(rng, Uc, mu, C, S, n if not xs else sum(len(q) for q in xs))
+        L = batch(np.ascontiguousarray(x), D)
+        ncall += len(x)
+        xs.append(x)
+        Ls.append(L)
+        lws.append(L - lq)
+        lwa = np.concatenate(lws)
+        m = lwa.max()
+        wa = np.exp(lwa - m) if np.isfinite(m) else np.zeros(len(lwa))
+        N = len(wa)
+        lz = float(m + math.log(wa.mean())) if wa.sum() > 0 else -np.inf
+        err = float(wa.std() / wa.mean() / math.sqrt(N)) if wa.sum() > 0 else np.inf
+        if err <= float(S["error_frac"]) * lz_tol or N >= int(S["n_max"]):
+            break
+    ess = float(wa.sum() ** 2 / (wa ** 2).sum()) if wa.sum() > 0 else 0.0
+    share = float(wa.max() / wa.sum()) if wa.sum() > 0 else 1.0
+    keep = wa > 0
+    U = np.concatenate(xs)[keep]
+    LL = np.concatenate(Ls)[keep]
+    wn = wa[keep] / wa[keep].sum() if keep.any() else wa[keep]
+    dz = abs(lz - p["logz"])
+    lim = float(S["consistency_k"]) * math.hypot(err, p["logzerr"]) + 0.1
+    fails = []
+    if ess < float(S["ess_min"]):
+        fails.append(f"IS effective sample size {ess:.0f} < {S['ess_min']}")
+    if share > float(S["max_share"]):
+        fails.append(f"largest weight {share:.3f} of the total > {S['max_share']}")
+    if not dz <= lim:
+        fails.append(f"IS lnZ {lz:.3f} and pilot lnZ {p['logz']:.3f} differ by {dz:.3f} > {lim:.3f}")
+    if not err <= lz_tol:
+        fails.append(f"IS error {err:.3f} > lz_tol {lz_tol}")
+    out = dict(ok=not fails, reason="; ".join(fails), logz=lz, logzerr=err, U=U, logL=LL, w=wn, ess=ess,
+               max_share=share, ncall=ncall, n_draws=N, wall=time.perf_counter() - t0,
+               pilot=dict(logz=float(p["logz"]), logzerr=float(p["logzerr"]), nlive=nl, runs=npil,
+                          ncall=int(p["ncall"]), niter=int(p["niter"])))
+    if verbose:
+        print(f"  importance sampling: lnZ {lz:.3f} +- {err:.3f} (pilot run {p['logz']:.3f} +- {p['logzerr']:.3f}), "
+              f"ESS {ess:.0f} of {N}, {ncall:,} calls, {out['wall']:.1f} s" + ("" if out["ok"] else
+              f"; checks failed ({out['reason']}): full nested-sampling fit"), flush=True)
+    return out
+
+
 def merge_weights(rs):
     """Merge independent runs into ONE nested-sampling run (Skilling 2006 Sect. 9; Higson et al. 2018,
     dynesty merge_runs): all points sorted by logL; the number of live points just before point j is

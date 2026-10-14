@@ -96,7 +96,7 @@ priors = dict(q1=Uniform(0, 1), q2=Uniform(0, 1), R_star=Uniform(0.4 * R_sun, 1.
               M_planet=Uniform(1.5e27, 2.5e27), r_moon=Uniform(0.01, 0.07), per_moon=Uniform(0, 50),
               tau_moon=Uniform(0, 1), Omega_moon=Uniform(0, 180), i_moon=Uniform(0, 180), M_moon=Uniform(1, 1e27))
 sampler = NestedSampler(like, priors, log_dir="fit_out")    # model="moon" (default) or "planet"
-results = sampler.run()                                     # accuracy="high" (logZ +-0.1) or "medium"
+results = sampler.run()                                     # accuracy="medium" (logZ +-0.2, default) or "high"
 sampler.print_results()
 results["logz"], results["logzerr"], results["dlogz"]      # dlogz = logZ(moon) - logZ(planet only)
 results["samples"], results["paramnames"]                  # equal-weight posterior samples

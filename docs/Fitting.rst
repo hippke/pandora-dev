@@ -105,7 +105,7 @@ A search has two stages: a fast **detection** test for every light curve, and th
 Interface
 ---------
 
-.. class:: NestedSampler(likelihood, priors, model="moon", compare_planet=True, moon_phase="auto", ld_correlation=0.0, log_dir=None, resume="subfolder", threads=None, seed=1, verbose=True, supersampling="auto")
+.. class:: NestedSampler(likelihood, priors, model="moon", compare_planet=True, moon_phase="auto", ld_correlation=0.0, log_dir=None, resume="subfolder", threads=None, seed=1, verbose=True, supersampling="auto", planet_evidence="is")
 
    :likelihood: A :class:`pandoramoon.Likelihood`. It holds the data, the errors and Pandora's model
       settings (``supersampling_factor``, ``hill_sphere_threshold``, ``occult_small_threshold``,
@@ -135,6 +135,15 @@ Interface
    :threads: *(int)* Number of runs in parallel. Default: all cores available to the process.
    :seed: *(int)* Random seed. A fit is reproducible for a given seed and number of threads.
    :verbose: *(bool)* Print the progress of the checks.
+   :planet_evidence: How the planet-only model is fitted. ``"is"`` (default): one short nested-sampling
+      pilot (4 runs of 100 live points, in parallel) gives the posterior's shape, and importance sampling
+      (Student-t kernels around pilot points plus a wide Student-t; 50,000 or more likelihood calls,
+      evaluated in parallel) gives ln Z and the posterior. The planet-only posterior is single-peaked, which
+      this needs. It checks itself (effective sample size, the largest weight, agreement with the pilot's ln Z)
+      and falls back to the full nested-sampling fit if a check fails. On a 16-core Ryzen 7950X it takes
+      ~1 s instead of 4–15 s, with ln Z errors of 0.01–0.02 (20 seeds: scatter equal to the quoted error;
+      agrees with the full high-accuracy fit). ``"nested"``: the full nested-sampling fit as for the moon
+      model (needed to test the run store / resume of a planet-only fit).
    :supersampling: ``"auto"`` (default), an integer, or ``None``. ``"auto"``: if the likelihood is not
       supersampled and the cadence is ≥ 10 min, the fit computes each data point as the average of 5
       sub-exposures (exposure = cadence). Without it, 30-min data bias the Bayes factor and the moon's
@@ -142,14 +151,15 @@ Interface
       actually uses is ``sampler.likelihood`` (e.g. ``sampler.likelihood(**sampler.parameters())``
       gives the ``logl`` of ``results["maxlikelihood"]``).
 
-   .. method:: run(accuracy="high", max_weighted_samples=None, progress=None, **kwargs)
+   .. method:: run(accuracy=None, max_weighted_samples=None, progress=None, **kwargs)
 
       Runs the fit (for ``model="moon"``: first the planet-only fit, then the planet+moon fit) and
       returns the results dictionary (also stored as ``sampler.results``).
 
-      :accuracy: ``"high"`` (default): statistical error of ln Z ≤ 0.1, posterior reproducible to a
-         KS distance ≤ 0.05, 1000 live points per run, at least 16 runs. ``"medium"``: ≤ 0.2 and
-         ≤ 0.08, 500 live points per run, at least 8 runs; about 2–5× faster. Use ``"medium"`` to follow up
+      :accuracy: ``"medium"`` (default since 2.0; ``None`` reads ``settings.cfg`` ``[fit] default_accuracy``):
+         statistical error of ln Z ≤ 0.2, posterior reproducible to a KS distance ≤ 0.08, 500 live points
+         per run, at least 8 runs. ``"high"``: ≤ 0.1 and ≤ 0.05, 1000 live points per run, at least 16
+         runs; about 2–5× slower. Use ``"medium"`` to follow up
          detections; for evidence comparisons at the 0.1–0.3 nat level use ``"high"`` (on our test cases medium
          fits deviated by up to 0.5 nats, 2.5 × their quoted error, from the high-accuracy values).
       :max_weighted_samples: Thin ``weighted_samples`` (all points of the merged runs, up to ~10⁶) to about
